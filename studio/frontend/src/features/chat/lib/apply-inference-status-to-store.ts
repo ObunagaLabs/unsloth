@@ -30,6 +30,7 @@ import {
 import type { ChatModelSummary } from "../types/runtime";
 import { resolveQwenThinkingParams } from "../utils/qwen-params";
 import { sameGpuSelection } from "@/hooks/gpu-selection";
+import { reconcileMlxSpeculativeStatus } from "./mlx-runtime-state";
 import { resolveBatchSizeSeed } from "./resolve-batch-size-seed";
 import { resolveChatTemplateSeed } from "./resolve-chat-template-seed";
 import { shouldSeedVisionSwitch } from "./resolve-vision-switch-seed";
@@ -378,6 +379,12 @@ export function applyActiveModelStatusToStore(
       }),
   };
 
+  const mlxSpeculativeFields = reconcileMlxSpeculativeStatus(
+    prevState,
+    status,
+    hydratingExistingModel,
+  );
+
   useChatRuntimeStore.setState({
     supportsReasoning,
     reasoningAlwaysOn,
@@ -410,6 +417,11 @@ export function applyActiveModelStatusToStore(
     specFallbackReason: status.spec_fallback_reason ?? null,
     mmprojFallbackReason: status.mmproj_fallback_reason ?? null,
     specDrafterKind: status.spec_drafter_kind ?? null,
+    // Held behind the same seed guard as the KV verdict below: a status that is not
+    // reporting a settled load must not retire the state a staged pick is holding.
+    ...(seedLoadParams &&
+      status.is_mlx !== undefined &&
+      mlxSpeculativeFields),
     // The spec / KV seeds share the GPU-fields reseed mechanism below: a
     // non-GGUF status leaves their loaded baselines null, so the "unseeded"
     // guard re-fires every refresh -- hold them too while a staged pick's
