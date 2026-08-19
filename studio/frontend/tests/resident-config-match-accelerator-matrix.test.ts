@@ -2,21 +2,11 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 /**
- * `residentRuntimeMatchesConfig` across the accelerators Studio runs on, crossed with every
- * setting a remembered config can pin.
- *
- * The two failures are not symmetric. A wrong FALSE costs one reload, which is what
- * happened before #8893. A wrong TRUE leaves the user on a server invoked differently from
- * what they asked for, with the panel rolled back so nothing says so. Hence both directions
- * for every field rather than sampling.
- *
- * The accelerator axis is real even though no paths are compared, because the fields read
- * are the GPU ones: CUDA and ROCm report a placement pool and an offload mode, a CPU-only
- * host reports `manual` with zero layers, MLX reports none of them and a KV width instead.
- * "The status does not carry this field" must never read as agreement.
- *
- * The structural test at the bottom is the one that lasts: it fails when a field is added
- * to `PerModelConfig` without being classified here.
+ * `residentRuntimeMatchesConfig` across every accelerator, crossed with every setting a
+ * remembered config can pin. Both directions per field rather than sampling: a wrong FALSE
+ * costs one reload (#8893), a wrong TRUE strands the user on a differently invoked server
+ * with the panel rolled back. Accelerators differ in which GPU fields they report at all,
+ * and "the status does not carry this field" must never read as agreement.
  */
 
 import assert from "node:assert/strict";
