@@ -25,6 +25,9 @@ import {
 import {
   DRAFT_N_MAX_SPEC_TYPES,
   SPECULATIVE_TYPES,
+  normalizeMlxDraftBlockSize,
+  normalizeMlxDraftModel,
+  normalizeMlxSpeculativeMode,
 } from "@/lib/speculative-modes";
 import {
   GPU_LAYERS_AUTO,
@@ -39,6 +42,9 @@ export type PresetLoadConfig = Pick<
   | "maxSeqLength"
   | "kvCacheDtype"
   | "mlxKvBits"
+  | "mlxSpeculativeMode"
+  | "mlxDraftModel"
+  | "mlxDraftBlockSize"
   | "speculativeType"
   | "specDraftNMax"
   | "nParallel"
@@ -63,6 +69,9 @@ export const EMPTY_PRESET_LOAD_CONFIG: PresetLoadConfig = {
   maxSeqLength: null,
   kvCacheDtype: null,
   mlxKvBits: null,
+  mlxSpeculativeMode: "auto",
+  mlxDraftModel: null,
+  mlxDraftBlockSize: null,
   speculativeType: null,
   specDraftNMax: null,
   nParallel: null,
@@ -117,7 +126,21 @@ export function normalizePresetLoadConfig(
     nCpuMoe = Math.max(0, Math.floor(partial.nCpuMoe));
   }
 
+  const mlxSpeculativeMode = normalizeMlxSpeculativeMode(
+    partial.mlxSpeculativeMode,
+    "auto",
+  );
+
   const normalized: PresetLoadConfig = {
+    mlxSpeculativeMode,
+    mlxDraftModel: normalizeMlxDraftModel(
+      partial.mlxDraftModel,
+      mlxSpeculativeMode,
+    ),
+    mlxDraftBlockSize: normalizeMlxDraftBlockSize(
+      partial.mlxDraftBlockSize,
+      mlxSpeculativeMode,
+    ),
     customContextLength:
       typeof partial.customContextLength === "number" &&
       Number.isFinite(partial.customContextLength) &&
@@ -214,6 +237,9 @@ export function capturePresetLoadConfig(): PresetLoadConfig | undefined {
     maxSeqLength: normalizeMaxSeqLength(snapshot.maxSeqLength),
     kvCacheDtype: snapshot.kvCacheDtype ?? null,
     mlxKvBits: snapshot.mlxKvBits ?? null,
+    mlxSpeculativeMode: snapshot.mlxSpeculativeMode,
+    mlxDraftModel: snapshot.mlxDraftModel,
+    mlxDraftBlockSize: snapshot.mlxDraftBlockSize,
     speculativeType: normalizeSpeculativeType(snapshot.speculativeType),
     specDraftNMax: snapshot.specDraftNMax ?? null,
     nParallel: snapshot.nParallel ?? null,
@@ -252,6 +278,10 @@ function coalesceDefaultLoadKnobs(
   if (speculativeType == null || speculativeType === "auto") {
     result.speculativeType = null;
   }
+  if (result.mlxSpeculativeMode === "off") {
+    result.mlxDraftModel = null;
+    result.mlxDraftBlockSize = null;
+  }
   if (
     (result.gpuLayers == null || result.gpuLayers < 0) &&
     result.gpuMemoryMode !== "manual"
@@ -277,6 +307,9 @@ export function applyPresetLoadConfig(
     customContextLength: config.customContextLength ?? null,
     kvCacheDtype: config.kvCacheDtype ?? null,
     mlxKvBits: config.mlxKvBits ?? null,
+    mlxSpeculativeMode: config.mlxSpeculativeMode ?? "auto",
+    mlxDraftModel: config.mlxDraftModel ?? null,
+    mlxDraftBlockSize: config.mlxDraftBlockSize ?? null,
     speculativeType: config.speculativeType ?? null,
     specDraftNMax: config.specDraftNMax ?? null,
     nParallel: config.nParallel ?? null,
@@ -312,6 +345,11 @@ export function formatPresetLoadConfigSummary(
   }
   if (config.mlxKvBits) {
     parts.push(`MLX KV ${config.mlxKvBits}-bit`);
+  }
+  if (config.mlxSpeculativeMode !== "auto" || config.mlxDraftModel) {
+    parts.push(
+      `MLX spec ${config.mlxDraftModel ?? config.mlxSpeculativeMode}`,
+    );
   }
   if (config.speculativeType && config.speculativeType !== "auto") {
     parts.push(`Spec ${config.speculativeType}`);

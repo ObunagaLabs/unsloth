@@ -29,7 +29,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { applyQwenThinkingParams } from "@/features/chat/utils/qwen-params";
-import { DRAFT_N_MAX_SPEC_TYPES } from "@/lib/speculative-modes";
+import { usePlatformStore } from "@/config/env";
+import { isServedByMlx } from "@/features/model-picker";
+import {
+  DRAFT_N_MAX_SPEC_TYPES,
+  mlxSpeculativeLoadFields,
+} from "@/lib/speculative-modes";
 import {
   StudioDictationAdapter,
   isStudioDictationAvailable,
@@ -1556,6 +1561,14 @@ export function SharedComposer({
           chat_template_override: effectiveChatTemplateOverride,
           cache_type_kv: ownConfig.kvCacheDtype ?? null,
           mlx_kv_bits: ownConfig.mlxKvBits ?? null,
+          ...mlxSpeculativeLoadFields(
+            ownConfig,
+            isServedByMlx(
+              targetIsGguf,
+              usePlatformStore.getState().deviceType,
+              usePlatformStore.getState().chatOnlyReason,
+            ),
+          ),
           speculative_type: effectiveSpeculativeType,
           spec_draft_n_max: effectiveSpecDraftNMax,
           tensor_parallel: effectiveTensorParallel,
