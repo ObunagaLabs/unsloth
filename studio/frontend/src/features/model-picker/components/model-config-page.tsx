@@ -1345,6 +1345,7 @@ function MlxSpeculativeSetting({
   error,
   onRetry,
   reason,
+  autoDraftModel,
 }: {
   config: PerModelConfig;
   update: (patch: Partial<PerModelConfig>) => void;
@@ -1354,15 +1355,23 @@ function MlxSpeculativeSetting({
   onRetry: () => void;
   /** Why the loaded runtime is not drafting as asked, or null when it is. */
   reason: string | null;
+  /** The drafter Auto resolved to for this target, or null when it resolved to none. */
+  autoDraftModel: string | null;
 }) {
   const mode = config.mlxSpeculativeMode ?? "auto";
-  // What Auto would pick, so the control names a method rather than making the user load.
-  const predicted = selectMlxSpeculativeCandidate(candidates, "auto", null);
+  // What Auto picked, so the control names a method rather than making the user load.
+  const predicted = selectMlxSpeculativeCandidate(
+    candidates,
+    "auto",
+    null,
+    autoDraftModel,
+  );
   // What this request would run, which decides whether a companion is choosable.
   const resolved = selectMlxSpeculativeCandidate(
     candidates,
     mode,
     config.mlxDraftModel,
+    autoDraftModel,
   );
   const externalCandidates = useMemo(
     () => selectableExternalMlxDraftCandidates(candidates),
@@ -1389,7 +1398,8 @@ function MlxSpeculativeSetting({
             update({
               mlxSpeculativeMode: next,
               mlxDraftModel: normalizeMlxDraftModel(
-                selectMlxSpeculativeCandidate(candidates, next, null)?.repo_id,
+                selectMlxSpeculativeCandidate(candidates, next, null, autoDraftModel)
+                  ?.repo_id,
                 next,
               ),
               mlxDraftBlockSize: normalizeMlxDraftBlockSize(
@@ -1439,8 +1449,8 @@ function MlxSpeculativeSetting({
           onDownloaded={onRetry}
         />
       ) : null}
-      {/* Auto names no method until the load resolves one, so there is no default for a
-          depth to override yet. */}
+      {/* Auto carries its own depth per method, chosen with the drafter, so there is no
+          default here for a depth to override. */}
       {normalizeMlxSpeculativeMethod(mode) !== null ? (
         <div className={ROW_CLASS}>
           <div className="flex min-w-0 items-center gap-1.5">
@@ -3362,6 +3372,8 @@ export function ModelConfigPage({
                   error: mlxSpeculative.error,
                   onRetry: mlxSpeculative.retry,
                   reason: mlxSpeculativeOutcome,
+                  autoDraftModel:
+                    mlxSpeculative.options?.auto_draft_model ?? null,
                 }}
               />
             )}
