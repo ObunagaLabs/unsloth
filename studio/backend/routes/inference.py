@@ -2403,7 +2403,9 @@ async def _aiter_llama_stream_items(
 
 
 from core.inference.mlx_speculative import (
+    mlx_speculative_reason_text,
     mlx_speculative_refusal_text,
+    normalize_mlx_speculative_mode,
     mlx_speculative_options,
     mlx_speculative_request_reason,
     mlx_speculative_refusal,
@@ -9563,19 +9565,19 @@ async def _load_model_impl(
                 inference_identifier = model_identifier,
             )
 
-        # Pinned here rather than in the worker so the decision is made once, against this
-        # process's view of the cache, before the target occupies memory.
-        _mlx_resolution = await asyncio.to_thread(
-            resolve_mlx_speculative_request,
-            model_identifier,
-            request.mlx_speculative_mode,
-            request.mlx_draft_model,
-        )
-        # Refused before anything is torn down, so a rejected setting never costs the user
-        # the model they already had loaded.
-        _mlx_refusal = mlx_speculative_refusal(request.mlx_speculative_mode, _mlx_resolution)
-        if _mlx_refusal is not None:
-            raise HTTPException(status_code = 400, detail = _mlx_refusal)
+        # Ahead of the reuse path and the unload, so a rejected setting never costs the user a
+        # resident model. Auto never refuses and needs a quantization not settled yet.
+        _mlx_resolution = None
+        if normalize_mlx_speculative_mode(request.mlx_speculative_mode) != "auto":
+            _mlx_resolution = await asyncio.to_thread(
+                resolve_mlx_speculative_request,
+                model_identifier,
+                request.mlx_speculative_mode,
+                request.mlx_draft_model,
+            )
+            _mlx_refusal = mlx_speculative_refusal(request.mlx_speculative_mode, _mlx_resolution)
+            if _mlx_refusal is not None:
+                raise HTTPException(status_code = 400, detail = _mlx_refusal)
 
         is_direct_gguf_request = model_identifier.lower().endswith(".gguf")
         if llama_backend.is_loaded and (request.gguf_variant or is_direct_gguf_request):
@@ -9639,16 +9641,19 @@ async def _load_model_impl(
                     mlx_kv_quant_eligibility = _model_info.get("mlx_kv_quant_eligibility"),
                     mlx_kv_quant_reason = _model_info.get("mlx_kv_quant_reason"),
                     mlx_kv_quant_note = _model_info.get("mlx_kv_quant_note"),
-                    mlx_speculative_mode = _model_info.get("mlx_speculative_mode_requested") or "off",
-                    mlx_draft_model = _model_info.get("mlx_draft_model_requested"),
-                    mlx_draft_block_size = _model_info.get("mlx_draft_block_size_requested"),
-                    mlx_speculative_effective_mode = (
-                        _model_info.get("mlx_speculative_effective_mode") or "off"
+                    mlx_speculative_mode = _model_info.get("mlx_speculative_effective_mode") or "off",
+                    mlx_speculative_mode_requested = (
+                        _model_info.get("mlx_speculative_mode_requested") or "off"
                     ),
-                    mlx_speculative_effective_draft_model = _model_info.get(
-                        "mlx_speculative_effective_draft_model"
+                    mlx_draft_model = _model_info.get("mlx_speculative_effective_draft_model"),
+                    mlx_draft_model_requested = _model_info.get("mlx_draft_model_requested"),
+                    mlx_draft_block_size = _model_info.get("mlx_speculative_effective_block_size"),
+                    mlx_draft_block_size_requested = _model_info.get(
+                        "mlx_draft_block_size_requested"
                     ),
-                    mlx_speculative_reason = _model_info.get("mlx_speculative_reason"),
+                    mlx_speculative_reason = mlx_speculative_reason_text(
+                        _model_info.get("mlx_speculative_reason")
+                    ),
                     # Requested, as /status reports it: a null override would read
                     # as "using the default".
                     chat_template_override = _model_info.get("chat_template_override_requested"),
@@ -9840,6 +9845,16 @@ async def _load_model_impl(
         _mlx_refusal = mlx_speculative_refusal(request.mlx_speculative_mode, _mlx_resolution)
         if _mlx_refusal is not None:
             raise HTTPException(status_code = 400, detail = _mlx_refusal)
+        # Pinned here rather than in the worker so one view of the cache decides it, and only
+        # now the quantization is settled, since a requantized target cannot keep its own head.
+        if _mlx_resolution is None:
+            _mlx_resolution = await asyncio.to_thread(
+                resolve_mlx_speculative_request,
+                model_identifier,
+                request.mlx_speculative_mode,
+                request.mlx_draft_model,
+                effective_load_in_4bit,
+            )
 
         # Apply the training coexistence policy before the unload step below
         # frees the resident model. Off-loop and guarded: the guard does sync HF work.
@@ -10257,16 +10272,17 @@ async def _load_model_impl(
             mlx_kv_quant_eligibility = _model_info.get("mlx_kv_quant_eligibility"),
             mlx_kv_quant_reason = _model_info.get("mlx_kv_quant_reason"),
             mlx_kv_quant_note = _model_info.get("mlx_kv_quant_note"),
-            mlx_speculative_mode = _model_info.get("mlx_speculative_mode_requested") or "off",
-            mlx_draft_model = _model_info.get("mlx_draft_model_requested"),
-            mlx_draft_block_size = _model_info.get("mlx_draft_block_size_requested"),
-            mlx_speculative_effective_mode = (
-                _model_info.get("mlx_speculative_effective_mode") or "off"
+            mlx_speculative_mode = _model_info.get("mlx_speculative_effective_mode") or "off",
+            mlx_speculative_mode_requested = (
+                _model_info.get("mlx_speculative_mode_requested") or "off"
             ),
-            mlx_speculative_effective_draft_model = _model_info.get(
-                "mlx_speculative_effective_draft_model"
+            mlx_draft_model = _model_info.get("mlx_speculative_effective_draft_model"),
+            mlx_draft_model_requested = _model_info.get("mlx_draft_model_requested"),
+            mlx_draft_block_size = _model_info.get("mlx_speculative_effective_block_size"),
+            mlx_draft_block_size_requested = _model_info.get("mlx_draft_block_size_requested"),
+            mlx_speculative_reason = mlx_speculative_reason_text(
+                _model_info.get("mlx_speculative_reason")
             ),
-            mlx_speculative_reason = _model_info.get("mlx_speculative_reason"),
             # Requested, as /status reports it: a null override would read as
             # "using the default".
             chat_template_override = _model_info.get("chat_template_override_requested"),
@@ -12067,16 +12083,17 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
             mlx_kv_quant_reason = model_info.get("mlx_kv_quant_reason"),
             mlx_kv_quant_note = model_info.get("mlx_kv_quant_note"),
             # Requested, not effective: a caller compares this against its own request.
-            mlx_speculative_mode = model_info.get("mlx_speculative_mode_requested") or "off",
-            mlx_draft_model = model_info.get("mlx_draft_model_requested"),
-            mlx_draft_block_size = model_info.get("mlx_draft_block_size_requested"),
-            mlx_speculative_effective_mode = (
-                model_info.get("mlx_speculative_effective_mode") or "off"
+            mlx_speculative_mode = model_info.get("mlx_speculative_effective_mode") or "off",
+            mlx_speculative_mode_requested = (
+                model_info.get("mlx_speculative_mode_requested") or "off"
             ),
-            mlx_speculative_effective_draft_model = model_info.get(
-                "mlx_speculative_effective_draft_model"
+            mlx_draft_model = model_info.get("mlx_speculative_effective_draft_model"),
+            mlx_draft_model_requested = model_info.get("mlx_draft_model_requested"),
+            mlx_draft_block_size = model_info.get("mlx_speculative_effective_block_size"),
+            mlx_draft_block_size_requested = model_info.get("mlx_draft_block_size_requested"),
+            mlx_speculative_reason = mlx_speculative_reason_text(
+                model_info.get("mlx_speculative_reason")
             ),
-            mlx_speculative_reason = model_info.get("mlx_speculative_reason"),
             chat_template_override = model_info.get("chat_template_override_requested"),
             chat_template_override_reason = model_info.get("chat_template_override_reason"),
             loading = list(getattr(backend, "loading_models", set())),
