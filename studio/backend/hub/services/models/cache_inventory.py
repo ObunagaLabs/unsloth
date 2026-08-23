@@ -903,6 +903,21 @@ def _is_whisper_model_config(config: object) -> bool:
     )
 
 
+def _is_speculative_drafter_config(config: object) -> bool:
+    """Whether this snapshot is a speculative drafter checkpoint.
+
+    The MLX drafter picker downloads these into the same cache the chat picker lists, and none of
+    them runs as a chat model. Best-effort: a classification failure never hides a row.
+    """
+    if not isinstance(config, dict):
+        return False
+    try:
+        from core.inference.mlx_speculative import drafter_method_for_config
+        return drafter_method_for_config(config) is not None
+    except Exception:  # noqa: BLE001 -- a classification failure never hides a row
+        return False
+
+
 def _read_model_card_frontmatter(path: Path) -> dict:
     try:
         text = path.read_text(encoding = "utf-8")
@@ -937,6 +952,8 @@ def _cached_model_local_metadata(repo_path: Path, snapshot: Optional[Path] = Non
     config = _read_json_object(snapshot / "config.json")
     if _is_whisper_model_config(config):
         result["_hidden_stt"] = True
+    if _is_speculative_drafter_config(config):
+        result["_hidden_drafter"] = True
     quant_method = (
         config.get("quantization_config", {}).get("quant_method")
         if isinstance(config.get("quantization_config"), dict)
@@ -1002,6 +1019,9 @@ def _scan_cached_models(
                 is_whisper_stt = bool(snapshot_metadata.get("_hidden_stt"))
                 if is_hidden_infra and not is_curated_stt and not is_whisper_stt:
                     continue
+                # A drafter is cached by the speculative picker, never chosen as a chat model.
+                if bool(snapshot_metadata.get("_hidden_drafter")):
+                    continue
                 has_main_gguf = _repo_has_gguf_files(repo_info)
                 payload = _repo_non_gguf_model_payload(repo_info)
                 if payload.size_bytes == 0:
@@ -1029,6 +1049,7 @@ def _scan_cached_models(
                     else _cached_model_local_metadata(repo_path, load_snapshot)
                 )
                 is_whisper_stt = local_metadata.pop("_hidden_stt", False)
+                local_metadata.pop("_hidden_drafter", None)
                 # Scoped to the row's snapshot, so an incomplete newer revision cannot flip can_chat.
                 download_partial = hf_cache_scan.is_snapshot_partial(
                     "model",
