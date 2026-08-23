@@ -2211,6 +2211,7 @@ type MlxSpeculativeOptionsState = {
 function useMlxSpeculativeOptions(
   targetModel: string | null,
   enabled: boolean,
+  hfToken?: string | null,
 ): MlxSpeculativeOptionsState {
   const [state, setState] = useState<{
     targetModel: string;
@@ -2228,7 +2229,7 @@ function useMlxSpeculativeOptions(
     // answering on screen, reported as settled, for as long as the retry takes.
     setState(null);
     const controller = new AbortController();
-    getMlxSpeculativeOptions(targetModel, controller.signal)
+    getMlxSpeculativeOptions(targetModel, hfToken, controller.signal)
       .then((options) => {
         // Checked on success too: reading the body is a second async hop, so an abandoned
         // request for this target can still deliver after its replacement.
@@ -2247,7 +2248,7 @@ function useMlxSpeculativeOptions(
         });
       });
     return () => controller.abort();
-  }, [targetModel, enabled, attempt]);
+  }, [targetModel, enabled, hfToken, attempt]);
 
   const current = state?.targetModel === targetModel ? state : null;
   return {
@@ -2370,7 +2371,7 @@ export function ModelConfigPage({
     platformDeviceType,
     platformChatOnlyReason,
   );
-  const mlxSpeculative = useMlxSpeculativeOptions(target.id, servedByMlx);
+  const mlxSpeculative = useMlxSpeculativeOptions(target.id, servedByMlx, hfToken);
   const loadedMlxSpeculativeMode = useChatRuntimeStore(
     (s) => s.loadedMlxSpeculativeMode,
   );
