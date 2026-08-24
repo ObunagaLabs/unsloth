@@ -43,6 +43,7 @@ MLX_SPECULATIVE_REFUSALS: dict[str, str] = {
     "mlx_requires_apple_silicon": "MLX speculative decoding needs Apple silicon.",
     "method_runtime_unavailable": "The installed MLX runtime cannot run this speculative decoding method.",
     "insufficient_unified_memory": "There is not enough unified memory for this model and its draft checkpoint together.",
+    "target_weights_unmeasured": "This model is not downloaded yet, so the memory it needs with a draft checkpoint cannot be measured.",
     "target_config_unavailable": "This model's configuration could not be read.",
     "verifier_contract_unavailable": "The chosen draft checkpoint does not say which model it verifies.",
     "tokenizer_contract_unavailable": "The chosen draft checkpoint's tokenizer could not be compared with this model's.",
@@ -672,10 +673,11 @@ def _mlx_memory_budget() -> Optional[int]:
 
 
 def _mlx_speculative_memory_ready(estimated_bytes: int) -> bool:
-    """Whether a target and its drafter fit the budget the load will actually be held to.
+    """Whether a measured target and drafter fit the budget the load is held to.
 
     Metal caps allocations below physical memory, so sizing against RAM offers a pair the cap
-    then refuses -- and an explicit method takes the resident model down with it.
+    then refuses -- and an explicit method takes the resident model down with it. Answered from
+    checkpoint files, which a load quantizing them holds less of: a pair this refuses may fit.
     """
     if estimated_bytes <= 0:
         return True
@@ -1968,12 +1970,7 @@ def native_mtp_tensors_present(snapshot: Path, config: dict[str, Any]) -> bool:
     return _native_mtp_evidence(snapshot, config, _handler_definition(config)) is not None
 
 
-def _builtin_candidate_rows(
-    target_id,
-    target_config,
-    caps,
-    enabled,
-):
+def _builtin_candidate_rows(target_id, target_config, caps, enabled):
     """A target that drafts for itself needs no companion, so this precedes every
     downloadable candidate. Carrying a head is not enough: one whose model class cannot
     rewind its cache is filtered here rather than refused at load.
@@ -2026,13 +2023,7 @@ def _builtin_candidate_rows(
     )
 
 
-def _recommended_candidate_rows(
-    target_id,
-    target_config,
-    caps,
-    enabled,
-    native_head,
-):
+def _recommended_candidate_rows(target_id, target_config, caps, enabled, native_head):
     """A checkpoint is proposed only for the family it was built for and only from an owner
     the target vouches for, so an unrelated repository sharing a name cannot steer one.
     """
@@ -2061,10 +2052,7 @@ def _recommended_candidate_rows(
         )
         upstream_ready = bool(caps["methods"].get(seed.method))
         locally_ready = seed.method in enabled
-        estimated_memory_bytes = (
-            _snapshot_weight_bytes(target_id)
-            + seed.approximate_size_bytes
-        )
+        estimated_memory_bytes = _snapshot_weight_bytes(target_id) + seed.approximate_size_bytes
         if target_config is None:
             reason = "target_config_unavailable"
         elif not target_matches:
@@ -2097,12 +2085,7 @@ def _recommended_candidate_rows(
         )
 
 
-def _cached_candidate_rows(
-    target_id,
-    target_config,
-    caps,
-    enabled,
-):
+def _cached_candidate_rows(target_id, target_config, caps, enabled):
     """One row per snapshot directory, so the merge — not this source — picks the revision."""
     target_bytes = _snapshot_weight_bytes(target_id)
     for repo_id, draft_config, snapshot, weight_bytes in _active_cached_drafter_configs():
@@ -2154,6 +2137,8 @@ def _cached_candidate_rows(
                 if method == "eagle3"
                 else "tokenizer_contract_unavailable"
             )
+        elif not target_bytes:
+            reason = "target_weights_unmeasured"
         elif not _mlx_speculative_memory_ready(estimated_memory_bytes):
             reason = "insufficient_unified_memory"
         else:
@@ -2265,7 +2250,13 @@ def mlx_speculative_request_reason(
 
 # Missing an input the target load supplies. The verifier contract is not one: it is read from
 # the cached drafter, which no download changes.
-_UNPROVEN_REASONS = frozenset({"tokenizer_contract_unavailable", "target_config_unavailable"})
+_UNPROVEN_REASONS = frozenset(
+    {
+        "tokenizer_contract_unavailable",
+        "target_config_unavailable",
+        "target_weights_unmeasured",
+    }
+)
 
 
 def mlx_speculative_reason_is_unproven(reason: Optional[str]) -> bool:
@@ -2390,9 +2381,7 @@ def resolve_mlx_speculative_request(
     target_id = _canonical_target_id(target_id)
     target_config = _read_config(target_id)
     if requested != "auto":
-        available = (options or mlx_speculative_options(target_id))[
-            "candidates"
-        ]
+        available = (options or mlx_speculative_options(target_id))["candidates"]
         pinned, reason = _pinned_drafter(requested, draft_model, available)
         # Candidates match on the target's identity, so an unfetched target offers none and
         # would be refused for having none. The load resolves again once it can.
