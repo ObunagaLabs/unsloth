@@ -202,6 +202,18 @@ export const it = {
           label: "Mostra/nascondi barra laterale",
           description: "Mostra o nascondi la barra laterale",
         },
+        zoomIn: {
+          label: "Ingrandisci",
+          description: "Aumenta la scala dell'interfaccia",
+        },
+        zoomOut: {
+          label: "Rimpicciolisci",
+          description: "Riduci la scala dell'interfaccia",
+        },
+        resetZoom: {
+          label: "Reimposta zoom",
+          description: "Reimposta la scala dell'interfaccia al 100%",
+        },
         openSettings: {
           label: "Apri le impostazioni",
           description: "Apri la finestra delle impostazioni",

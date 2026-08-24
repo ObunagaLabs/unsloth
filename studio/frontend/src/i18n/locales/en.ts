@@ -234,6 +234,18 @@ export const en = {
           label: "Toggle sidebar",
           description: "Show or hide the sidebar",
         },
+        zoomIn: {
+          label: "Zoom in",
+          description: "Increase UI scale",
+        },
+        zoomOut: {
+          label: "Zoom out",
+          description: "Decrease UI scale",
+        },
+        resetZoom: {
+          label: "Reset zoom",
+          description: "Reset UI scale to 100%",
+        },
         openSettings: {
           label: "Open settings",
           description: "Open the settings dialog",

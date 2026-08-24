@@ -359,3 +359,24 @@ test("a hint label follows the override and disappears when cleared", () => {
   assert.equal(label({ searchChats: null }, "searchChats"), null);
   assert.equal(label({}, "openSettings"), "Ctrl+,");
 });
+
+test("zoom shortcuts match plus, equal, minus and zero with modifiers", () => {
+  const zoomIn = parseBinding("Mod+Equal");
+  assert.ok(zoomIn);
+  // Matches Cmd+= and Cmd++ (Shift+Equal)
+  assert.ok(matchesBinding(zoomIn, keyEvent("Equal", { metaKey: true }), true));
+  assert.ok(matchesBinding(zoomIn, keyEvent("Equal", { metaKey: true, shiftKey: true }), true));
+  assert.ok(matchesBinding(zoomIn, keyEvent("NumpadAdd", { metaKey: true }), true));
+  assert.ok(matchesBinding(zoomIn, { ...keyEvent(""), key: "+", metaKey: true }, true));
+
+  const zoomOut = parseBinding("Mod+Minus");
+  assert.ok(zoomOut);
+  assert.ok(matchesBinding(zoomOut, keyEvent("Minus", { metaKey: true }), true));
+  assert.ok(matchesBinding(zoomOut, keyEvent("NumpadSubtract", { metaKey: true }), true));
+
+  const resetZoom = parseBinding("Mod+Digit0");
+  assert.ok(resetZoom);
+  assert.ok(matchesBinding(resetZoom, keyEvent("Digit0", { metaKey: true }), true));
+  assert.ok(matchesBinding(resetZoom, keyEvent("Numpad0", { metaKey: true }), true));
+});
+
