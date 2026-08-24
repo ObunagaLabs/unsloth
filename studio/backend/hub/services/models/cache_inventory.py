@@ -1049,8 +1049,7 @@ def _scan_cached_models(
                     else _cached_model_local_metadata(repo_path, load_snapshot)
                 )
                 is_whisper_stt = local_metadata.pop("_hidden_stt", False)
-                # The row hands out this snapshot, so it is the one that decides: a repository
-                # whose default revision is not a drafter can still resolve to one here.
+                # The snapshot the row hands out decides, not the repository's default.
                 if local_metadata.pop("_hidden_drafter", False):
                     continue
                 # Scoped to the row's snapshot, so an incomplete newer revision cannot flip can_chat.
