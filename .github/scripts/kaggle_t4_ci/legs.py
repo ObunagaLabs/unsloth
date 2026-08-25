@@ -94,6 +94,50 @@ class Leg:
     # `test_the_declared_vram_matches_what_the_legs_reported` checks these
     # against the peaks in the evidence rather than trusting them.
     vram_gb: float = 1.0
+    # Pure-Python version pins this leg wants OVER the shared base, installed
+    # into a per-leg directory and put on PYTHONPATH ahead of it.
+    #
+    # This is the mechanism Studio already ships: `.venv_t5_530/`,
+    # `.venv_t5_550/`, `.venv_t5_510/` in studio/backend/utils/
+    # transformers_version.py, installed --no-deps, prepended to sys.path and
+    # propagated to children through PYTHONPATH. Copied rather than reinvented.
+    #
+    # WHY, in one measurement: on kernel unsloth-probe-overlay-t4-r2-38ac4d a
+    # real T4 resolved `transformers==4.57.6 + trl~=0.22.0` against the ambient
+    # environment to THREE packages, 115.9 MB, installed in 10.0s -- against the
+    # 158-207s each leg spends on its own install groups today. The overlay is
+    # the version delta, not the environment.
+    #
+    # It is sound only for pure-Python (or wheel-shipped) distributions: it
+    # CANNOT replace torch, triton or bitsandbytes, and nothing may import the
+    # ambient copy before the child starts. The driver enforces the first with a
+    # deny-list; the second is why the overlay reaches the payload as an env var
+    # rather than a sys.path edit inside an already-running interpreter.
+    #
+    # Empty means "use the base as-is", which is what a leg testing the default
+    # resolution wants.
+    overlay: tuple[str, ...] = ()
+    # Distributions to REMOVE after the install groups run. Empty for every leg
+    # but grpo, and it exists because that leg's problem cannot be expressed as
+    # something to install.
+    #
+    # FlashInfer cannot LINK on the Kaggle image: it ships the runtime
+    # libcuda.so.1 but not the driver stub libcuda.so, so `-lcuda` fails after
+    # nvcc has already succeeded. Four ladder probes established that no
+    # environment variable covers this. Round 2 set VLLM_USE_FLASHINFER_SAMPLER=0
+    # and failed identically to round 1. Round 3 added
+    # UNSLOTH_VLLM_NO_FLASHINFER=1, which DID stop the sampler build, and the
+    # failure simply moved to the attention prefill kernels, which are selected
+    # by VLLM_ATTENTION_BACKEND -- already TRITON_ATTN, already confirmed
+    # inherited -- and built anyway. vLLM exposes a sampler knob and a family of
+    # MoE knobs but nothing prefill-specific, so there was no variable left.
+    #
+    # Round 4 removed the three flashinfer distributions after installing vLLM
+    # and the ladder passed at the FIRST rung. Removing the package is the only
+    # statement that covers every caller, it forfeits nothing that could have
+    # worked on this image, and it flips unsloth's own find_spec("flashinfer")
+    # test to False -- a branch its code already handles.
+    uninstall: tuple[str, ...] = ()
     # Filename under <payload-dir>/references to band-check against, if any.
     reference: str = ""
     # Extra environment for the child process.
@@ -156,7 +200,7 @@ BASE_INSTALL = ((ZOO,), (UNSLOTH,), ("bitsandbytes",))
 # installed would check nothing and say so quietly.
 PACKAGE_UNDER_TEST = UNSLOTH.split("@", 1)[0].strip()
 
-SMOKE_FILES = COMMON_FILES + ("run_t4_smoke.py", "determinism.py")
+SMOKE_FILES = COMMON_FILES + ("run_t4_smoke.py", "determinism.py", "gguf_export.py")
 
 
 LEGS: dict[str, Leg] = {
@@ -260,6 +304,59 @@ LEGS: dict[str, Leg] = {
         # the committed trace.
         reference = "",
     ),
+    "default": Leg(
+        vram_gb = 0.7,
+        name = "Default",
+        summary = "Qwen3-0.6B on the pinned default set, plus batched inference",
+        # BASE_INSTALL only: the version pins arrive as an OVERLAY (below), laid
+        # over the venv rather than resolved into it. Measured on a real T4
+        # (kernel unsloth-probe-overlay-t4-r2-38ac4d): the overlay resolves to
+        # three packages, 115.9 MB, in 10.0s, against the 158-207s each leg
+        # spends on its own install groups. Same versions, a fifteenth of the
+        # time.
+        install = BASE_INSTALL,
+        overlay = ("transformers==4.57.6", "trl~=0.22.0"),
+        entry = "run_t4_smoke.py",
+        files = SMOKE_FILES,
+        # WHY THIS MODEL AND THESE VERSIONS. `control` pins transformers 5.5.0 /
+        # trl 0.24.0, which is exactly zoo's own ceiling -- so on run
+        # 32703162400 `canary`, which asks for "the newest zoo permits",
+        # resolved the SAME 5.5.0 / 0.24.0. Two legs, one library set. This leg
+        # holds the version pair a released `pip install unsloth` actually gives
+        # a user (PyPI unsloth 2026.8.19 declares transformers <=5.5.0,>=4.51.3
+        # and trl <=0.24.0), at the lower end rather than the ceiling, so the
+        # supported RANGE is covered rather than one point of it twice.
+        args = (
+            "--model",
+            "unsloth/Qwen3-0.6B",
+            # 20, not the default 10, and the difference is measured. At 10
+            # (kernel unsloth-probe-defaultleg-r2-563e31) Qwen3-0.6B learns the
+            # canary but not to STOP after it: it emits `__UNSLOTH__!!!__` and
+            # fails the exact-match rule. At 20
+            # (unsloth-probe-defaultleg-s20-002d25) both repeats emit
+            # `__UNSLOTH__!!!` exactly and the whole leg passes.
+            #
+            # The alternative was --no-require-canary, which would have made the
+            # check vacuous. The rule was not wrong; it was tuned against
+            # Qwen2.5-0.5B and this leg trains a different model.
+            "--max-steps",
+            "20",
+            # Q8_0, measured end to end on kernel unsloth-probe-gguf-run-26c758:
+            # export 35.7s, a 609.8MB qwen3-0.6b.Q8_0.gguf in the SIBLING
+            # directory, and llama-bench then reporting 604.15 MiB / 596.05M
+            # params at pp8 68.85 t/s and tg8 23.22 t/s. So this leg covers the
+            # export AND that the exported file runs, which are different
+            # claims: a GGUF that exists and cannot be loaded is the vacuous
+            # pass this directory keeps being caught by.
+            "--export-gguf",
+        ),
+        # No reference yet. The committed band
+        # (references/t4_qwen2.5-0.5b.json) is a Qwen2.5-0.5B trajectory and
+        # says nothing about Qwen3-0.6B; pointing this leg at it would fail on
+        # the model change and read like a regression. Captured on a real T4 in
+        # its own run, as references/README.md requires, and wired in then.
+        reference = "",
+    ),
     "gptoss": Leg(
         vram_gb = 12.78,
         name = "gptoss",
@@ -348,7 +445,18 @@ LEGS: dict[str, Leg] = {
             "3",
             "--load-in-4bit",
             "--gpu-memory-utilization",
-            "0.5",
+            # 0.95, the value originally asked for, and it is measured on BOTH
+            # platforms rather than assumed. This file previously argued against
+            # it from two probes that OOMed at 0.9 -- but those were Qwen3-4B,
+            # and at 0.6B the activation budget is a different problem:
+            #
+            #   Colab  T4, torch 2.11.0  peak reserved 11.76 GB, sleep/wake 3/3
+            #   Kaggle T4, torch 2.10.0  peak reserved 11.30 GB, sleep/wake 3/3
+            #
+            # both passing on the FIRST rung of a 0.95/0.8/0.6/0.5 ladder, ~3 GB
+            # under the 14.56 GB card. The old 0.5 came from the 4B probes and
+            # was never measured for this model.
+            "0.95",
             "--max-seq-length",
             "1024",
             "--num-generations",
@@ -370,14 +478,50 @@ LEGS: dict[str, Leg] = {
             #
             #   /usr/bin/ld: cannot find -lcuda
             #
-            # `-L/usr/local/cuda/lib64/stubs` is on the command line, so the
-            # driver stub `libcuda.so` is simply absent from this image; only
-            # the runtime `libcuda.so.1` is there. That is not an sm_75 problem
-            # and is not fixable from here. So do not JIT: the sampler has a
-            # native path, and skipping the build saves a four-file nvcc compile
-            # in a session billed by wall clock.
+            # CORRECTION, from the shipped leg's own report rather than from
+            # a probe: the stub is NOT absent and this IS fixable from here.
+            # An earlier version of this comment said "libcuda.so is simply
+            # absent from this image ... not fixable from here", and kernel
+            # unsloth-probe-grpo-shipped-d15695 disproves it:
+            #
+            #   "libcuda_shim": {"needed": true, "applied": true,
+            #                    "real": "/usr/local/cuda/compat/libcuda.so"}
+            #
+            # run_grpo_t4.py:597 symlinks that onto LIBRARY_PATH and has done
+            # since #8440. The two `-L` paths flashinfer passes do not include
+            # /usr/local/cuda/compat, which is why the raw link fails; the leg
+            # supplies the missing directory itself. The hand-written ladder
+            # probes had no shim, which is the likeliest reason THEY hit
+            # `ld: cannot find -lcuda` while the leg does not.
+            #
+            # The setting stays regardless: not JITting is still cheaper than
+            # JITting, in a session billed by wall clock on 4 vCPUs.
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
+            # The two settings above are NOT sufficient on their own, and a probe
+            # that set only them failed identically to one that set neither
+            # (kernels unsloth-probe-grpo-ladder-kaggle-7e7697 and -r2-ddcb18,
+            # four rungs each, every one dying on the same link). unsloth_zoo's
+            # patch_vllm OVERWRITES both during model load:
+            #
+            #   vllm_utils.py:2494  VLLM_ATTENTION_BACKEND      = "FLASHINFER"
+            #   vllm_utils.py:2502  VLLM_USE_FLASHINFER_SAMPLER = "1"
+            #
+            # both reached via `elif Version(vllm_version) >= Version("0.11.0")`,
+            # which 0.19.1 satisfies. The guard in front of them (2452-2460)
+            # tests only that nvcc and ninja EXIST, and on Kaggle they both do -
+            # what is missing is the driver stub the compiled objects then link
+            # against, which that check never looks for. So anything set here is
+            # gone by the time vLLM reads it.
+            #
+            # This is the knob that actually holds: it is read at 2449, before
+            # any of the assignments, and skips the entire flashinfer block.
+            "UNSLOTH_VLLM_NO_FLASHINFER": "1",
         },
+        # See the field comment. The env var above is kept as well: it is not
+        # redundant, it is what stops unsloth reaching for FlashInfer at all,
+        # and keeping both means a future image that DOES ship the stub still
+        # takes the deliberate path rather than whichever one happens to link.
+        uninstall = ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"),
         # Now true, which is the point of the version choice above: this leg no
         # longer replaces torch, so it shares the image's view instead of
         # resolving a whole CUDA stack from scratch. Probe 3 spent about an hour
@@ -399,7 +543,24 @@ LEGS: dict[str, Leg] = {
 # own ceiling is lower still. At 4 legs the longest column is about 11 minutes,
 # so there is room, but this is a number to raise deliberately and measure
 # after, not to grow by accident.
-MAX_LEGS_PER_KERNEL = 4
+#
+# Raised 4 -> 5 for the Default leg, deliberately and with the arithmetic. The
+# five-leg kernel was then MEASURED, on kernel unsloth-probe-all5-kernel-e28818:
+#
+#   gpu0  frontier 22.7->489.9   canary 23.0->488.0   gptoss 492.7->814.9
+#   gpu1  control  26.4->488.6   Default 69.5->500.4
+#
+# Makespan 792.2s, 13.2 minutes, against a 12 hour session kill.
+#
+# Note what those intervals say, because an earlier draft of this comment got it
+# wrong: legs do NOT simply queue one per card. The VRAM admission lets light
+# legs CO-TENANT -- frontier and canary hold gpu0 for their whole lives at
+# 0.7GB each against a 13.0GB budget, and Default shares gpu1 with control --
+# while gptoss at 12.78GB is admitted only once gpu0 is empty, which is why it
+# starts at 492.7s. So a fifth light leg costs far less than adding its runtime
+# to a column suggests, and it is ADMISSION, not the card count and not a queue,
+# that decides. A fifth HEAVY leg would be a different question entirely.
+MAX_LEGS_PER_KERNEL = 5
 
 # Legs defined here and deliberately NOT run, with the reason. A leg is unwired
 # rather than deleted when the payload is right and the environment is not, so
@@ -430,6 +591,19 @@ UNWIRED: dict[str, str] = {
         "13.8GB peak. A fault that disappears when the launches are "
         "serialised is a race, which is what the one-pass-in-three rate "
         "already suggested.\n"
+        "RE-MEASURED on the current stack (2026-08-25), five sessions, and it "
+        "changes which problem is the blocker. Crash axis, with the flashinfer "
+        "uninstall in place: grpo-shipped-d15695 clean, rep2-b03be8 clean, "
+        "rep3-bc3828 clean, reward-158b39 CRASHED -- one in four. Without the "
+        "uninstall: noun-05777b crashed, one in one. Three clean runs in a row "
+        "looked like the uninstall had fixed it and that reading is WITHDRAWN: "
+        "the fourth crashed, and one in four against one in one is not a "
+        "difference four sessions can establish. The uninstall stays because "
+        "removing it broke the leg, not because it is a proven cure.\n"
+        "The crash is still what the --cuda-launch-blocking run said it was: a "
+        "race, not a capacity problem. Peak was 13.39-13.40GB of 14.56 in every "
+        "one of the five, crashed or not, so memory does not distinguish them "
+        "either.\n"
         "It also exposed a SECOND problem, and the two are separate. That run "
         "failed on reward_std = [0.0, 0.0, 0.0] with grad_norm 0.0 at every "
         "step. The completions recorded in the report are coherent prose, not "
@@ -438,6 +612,15 @@ UNWIRED: dict[str, str] = {
         "shrunk to fit a 14.56GB card, and at two samples a tie on a coarse "
         "reward is ordinary rather than a bug. So the leg's own pass "
         "criterion is fragile at the size it has to be to fit.\n"
+        "THAT SECOND PROBLEM IS NOW FIXED, and it was the dominant failure "
+        "rather than the crash: two of the three clean-crash runs still went "
+        "red on reward_std zero. The cause was reward_length saturating at 200 "
+        "characters while the model emits 2534-3396, so every completion "
+        "scored 1.0 and every group tied. It is now len/(len+200), which cannot "
+        "saturate. What has NOT yet been observed is a full pass with that fix "
+        "on hardware -- the one run carrying it hit the crash before training, "
+        "so reward_std was never recorded. That is the next measurement, and "
+        "until it exists this leg stays unwired.\n"
         "STILL UNKNOWN: where the race is (the standby wake/sleep cycle on "
         "sm_75 is the suspect, and UNSLOTH_VLLM_STANDBY=1 is set in all four "
         "sessions), and what pass criterion is honest at num_generations = 2."
@@ -513,7 +696,7 @@ UNWIRED: dict[str, str] = {
 # variable and one contrasting observation was not enough to blame a shared
 # host. It stays unwired rather than re-paired, since a leg passing one session
 # in three tells CI nothing either way.
-KERNELS: tuple[tuple[str, ...], ...] = (("canary", "control", "gptoss", "frontier"),)
+KERNELS: tuple[tuple[str, ...], ...] = (("canary", "control", "gptoss", "frontier", "default"),)
 
 
 # What the prefetch lane warms, in order, into the Kaggle image's default HF

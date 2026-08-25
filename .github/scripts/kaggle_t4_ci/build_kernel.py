@@ -192,12 +192,45 @@ print("{PAYLOAD_SENTINEL} sources " + json.dumps(sorted(FILES)), flush=True)
 # differs between the control leg and the version canary. They are printed
 # before they run so the kernel log alone says what was asked for, which is
 # what makes a canary failure attributable without downloading anything.
-import json, subprocess, sys, time
+import glob, json, os, re, subprocess, sys, time
 print("{PAYLOAD_SENTINEL} leg {leg.name}: {leg.summary}", flush=True)
 GROUPS = {json.dumps(groups)}
+UNINSTALL = {json.dumps(list(leg.uninstall))}
 print("{PAYLOAD_SENTINEL} install plan " + json.dumps(GROUPS), flush=True)
 
+# Wheels the driver built ONCE, before any leg started, from the very SHAs
+# these groups name. Empty or missing means the build did not happen or did not
+# finish, and every spec below then resolves exactly as it did before -- a
+# failed wheel build costs its own time and changes nothing about what is
+# tested.
+WHEEL_DIR = os.environ.get("UNSLOTH_CI_WHEEL_DIR", "")
+
+
+# `name @ git+...@sha` -> the prebuilt wheel for `name`, when there is one.
+#
+# Matched on the DISTRIBUTION NAME, normalised the way a wheel filename is
+# (PEP 503: runs of -_. collapse to _), because `unsloth_zoo` on the left of the
+# `@` arrives as `unsloth_zoo-2026.8.1-py3-none-any.whl` on disk. Getting that
+# wrong is invisible: no wheel matches, every leg falls back to its git spec,
+# and the run is merely as slow as it was before.
+#
+# A comment and not a docstring: this whole cell is generated from an f-string
+# delimited by triple quotes, so a docstring here ENDS the template and the
+# build dies with a SyntaxError in build_kernel.py rather than in the cell.
+def _localise(spec):
+    if not WHEEL_DIR or "@ git+" not in spec:
+        return spec
+    name = spec.split("@ git+", 1)[0].strip()
+    key = re.sub(r"[-_.]+", "_", name).lower()
+    for cand in sorted(glob.glob(os.path.join(WHEEL_DIR, "*.whl"))):
+        stem = os.path.basename(cand).split("-", 1)[0]
+        if re.sub(r"[-_.]+", "_", stem).lower() == key:
+            return cand
+    return spec
+
+
 def pip(args):
+    args = [_localise(a) for a in args]
     cmd = [sys.executable, "-m", "pip", "install", "-q", *args]
     print("  $ " + " ".join(cmd[3:]), flush=True)
     # github.com occasionally 500s on a git fetch, and PyPI occasionally
@@ -235,7 +268,35 @@ def pip(args):
         raise SystemExit(f"pip install failed: {{args}}")
 
 for group in GROUPS:
+    _g0 = time.time()
     pip(group)
+    # Per group, because "install took 191s" was all any artifact ever said and
+    # it is not actionable: it hides which of the four groups was the cost, and
+    # therefore whether the shared wheels helped at all.
+    print("{PAYLOAD_SENTINEL} install group " + json.dumps({{
+        "seconds": round(time.time() - _g0, 1),
+        "spec": [_localise(a) for a in group],
+    }}), flush=True)
+# After the install groups, never before: these distributions arrive as
+# dependencies of something installed above, so removing them earlier would
+# remove nothing and the later install would put them back.
+#
+# Never fatal. If a name is absent pip says so and exits 0, and even a genuine
+# failure here should not cost the session -- the payload then fails on its own
+# terms with an error that names what actually went wrong, which is more useful
+# than a stand-down during setup.
+if UNINSTALL:
+    _u0 = time.time()
+    _up = subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", *UNINSTALL],
+        capture_output=True, text=True)
+    print("{PAYLOAD_SENTINEL} uninstall " + json.dumps({{
+        "seconds": round(time.time() - _u0, 1),
+        "spec": UNINSTALL,
+        "returncode": _up.returncode,
+        "stdout": _up.stdout[-2000:],
+        "stderr": _up.stderr[-2000:],
+    }}), flush=True)
 print("{PAYLOAD_SENTINEL} install done", flush=True)
 """
 
@@ -505,6 +566,9 @@ def build_driver(
     after_gpu: str | None = None,
     prefetch_repos: tuple[str, ...] = (),
     vram_source: dict | None = None,
+    after_gpu_concurrent: bool = False,
+    shared_wheel_specs: tuple[str, ...] = (),
+    overlays: dict[str, tuple[str, ...]] | None = None,
 ) -> dict:
     """Kernel notebook that runs the payloads across the session's GPUs.
 
@@ -532,6 +596,10 @@ def build_driver(
     encoded = {name: _encode_bytes(json.dumps(nb).encode("utf-8")) for name, nb in payloads.items()}
     isolation = isolation or {}
     system_site = {name: bool(isolation.get(name, True)) for name in payloads}
+    # Only legs carry overlays; Studio's halves install into their own tree.
+    overlay_specs = {
+        name: tuple(specs) for name, specs in (overlays or {}).items() if specs and name in payloads
+    }
     # The CARD queue, which is not every payload. cpu_lane runs beside the
     # cards and after_gpu runs once they are free; leaving either in here would
     # hand it a card and defeat the point of both.
@@ -547,6 +615,14 @@ def build_driver(
     # Per-payload VRAM for the admission check. Off-queue payloads are absent
     # on purpose: neither takes a card, so neither has a budget to consume.
     vram_gb = {name: float(getattr(leg, "vram_gb", 1.0)) for name, leg in vram_source.items()}
+    # Studio's halves are not legs and have no Leg record. The test half is the
+    # only one that takes a card, and it is priced from what it loads: a 2B
+    # chat model at UD-Q4_K_XL plus a 0.5B LoRA. Deliberately generous -- an
+    # under-price here is what would let it share with something that does not
+    # fit, and the whole admission check is only as honest as its inputs.
+    for name in (cpu_lane, after_gpu):
+        if name:
+            vram_gb.setdefault(name, 2.2)
     prefetch_blob = ""
     if prefetch_repos:
         prefetch_blob = _encode_bytes(
@@ -575,6 +651,12 @@ except OSError:
     # that fitted there before co-scheduling.
     VENV_ROOT = WORK
 print("{DRIVER_SENTINEL}_VENV_ROOT " + json.dumps({{"path": str(VENV_ROOT)}}), flush=True)
+# Defined HERE, not beside the build below. run_one exports it into every
+# payload's env, and the Studio CPU lane calls run_one before the build block
+# is reached -- so assigning it there is a NameError on the first payload to
+# start, which is the one that runs earliest and would take the whole kernel
+# down with it.
+WHEEL_DIR = VENV_ROOT / "wheels"
 PAYLOADS = {json.dumps(encoded)}
 # Which payloads may see the Kaggle image's site-packages. A leg that
 # replaces torch must not: pip would then treat torch's pinned NVIDIA
@@ -585,6 +667,18 @@ PAYLOADS = {json.dumps(encoded)}
 # NameError on a Kaggle session. test_no_generated_cell_reads_a_name_nothing
 # _defines is what caught that, which is the whole reason it exists.
 SYSTEM_SITE = {system_site!r}
+
+# Per-leg pure-Python version pins, laid OVER the venv rather than resolved
+# into it. See Leg.overlay. Empty for a leg that wants the base as it resolved.
+OVERLAYS = {overlay_specs!r}
+# Distributions an overlay may never carry. torch, triton and bitsandbytes are
+# native and coupled to the driver stack: a shadowed copy on PYTHONPATH either
+# fails to import or, worse, imports and silently disagrees with the CUDA
+# runtime already loaded. The overlay exists to move transformers/trl/peft, not
+# to rebuild the machine. Substring match, lowercased, so `nvidia-cublas-cu12`
+# and `torchvision` are caught without listing every wheel NVIDIA ships.
+OVERLAY_DENY = ("torch", "triton", "bitsandbytes", "nvidia", "cuda",
+                "xformers", "flash")
 
 # How many GPUs did we actually get? Assert rather than assume: a 1-GPU
 # allocation would silently serialise everything onto device 0 and double
@@ -605,6 +699,13 @@ N_GPU = len(GPUS)
 # legs.KERNELS, so the packing decision lives beside the legs it packs.
 ORDER = {order!r}
 
+# Requirement specs that EVERY leg installs identically, built once up front.
+# Derived from the legs' own install groups rather than written out again here,
+# because a second copy of the two SHAs is a second thing to keep in step -- and
+# one that drifts silently, since a wheel built from the wrong ref installs
+# perfectly.
+SHARED_WHEEL_SPECS = {shared_wheel_specs!r}
+
 # Payloads that are NOT in the card queue.
 #
 # CPU_LANE runs from t=0 alongside the training legs and never takes a card.
@@ -613,6 +714,15 @@ ORDER = {order!r}
 # was.
 CPU_LANE = {cpu_lane!r}
 AFTER_GPU = {after_gpu!r}
+# When true, AFTER_GPU does not wait for the cards to drain. It is admitted to
+# a card by the same VRAM check the legs use, so it runs BESIDE a light leg
+# rather than behind the last one.
+#
+# Worth ~211s in simulation, because Studio's install-then-test chain is the
+# critical path while the legs have slack. What it costs is real and is why it
+# is a flag and not the default: Studio then sees ONE card instead of two, and
+# its own device selection is part of what it exists to prove.
+AFTER_GPU_CONCURRENT = {after_gpu_concurrent!r}
 
 # Measured peak_reserved_gb per payload (legs.Leg.vram_gb), and the budget a
 # single card will admit. A T4 reports 14.56 GB usable; the budget is 13.0 so
@@ -632,7 +742,14 @@ AFTER_GPU = {after_gpu!r}
 # says is available.
 VRAM_GB = {vram_gb!r}
 CARD_VRAM_BUDGET_GB = 13.0
-MAX_LEGS_PER_CARD = 2
+# 1 when the venvs had to fall back to WORK. The fallback above says it "keeps
+# a one-leg-per-card run working", and until this line that was a description
+# of an intention rather than of anything the code did: MAX_LEGS_PER_CARD was a
+# constant, so a box with no writable /tmp would still build four torch venvs,
+# two at a time per card, in the 19.5 GB /kaggle/working that the comment at
+# the top of this block says they do not fit in. It would have surfaced as an
+# install failing halfway through for reasons that look nothing like a disk.
+MAX_LEGS_PER_CARD = 2 if VENV_ROOT != WORK else 1
 
 # The model prefetch, gzip+base64 like the payloads so its quoting survives
 # being embedded in a generated cell. Empty string means no prefetch, which is
@@ -727,6 +844,41 @@ def run_one(name, gpu_index, idx):
     env["UNSLOTH_COMPILE_LOCATION"] = str(
         WORK / ("unsloth_compiled_cache_" + pathlib.Path(name).stem))
 
+    # The OTHER three caches, which a separate venv does not protect.
+    #
+    # UNSLOTH_COMPILE_LOCATION above covered unsloth's generated modules and
+    # was assumed to be the whole story. It is not. torch and triton key their
+    # caches off $TMPDIR, not off the interpreter, so on torch 2.9.1 an unset
+    # TORCHINDUCTOR_CACHE_DIR resolves to `tempfile.gettempdir()/torchinductor_
+    # $USER` (torch/_inductor/runtime/cache_dir_utils.py:22) and the triton
+    # cache lands UNDER that same directory. Every leg on the box therefore
+    # shared /tmp/torchinductor_root -- four payloads whose entire purpose is
+    # to install DIFFERENT transformers/TRL/peft versions and compile the same
+    # modules, writing one cache between them.
+    #
+    # Per-leg directories rather than TORCHINDUCTOR_FORCE_DISABLE_CACHES or
+    # TRITON_ALWAYS_COMPILE, which are the blunter knobs and do exist
+    # (torch/compiler/config.py:85 and triton/knobs.py:358). Those force every
+    # leg to recompile from cold, which spends time on the critical path this
+    # kernel is being shortened along, and makes the legs measure a machine no
+    # user has. Isolation is what is wanted here, not cache defeat.
+    #
+    # TMPDIR is set too, and it is the belt to the braces: anything else that
+    # resolves a cache through gettempdir() follows it without this file having
+    # to know the variable's name.
+    _leg_tmp = VENV_ROOT / ("tmp_" + pathlib.Path(name).stem)
+    for _sub in ("", "inductor", "triton"):
+        try:
+            (_leg_tmp / _sub).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    env["TMPDIR"] = str(_leg_tmp)
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(_leg_tmp / "inductor")
+    env["TRITON_CACHE_DIR"] = str(_leg_tmp / "triton")
+    # Where the once-built wheels are. Read by the install cell, which falls
+    # back to its git specs when the directory is empty or absent.
+    env["UNSLOTH_CI_WHEEL_DIR"] = str(WHEEL_DIR)
+
     made = _make_venv(idx, SYSTEM_SITE.get(name, True))
     if not made:
         # No venv means the SHARED system site-packages, which is the one
@@ -747,6 +899,67 @@ def run_one(name, gpu_index, idx):
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     env["VIRTUAL_ENV"] = str(pathlib.Path(bindir).parent)
     env["UV_SYSTEM_PYTHON"] = "0"
+
+    # The per-leg OVERLAY: this leg's version pins laid over the venv rather
+    # than resolved into it.
+    #
+    # Two pip calls, and the first one is the point. `--dry-run --report`
+    # resolves the FULL closure against the environment as it actually is, so
+    # the second call can be `--no-deps` over a manifest instead of a guess. An
+    # overlay assembled by naming packages by hand pairs a new transformers with
+    # the base's older tokenizers or huggingface_hub, and fails minutes later
+    # inside a payload with an import error that reads like a code bug.
+    #
+    # Never fatal. A leg whose overlay fails runs on the base versions and says
+    # so: that is a leg testing the wrong versions, which the payload's own
+    # resolved-version record makes visible, and it is strictly better than
+    # standing the leg down and reporting nothing at all.
+    _ov_specs = OVERLAYS.get(name) or ()
+    if _ov_specs:
+        _ov_dir = VENV_ROOT / ("overlay_" + pathlib.Path(name).stem)
+        _ov_report = _leg_tmp / "overlay_report.json"
+        _ov_t0 = time.time()
+        _ov_rec = {{"payload": name, "requested": list(_ov_specs)}}
+        try:
+            _rc = subprocess.run(
+                [py, "-m", "pip", "install", "--dry-run", "--quiet",
+                 "--report", str(_ov_report)] + list(_ov_specs),
+                capture_output=True, text=True, timeout=600)
+            _closure = []
+            if _ov_report.exists():
+                for _item in json.loads(_ov_report.read_text()).get("install", []):
+                    _meta = _item.get("metadata", {{}})
+                    _closure.append((_meta.get("name", "?"), _meta.get("version", "?")))
+            _keep, _dropped = [], []
+            for _nm, _ver in _closure:
+                if any(_d in _nm.lower() for _d in OVERLAY_DENY):
+                    _dropped.append(f"{{_nm}}=={{_ver}}")
+                else:
+                    _keep.append(f"{{_nm}}=={{_ver}}")
+            _ov_rec.update({{"resolved": _keep, "denied": _dropped,
+                            "resolve_returncode": _rc.returncode}})
+            if _keep:
+                _rc2 = subprocess.run(
+                    [py, "-m", "pip", "install", "--quiet", "--no-deps",
+                     "--target", str(_ov_dir)] + _keep,
+                    capture_output=True, text=True, timeout=900)
+                _ov_rec["install_returncode"] = _rc2.returncode
+                if _rc2.returncode == 0:
+                    # PREPENDED, so the overlay wins over the venv. The payload
+                    # child reads this at interpreter start, which is the only
+                    # moment it can matter: an already-imported transformers
+                    # cannot be displaced by any later sys.path edit.
+                    env["PYTHONPATH"] = str(_ov_dir) + os.pathsep + env.get("PYTHONPATH", "")
+                    _ov_rec["active"] = True
+                else:
+                    _ov_rec["error"] = _rc2.stderr[-400:]
+            else:
+                _ov_rec["error"] = "resolved to nothing installable"
+        except BaseException as _exc:  # noqa: BLE001
+            _ov_rec["error"] = f"{{type(_exc).__name__}}: {{_exc}}"[:300]
+        _ov_rec["seconds"] = round(time.time() - _ov_t0, 1)
+        _ov_rec.setdefault("active", False)
+        print(f"{DRIVER_SENTINEL}_OVERLAY " + json.dumps(_ov_rec), flush=True)
 
     log = WORK / (pathlib.Path(name).stem + "_driver.log")
     started = time.time()
@@ -934,6 +1147,46 @@ if CPU_LANE:
     cpu_thread.start()
     print("{DRIVER_SENTINEL}_CPU_LANE " + json.dumps({{"payload": CPU_LANE}}), flush=True)
 
+# Build unsloth and unsloth_zoo ONCE, before any leg starts.
+#
+# Every leg's first two install groups are byte-identical -- the same two
+# pinned SHAs, zoo from main and unsloth from the ref under test -- and pip
+# does not cache a VCS build, so run 32679427416 cloned and built both of them
+# FOUR times. Install was 149-191s per leg there, the single largest phase of
+# every leg and 41% of gpt-oss.
+#
+# Synchronous, and that is the whole design. A background lane would lose the
+# race it exists to win: the legs are admitted to their cards and start
+# installing at t=0, so a wheel that is still building when they get there
+# saves nothing. Studio's CPU lane is started FIRST so its 345s overlaps this
+# rather than queueing behind it.
+#
+# Building from the same SHAs the groups name is what keeps this honest: the
+# wheel IS main-plus-the-PR, not a substitute for it. A leg whose wheel is
+# missing falls back to its original git spec, so a failed build costs the time
+# it took and changes nothing about what is tested.
+if SHARED_WHEEL_SPECS:
+    _t0 = time.time()
+    try:
+        WHEEL_DIR.mkdir(parents=True, exist_ok=True)
+        _proc = subprocess.run(
+            [sys.executable, "-m", "pip", "wheel", "--no-deps", "-q",
+             "-w", str(WHEEL_DIR), *SHARED_WHEEL_SPECS],
+            capture_output=True, text=True, timeout=900)
+        _built = sorted(p.name for p in WHEEL_DIR.glob("*.whl"))
+        print("{DRIVER_SENTINEL}_WHEELS " + json.dumps({{
+            "seconds": round(time.time() - _t0, 1),
+            "returncode": _proc.returncode,
+            "built": _built,
+            "error": None if _proc.returncode == 0 else _proc.stderr.strip()[-400:],
+        }}), flush=True)
+    except BaseException as _exc:  # noqa: BLE001
+        # Never fatal. The legs still carry their git specs.
+        print("{DRIVER_SENTINEL}_WHEELS " + json.dumps({{
+            "seconds": round(time.time() - _t0, 1), "returncode": None,
+            "built": [], "error": f"{{type(_exc).__name__}}: {{_exc}}",
+        }}), flush=True)
+
 # MAX_LEGS_PER_CARD workers per card, not one. The extra worker is what lets a
 # card pick up a second small leg beside the one it is already running; it
 # takes nothing when VRAM says no, so a card carrying gptoss behaves exactly as
@@ -954,19 +1207,70 @@ for gpu_index in range(N_GPU):
         t = threading.Thread(target=worker, args=(gpu_index, seed), daemon=False)
         t.start()
         threads.append(t)
+def _after_gpu_blocked():
+    """The install half must have SUCCEEDED before the test half is worth
+    running: it is what puts the interpreter and the llama.cpp on disk, so
+    without it this half dies on a missing venv and reports that as a Studio
+    regression."""
+    prior = results.get(CPU_LANE) if CPU_LANE else None
+    return bool(CPU_LANE) and (prior is None or prior.get("returncode") != 0)
+
+
+def _after_gpu_skip():
+    results[AFTER_GPU] = {{
+        "returncode": None, "gpu": None, "seconds": 0.0,
+        "error": "the install lane did not succeed, so there is nothing "
+                 "installed to test",
+        "kernel": None, "output_exists": False,
+    }}
+    print("{DRIVER_SENTINEL}_SKIPPED " + json.dumps({{AFTER_GPU: results[AFTER_GPU]}}),
+          flush=True)
+
+
+# Concurrent placement: AFTER_GPU takes a card as soon as its install lane is
+# done and some card has the VRAM, rather than waiting for the whole queue.
+after_thread = None
+if AFTER_GPU and AFTER_GPU_CONCURRENT:
+    def _after_gpu_lane():
+        if cpu_thread is not None:
+            cpu_thread.join()
+        if _after_gpu_blocked():
+            _after_gpu_skip()
+            return
+        chosen = None
+        while chosen is None:
+            with pending_lock:
+                for g in range(N_GPU):
+                    if _admit(g, AFTER_GPU):
+                        chosen = g
+                        break
+            if chosen is None:
+                # Every card is full. Something is running or the legs would
+                # have finished, so wait for a release rather than spin.
+                time.sleep(1.0)
+        try:
+            print("{DRIVER_SENTINEL}_AFTER_GPU_SHARED " + json.dumps(
+                {{"payload": AFTER_GPU, "gpu": chosen}}), flush=True)
+            run_one(AFTER_GPU, chosen, len(ORDER) + 1)
+        finally:
+            _release(chosen, AFTER_GPU)
+    after_thread = threading.Thread(target = _after_gpu_lane, daemon = False)
+    after_thread.start()
+
 for t in threads:
     t.join()
 
-# AFTER_GPU wants every card, so it waits for the queue to drain rather than
-# taking one from it. Studio's own driver keeps both T4s visible on purpose --
-# "Studio's own device selection is part of what is under test; masking one
-# would test a machine nobody has" -- and that stays true here.
+# On the NON-concurrent path AFTER_GPU wants every card, so it waits for the
+# queue to drain. Studio's driver keeps both T4s visible on purpose -- "Studio's
+# own device selection is part of what is under test; masking one would test a
+# machine nobody has" -- and that stays true here.
 if cpu_thread is not None:
     cpu_thread.join()
+if after_thread is not None:
+    after_thread.join()
 
-if AFTER_GPU:
-    prior = results.get(CPU_LANE) if CPU_LANE else None
-    if CPU_LANE and (prior is None or prior.get("returncode") != 0):
+if AFTER_GPU and not AFTER_GPU_CONCURRENT:
+    if _after_gpu_blocked():
         # Do NOT run it. The install half is what puts the interpreter and the
         # llama.cpp on disk, so without it this half fails on a missing venv
         # and reports that as a Studio regression. Recording the skip keeps the
@@ -977,8 +1281,7 @@ if AFTER_GPU:
                      "installed to test",
             "kernel": None, "output_exists": False,
         }}
-        print("{DRIVER_SENTINEL}_SKIPPED " + json.dumps({{AFTER_GPU: results[AFTER_GPU]}}),
-              flush=True)
+        _after_gpu_skip()
     else:
         run_one(AFTER_GPU, None, len(ORDER) + 1)
 
@@ -1107,10 +1410,14 @@ def build_kernel(
     skip_reference: bool = False,
     studio: dict | None = None,
     prefetch_repos: tuple[str, ...] = (),
+    after_gpu_concurrent: bool = False,
+    shared_wheels: bool = False,
 ) -> dict:
     payloads = {}
     isolation = {}
+    overlays: dict[str, tuple[str, ...]] = {}
     legs_by_payload = {}
+    leg_groups: dict[str, list[list[str]]] = {}
     for leg in resolve(leg_names):
         name = f"t4_{leg.name}.ipynb"
         payloads[name] = build_payload_notebook(
@@ -1122,12 +1429,24 @@ def build_kernel(
             reference = "" if skip_reference else None,
         )
         isolation[name] = leg.system_site_packages
+        overlays[name] = tuple(leg.overlay)
         legs_by_payload[name] = leg
+        leg_groups[name] = expand_install(
+            leg,
+            unsloth_ref = unsloth_ref,
+            zoo_ref = zoo_ref,
+            payload_dir = payload_dir,
+        )
     # The card queue is the LEGS. Studio's two halves ride the same kernel but
     # not the same queue, so expected_gpus is derived before they are added:
     # they are what the cards are freed FOR, not more work to schedule onto
     # them.
     expected_gpus = min(len(payloads), SESSION_GPUS)
+    # Opt in. On run 32689629906 the wheels helped the leg that runs ALONE and
+    # cost the three that run concurrently, and that run moved the caches at the
+    # same time, so the effect is not yet attributable to either. Off by default
+    # until one variable at a time says otherwise.
+    shared_wheel_specs = _shared_vcs_specs(leg_groups) if shared_wheels else ()
     cpu_lane = after_gpu = None
     if studio:
         payloads.update(studio_payloads(**studio))
@@ -1151,7 +1470,40 @@ def build_kernel(
         after_gpu = after_gpu,
         prefetch_repos = prefetch_repos,
         vram_source = legs_by_payload,
+        after_gpu_concurrent = after_gpu_concurrent,
+        shared_wheel_specs = shared_wheel_specs,
+        overlays = overlays,
     )
+
+
+def _shared_vcs_specs(leg_groups: dict[str, list[list[str]]]) -> tuple[str, ...]:
+    """VCS requirements that EVERY leg installs identically.
+
+    Derived rather than declared. The two SHAs already live in the install
+    groups, and a second copy here would be a second thing to keep in step --
+    one that drifts silently, because a wheel built from the wrong ref installs
+    perfectly and fails nothing.
+
+    "Every leg" is the point of the intersection. A spec only one leg carries is
+    part of what that leg is testing and must keep its own resolution; building
+    it once and sharing it would quietly make the legs agree about something
+    they exist to disagree about. Two legs pinning the SAME package to
+    DIFFERENT refs therefore yields nothing shared, which is the safe answer.
+    """
+    if not leg_groups:
+        return ()
+    sets = []
+    for groups in leg_groups.values():
+        specs = set()
+        for group in groups:
+            for token in group:
+                if "@ git+" in token or token.startswith("git+"):
+                    specs.add(token)
+        sets.append(specs)
+    common = set.intersection(*sets) if sets else set()
+    # Sorted for a stable kernel: an unordered set would rebuild the notebook
+    # differently run to run and make a diff of two kernels unreadable.
+    return tuple(sorted(common))
 
 
 def main() -> int:
@@ -1189,6 +1541,19 @@ def main() -> int:
         help = "build with no band check at all. Only for the one run that recaptures a reference",
     )
     ap.add_argument("--per-run-timeout", type = int, default = 2400)
+    ap.add_argument(
+        "--shared-wheels",
+        action = "store_true",
+        help = "build unsloth and unsloth_zoo once up front and install every "
+        "leg from the wheel instead of resolving the git spec per leg",
+    )
+    ap.add_argument(
+        "--studio-concurrent",
+        action = "store_true",
+        help = "let the Studio GPU half share a card with a light training leg "
+        "instead of waiting for the queue to drain. Faster, but Studio then "
+        "sees one T4 rather than two, which narrows what it proves",
+    )
     ap.add_argument(
         "--no-prefetch",
         action = "store_true",
@@ -1262,6 +1627,8 @@ def main() -> int:
             # load -- which would be pure network cost, on a lane whose entire
             # justification is that it is free.
             prefetch_repos = () if args.no_prefetch else PREFETCH_REPOS,
+            after_gpu_concurrent = args.studio_concurrent,
+            shared_wheels = args.shared_wheels,
         )
         out.parent.mkdir(parents = True, exist_ok = True)
         out.write_text(json.dumps(driver, indent = 1), encoding = "utf-8")

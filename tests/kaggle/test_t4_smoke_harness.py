@@ -1544,7 +1544,7 @@ def test_every_setting_the_child_needs_is_forwarded_to_it():
 
 # ------------------------------------------------------------ kernel build
 
-LEG_NAMES = ("control", "canary", "gptoss", "grpo")
+LEG_NAMES = ("control", "canary", "gptoss", "grpo", "default")
 
 
 def _build(
@@ -1740,7 +1740,7 @@ def test_every_leg_carries_the_version_recorder(tmp_path):
 
     assert "versions.py" in COMMON_FILES
     for name in LEGS:
-        payload = _payload_notebooks(_build(tmp_path / name, name))[f"t4_{name}.ipynb"]
+        payload = _payload_notebooks(_build(tmp_path / name, name))[f"t4_{LEGS[name].name}.ipynb"]
         assert "versions.py" in _cell(payload, 0)
         assert "versions.flatten_versions" in _cell(payload, 2)
 
@@ -1757,7 +1757,7 @@ def test_every_registered_leg_is_either_carried_or_explicitly_unwired():
 
     carried = [name for kernel in KERNELS for name in kernel]
     assert len(carried) == len(set(carried)), carried
-    assert sorted(carried) + sorted(UNWIRED) == sorted(LEGS), (
+    assert sorted(carried + list(UNWIRED)) == sorted(LEGS), (
         sorted(carried),
         sorted(UNWIRED),
         sorted(LEGS),
@@ -1810,10 +1810,12 @@ def test_generated_cells_compile(tmp_path):
             for index, cell in enumerate(nb["cells"]):
                 compile("".join(cell["source"]), f"{path}/{name}#cell{index}", "exec")
                 seen += 1
-    # 5 builds x (3 driver cells + 4 payload cells), asserted so a refactor that
-    # stops reaching the payloads cannot leave this test passing while compiling
-    # nothing that matters.
-    assert seen == 5 * 7, seen
+    # One build per leg in LEG_NAMES x (3 driver cells + 4 payload cells),
+    # asserted so a refactor that stops reaching the payloads cannot leave this
+    # test passing while compiling nothing that matters. Derived from LEG_NAMES
+    # rather than hardcoded: the literal 5 silently meant "every leg" only for
+    # as long as nobody added one.
+    assert seen == (len(LEG_NAMES) + 1) * 7, seen
 
 
 def _undefined_names(source: str, already_bound: set) -> tuple:
@@ -2139,6 +2141,7 @@ def test_the_files_the_payload_carries_are_byte_identical_to_the_repo(tmp_path):
         "training_evidence.py",
         "run_t4_smoke.py",
         "determinism.py",
+        "gguf_export.py",
         "pins/control.txt",
         "references/t4_qwen2.5-0.5b.json",
     }, sorted(files)
@@ -2279,6 +2282,99 @@ def test_the_grpo_leg_names_its_attention_backend():
     assert LEGS["grpo"].env.get("VLLM_ATTENTION_BACKEND") == "TRITON_ATTN"
 
 
+def test_the_grpo_leg_disables_flashinfer_at_the_only_layer_that_holds():
+    """Two Kaggle probes died four rungs each on the same flashinfer link, one
+    of them WITH `VLLM_USE_FLASHINFER_SAMPLER=0` already set, because that is
+    not the layer the decision is made at. unsloth_zoo's patch_vllm assigns
+    both vLLM env vars itself during model load:
+
+        vllm_utils.py:2494  VLLM_ATTENTION_BACKEND      = "FLASHINFER"
+        vllm_utils.py:2502  VLLM_USE_FLASHINFER_SAMPLER = "1"
+
+    each behind `elif Version(vllm_version) >= Version("0.11.0")`, which this
+    leg's 0.19.1 pin satisfies. Its guard checks only that nvcc and ninja are
+    present, and on Kaggle both are - the missing piece is the driver stub the
+    compiled objects link against, which that check does not look at. So the
+    two settings above are overwritten before vLLM ever reads them.
+
+    UNSLOTH_VLLM_NO_FLASHINFER is read at vllm_utils.py:2449, ahead of every
+    assignment, and is the only one of the three that survives. Losing it puts
+    the leg straight back on a link that cannot succeed on this image."""
+    from legs import LEGS
+    assert LEGS["grpo"].env.get("UNSLOTH_VLLM_NO_FLASHINFER") == "1"
+
+
+def test_the_grpo_leg_removes_flashinfer_and_the_removal_reaches_the_payload(tmp_path):
+    """The env vars were necessary and NOT sufficient, established over four
+    Kaggle ladder probes:
+
+        r1  nothing set                       4/4 rungs fail, cached_ops/sampling
+        r2  VLLM_USE_FLASHINFER_SAMPLER=0     identical failure
+        r3  UNSLOTH_VLLM_NO_FLASHINFER=1      sampling build gone; now fails in
+                                              cached_ops/batch_prefill_with_kv_cache_...
+        r4  uninstall flashinfer              PASSES on the first rung, 11.30 GB
+
+    r3 is the one that proves the remaining gap: the sampler build genuinely
+    stopped, and the failure moved to ATTENTION, which is chosen by
+    VLLM_ATTENTION_BACKEND -- already TRITON_ATTN and confirmed inherited by the
+    rung child -- and which vLLM offers no prefill-specific opt-out for. There
+    was no variable left to set, which is why the package goes instead.
+
+    THE SHIPPED LEG FAILS DIFFERENTLY, and that is the reason this guard is
+    worth keeping rather than a historical note. Removing the uninstall from the
+    leg (unsloth-probe-grpo-noun-05777b, nothing else changed) does NOT
+    reproduce the link error at all -- the leg carries a libcuda shim
+    (run_grpo_t4.py:597, /usr/local/cuda/compat/libcuda.so, since #8440) that
+    the probes lacked. It fails instead with
+
+        AcceleratorError: CUDA error: an illegal memory access was encountered
+
+    which is verbatim the intermittent crash UNWIRED["grpo"] documents from
+    kernels unsloth-t4-ci-70a2f4eb and -c98f14be. With the uninstall the crash
+    has not recurred.
+
+    State the strength honestly: that crash is documented at roughly two failures
+    in three, so a handful of clean runs is suggestive and not proof, and this
+    guard asserts only that the uninstall is PRESENT and REACHES the payload --
+    which removing it demonstrably breaks. It does not claim to have identified
+    the crash's cause.
+
+    Asserted through the BUILT payload rather than off the dataclass: a field
+    nothing emits is a setting that reads like coverage and does nothing, and
+    that is the exact failure mode this file exists to catch.
+    """
+    from legs import LEGS
+
+    assert set(LEGS["grpo"].uninstall) >= {"flashinfer-python", "flashinfer-cubin"}
+    payload = _payload_notebooks(_build(tmp_path / "g", "grpo"))["t4_grpo.ipynb"]
+    install_cell = _cell(payload, 1)
+    assert "flashinfer-python" in install_cell
+    assert "uninstall" in install_cell
+
+
+def test_a_leg_with_nothing_to_uninstall_does_not_run_pip_uninstall(tmp_path):
+    """The counterpart, so the emission is conditional rather than always-on:
+    an unconditional `pip uninstall -y` with an empty list is a per-leg
+    subprocess that can only cost time."""
+    from legs import LEGS
+
+    assert LEGS["control"].uninstall == ()
+    payload = _payload_notebooks(_build(tmp_path / "c", "control"))["t4_control.ipynb"]
+    assert "flashinfer" not in _cell(payload, 1)
+
+
+def test_the_grpo_leg_asks_for_the_utilization_both_platforms_measured(tmp_path):
+    """0.95 is measured, not requested-and-hoped. Colab (torch 2.11.0) peaked at
+    11.76 GB and Kaggle (torch 2.10.0) at 11.30 GB, both on the FIRST rung of a
+    0.95/0.8/0.6/0.5 ladder and both surviving three sleep/wake cycles, roughly
+    3 GB under a 14.56 GB card. The 0.5 that used to be here came from Qwen3-4B
+    probes and was never measured for the 0.6B this leg trains."""
+    from legs import LEGS
+
+    args = LEGS["grpo"].args
+    assert args[args.index("--gpu-memory-utilization") + 1] == "0.95"
+
+
 def test_the_grpo_leg_no_longer_carries_xformers():
     """Its vLLM backend is gone at this version, so it would be a package
     nothing selects, resolved against a torch it has opinions about."""
@@ -2359,12 +2455,21 @@ def test_the_grpo_leg_keeps_the_config_that_actually_fit():
     unsloth_zoo/gradient_checkpointing.py:1013, peaking at 15.97GB in 16-bit and
     19.25GB in 4-bit. The set below passed on kernel unsloth-t4-ci-53efcc4e at
     13.60GB with reward_std 0.707 at step 2, so restoring any of them to the
-    notebook's value is a session that OOMs, and it fails here instead."""
+    notebook's value is a session that OOMs, and it fails here instead.
+
+    UTILIZATION IS THE ONE EXCEPTION, raised 0.5 -> 0.95 on measurement. Those
+    probes trained **Qwen3-4B**; this leg trains Qwen3-0.6B, where the
+    activation budget is a different problem entirely. A 0.95/0.8/0.6/0.5 ladder
+    stopped at the FIRST rung on both platforms - Colab peak reserved 11.76GB,
+    Kaggle 11.30GB, three sleep/wake cycles each - roughly 3GB under the card.
+    The other three values are unchanged and still carry the 4B evidence, which
+    is why they are asserted together with this one rather than relaxed with
+    it."""
     from legs import LEGS
 
     args = LEGS["grpo"].args
     for flag, value in (
-        ("--gpu-memory-utilization", "0.5"),
+        ("--gpu-memory-utilization", "0.95"),
         ("--max-seq-length", "1024"),
         ("--num-generations", "2"),
         ("--lora-rank", "16"),
@@ -3262,9 +3367,7 @@ _STUDIO = [{"label": "studio-gpu", "passed": False, "failures": ["x"], "assertio
         ("fail", _TWO_LEGS + _STUDIO, 0),
     ],
 )
-def test_only_a_real_assertion_failure_turns_the_job_red(
-    tmp_path, verdict, reports, expected_exit
-):
+def test_only_a_real_assertion_failure_turns_the_job_red(tmp_path, verdict, reports, expected_exit):
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     (evidence / "launch_result.json").write_text(
