@@ -1440,6 +1440,7 @@ class MLXInferenceBackend:
         self._is_vlm = False
         self._draft_model = None
         self._draft_kind = None
+        self._draft_method = None
         self._draft_repo_id = None
         self._draft_block_size = None
         self._draft_materialization_bytes = 0
@@ -1549,6 +1550,7 @@ class MLXInferenceBackend:
     def _clear_speculative_state(self):
         self._draft_model = None
         self._draft_kind = None
+        self._draft_method = None
         self._draft_repo_id = None
         self._draft_block_size = None
         self._draft_materialization_bytes = 0
@@ -1567,6 +1569,7 @@ class MLXInferenceBackend:
 
         from core.inference.mlx_speculative import (
             BUILTIN_MTP_ID,
+            MLX_SPECULATIVE_DRAFT_KINDS,
             materialize_native_mtp,
             mlx_speculative_snapshot_path,
             MLX_SIDECAR_LOCK_BUSY,
@@ -1592,8 +1595,10 @@ class MLXInferenceBackend:
                     if target_id
                     else mlx_speculative_snapshot_path(repo_id)
                 )
-            draft_model, resolved_kind = load_drafter(str(path), kind = mode)
-        if resolved_kind != mode:
+            # load_drafter refuses any kind it does not dispatch.
+            kind = MLX_SPECULATIVE_DRAFT_KINDS.get(mode, mode)
+            draft_model, resolved_kind = load_drafter(str(path), kind = kind)
+        if resolved_kind != kind:
             raise RuntimeError("mlx_speculative_kind_mismatch")
         materialized = materialize_mtp_masked_embedding(draft_model) if mode == "mtp" else 0
         if mode == "eagle3":
@@ -1602,6 +1607,8 @@ class MLXInferenceBackend:
         validate_speculative_target_contract(self._model, draft_model, resolved_kind)
         self._draft_model = draft_model
         self._draft_kind = resolved_kind
+        # Several methods share a kind, so what ran is reported as what was asked for.
+        self._draft_method = mode
         self._draft_repo_id = repo_id
         self._draft_block_size = block_size
         self._draft_materialization_bytes = materialized
@@ -1900,7 +1907,7 @@ class MLXInferenceBackend:
                 model_record["mlx_speculative_reason"] = "auto_drafter_load_failed"
             else:
                 model_record.update(
-                    mlx_speculative_effective_mode = self._draft_kind,
+                    mlx_speculative_effective_mode = self._draft_method,
                     mlx_speculative_effective_draft_model = self._draft_repo_id,
                     mlx_speculative_effective_block_size = self._draft_block_size,
                     mlx_speculative_materialization_bytes = self._draft_materialization_bytes,
