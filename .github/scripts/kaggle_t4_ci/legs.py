@@ -81,6 +81,19 @@ class Leg:
         "unsloth",
         "unsloth_zoo",
     )
+    # Measured peak_reserved_gb on a Tesla T4, from the executed payload
+    # notebooks of run 32611343797. NOT an estimate and not a request: the
+    # driver uses it to decide whether two legs may share a card.
+    #
+    #   gptoss    12.78 of 14.56   frontier  0.70
+    #   canary     0.70            control   0.70
+    #
+    # The three Qwen legs are 4.8% of the card each, which is why sharing is
+    # possible at all; gptoss is 88%, which is why it never shares. A leg whose
+    # real appetite grows past what it declares here is the failure mode, so
+    # `test_the_declared_vram_matches_what_the_legs_reported` checks these
+    # against the peaks in the evidence rather than trusting them.
+    vram_gb: float = 1.0
     # Filename under <payload-dir>/references to band-check against, if any.
     reference: str = ""
     # Extra environment for the child process.
@@ -148,6 +161,7 @@ SMOKE_FILES = COMMON_FILES + ("run_t4_smoke.py", "determinism.py")
 
 LEGS: dict[str, Leg] = {
     "control": Leg(
+        vram_gb = 0.7,
         name = "control",
         summary = "tiny SFT determinism run, pinned library set",
         # Pins go in LAST, as their own resolution step, so they beat what the
@@ -160,6 +174,7 @@ LEGS: dict[str, Leg] = {
         args = ("--pins", "@ROOT/pins/control.txt"),
     ),
     "canary": Leg(
+        vram_gb = 0.7,
         name = "canary",
         summary = "the same SFT run on the newest permitted library set",
         # One resolution with the zoo requirement present, so pip picks the
@@ -179,6 +194,7 @@ LEGS: dict[str, Leg] = {
         reference = "",
     ),
     "frontier": Leg(
+        vram_gb = 0.7,
         name = "frontier",
         summary = "the same SFT run on the newest transformers and trl on PyPI",
         # WHY THIS EXISTS, given the canary already says "newest": the canary
@@ -245,6 +261,7 @@ LEGS: dict[str, Leg] = {
         reference = "",
     ),
     "gptoss": Leg(
+        vram_gb = 12.78,
         name = "gptoss",
         summary = "gpt-oss-20b LoRA: torch.compile and the float32 path",
         # The base install and nothing else, specifically WITHOUT the
@@ -270,6 +287,7 @@ LEGS: dict[str, Leg] = {
     # the install that killed three probe sessions is re-solved, and what
     # remains is a runtime question needing one session on a real T4.
     "grpo": Leg(
+        vram_gb = 13.8,
         name = "grpo",
         summary = "Qwen3-4B GRPO through a vLLM engine on the same card",
         # vLLM FIRST and alone: it pins torch, and resolving it after unsloth
@@ -442,15 +460,43 @@ UNWIRED: dict[str, str] = {
 # actually use it. Splitting the group without packing the kernel, or packing
 # without splitting the group, each make things worse on their own.
 #
-# Ordered LONGEST EXPECTED LEG FIRST, and that ordering is load-bearing.
-# build_kernel.py hands this order to the driver as its start order and a card
-# takes work greedily, so putting gptoss (384s, and the leg that sets the
-# makespan) anywhere but first leaves the schedule unable to balance around it.
-# Measured on run 32607621452: gptoss 384.1s, frontier 312.2s, canary 265.3s,
-# control 262.2s, which this order packs as 384.1+262.2 = 646.3s against
-# 312.2+265.3 = 577.5s. That is the optimal split of these four; the next best
-# pairing is 649.4s, and perfect balance would be 611.9s, so the 68.8s of idle
-# at the end is 34.4s of genuinely unavoidable imbalance and not a packing bug.
+# gptoss sits THIRD, and that position is load-bearing. This is not the
+# longest-first order it used to be, and it is not tidy either, so it needs its
+# reasoning attached or the next reader will "fix" it back.
+#
+# The driver now prefetches the models on a lane that takes no card (see
+# kaggle_prefetch.py). A prefetch only pays for the work it finishes BEFORE the
+# leg that wants the model starts, so gptoss -- the only leg with a 12 GB
+# download -- must not start at t=0. Third is first pick of the SECOND WAVE: it
+# starts at ~190-220s, which is lead time the prefetch can spend, and a small
+# leg is still running beside it.
+#
+# Simulated over every permutation, against the durations measured on the real
+# one-kernel run 32611343797 (gptoss 384.1s, frontier 307.1s, canary 191.5s
+# warm, control 179.0s warm) and a range of the unknown gpt-oss download time D:
+#
+#   order                                  prefetch   worst (D 40..200)   mean
+#   canary, control, gptoss, frontier      yes            528.1s        504.1s
+#   control, canary, gptoss, frontier      yes            540.6s        500.8s
+#   gptoss, frontier, canary, control      no             563.1s        563.1s
+#   gptoss, frontier, canary, control      yes            603.1s        603.1s
+#   frontier, canary, control, gptoss      yes            651.1s        585.2s
+#
+# Three results, each contradicting something that sounds right:
+#
+#   * Prefetching WITHOUT reordering is a REGRESSION. gptoss starts at t=0, so
+#     there is no window in front of it to fill, and it waits on a download it
+#     could have started itself.
+#   * gptoss LAST is worse than doing nothing for any D under ~120s. It is the
+#     longest leg, so ending on it leaves the other card idle for its whole
+#     ~284s. Standard LPT; "run the big model last" is the intuition to resist.
+#   * This order is never worse than the old one at any D tested, including
+#     D=40 where the prefetch barely helps. Chosen on WORST CASE rather than
+#     mean, deliberately, because D is not measured yet.
+#
+# If the prefetch fails outright the schedule degrades to ~568s against the old
+# 563.1s: gptoss starts at ~184s and downloads for itself exactly as before.
+# Costing 5s to maybe save 35-65s is why this is safe to ship before D is known.
 #
 # control and canary stay in the same kernel, which is what their comparison
 # needs: same image, same driver, same hour. They no longer run on the two
@@ -467,7 +513,45 @@ UNWIRED: dict[str, str] = {
 # variable and one contrasting observation was not enough to blame a shared
 # host. It stays unwired rather than re-paired, since a leg passing one session
 # in three tells CI nothing either way.
-KERNELS: tuple[tuple[str, ...], ...] = (("gptoss", "frontier", "canary", "control"),)
+KERNELS: tuple[tuple[str, ...], ...] = (("canary", "control", "gptoss", "frontier"),)
+
+
+# What the prefetch lane warms, in order, into the Kaggle image's default HF
+# cache. See kaggle_prefetch.py for the mechanism and KERNELS above for why
+# gptoss is third.
+#
+# The SMALL model first, which inverts what looks obvious. gpt-oss is bigger,
+# but it is wanted by ONE leg whose own setup does not finish until ~160s, so a
+# fetch that lands by then is early enough. Qwen2.5-0.5B gates THREE legs and
+# the first of them starts at t=0, so it is the only fetch with no lead time in
+# front of it at all. Fetching the big one first pushes the small one out past
+# the moment the first leg is ready, delaying three legs to give one a head
+# start it did not need.
+#
+# These must match what the legs LOAD, which is not the same thing as what
+# they ASK FOR, and the difference cost a whole prefetch once already. The
+# gptoss payload declares DEFAULT_MODEL = "unsloth/gpt-oss-20b", but that is an
+# MXFP4 checkpoint and sm_75 cannot read MXFP4, so unsloth redirects to
+# `-unsloth-bnb-4bit` at load time; run_gptoss_t4.py's own docstring records the
+# redirect and the leg's output on run 32667451396 shows both strings. The
+# first version of this list prefetched the declared name and therefore pulled
+# 55.1 GB of a checkpoint no leg ever opens, while the leg downloaded the real
+# one for itself exactly as before.
+#
+# Nothing at runtime notices this: a prefetch of the wrong repo downloads
+# happily, warms a cache nobody reads, and reports success. The guard that was
+# supposed to catch it compared against DEFAULT_MODEL and so agreed with the
+# bug; it now knows about the redirect.
+PREFETCH_REPOS: tuple[str, ...] = (
+    "unsloth/Qwen2.5-0.5B-Instruct",
+    "unsloth/gpt-oss-20b-unsloth-bnb-4bit",
+)
+
+# Declared name -> what actually gets loaded on an sm_75 card. Kept beside the
+# list it corrects so the two cannot drift apart silently.
+LOAD_REDIRECTS: dict[str, str] = {
+    "unsloth/gpt-oss-20b": "unsloth/gpt-oss-20b-unsloth-bnb-4bit",
+}
 
 
 def expand_install(
