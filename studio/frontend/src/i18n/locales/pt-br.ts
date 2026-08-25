@@ -236,6 +236,18 @@ export const ptBR = {
           label: "Alternar barra lateral",
           description: "Mostrar ou ocultar a barra lateral",
         },
+        zoomIn: {
+          label: "Aumentar zoom",
+          description: "Aumentar escala da interface",
+        },
+        zoomOut: {
+          label: "Diminuir zoom",
+          description: "Diminuir escala da interface",
+        },
+        resetZoom: {
+          label: "Redefinir zoom",
+          description: "Restaurar escala da interface para 100%",
+        },
         openSettings: {
           label: "Abrir configurações",
           description: "Abrir a janela de configurações",

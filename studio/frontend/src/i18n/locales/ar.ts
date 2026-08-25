@@ -234,6 +234,18 @@ export const ar = {
           label: "تبديل الشريط الجانبي",
           description: "إظهار الشريط الجانبي أو إخفاؤه",
         },
+        zoomIn: {
+          label: "تكبير",
+          description: "تكبير واجهة المستخدم",
+        },
+        zoomOut: {
+          label: "تصغير",
+          description: "تصغير واجهة المستخدم",
+        },
+        resetZoom: {
+          label: "إعادة ضبط التكبير",
+          description: "إعادة ضبط مقياس الواجهة إلى 100%",
+        },
         openSettings: {
           label: "فتح الإعدادات",
           description: "فتح مربع حوار الإعدادات",

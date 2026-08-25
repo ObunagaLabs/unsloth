@@ -26,6 +26,7 @@ import { usePersonalizationSync } from "@/features/profile";
 import { RemoteCodeConsentDialog } from "@/features/security";
 import {
   SettingsDialog,
+  useAppearanceCustomStore,
   useSettingsDialogStore,
   useShortcut,
 } from "@/features/settings";
@@ -401,6 +402,37 @@ function RootLayout() {
     "openKeyboardShortcuts",
     () =>
       useSettingsDialogStore.getState().openDialog("keyboard-shortcuts"),
+    { enabled: !isAuthFlowRoute },
+  );
+  useShortcut(
+    "zoomIn",
+    () => {
+      const current =
+        useAppearanceCustomStore.getState().customization.uiZoom ?? 100;
+      const next = Math.min(200, current + 10);
+      useAppearanceCustomStore
+        .getState()
+        .patch({ uiZoom: next === 100 ? null : next });
+    },
+    { enabled: !isAuthFlowRoute },
+  );
+  useShortcut(
+    "zoomOut",
+    () => {
+      const current =
+        useAppearanceCustomStore.getState().customization.uiZoom ?? 100;
+      const next = Math.max(50, current - 10);
+      useAppearanceCustomStore
+        .getState()
+        .patch({ uiZoom: next === 100 ? null : next });
+    },
+    { enabled: !isAuthFlowRoute },
+  );
+  useShortcut(
+    "resetZoom",
+    () => {
+      useAppearanceCustomStore.getState().patch({ uiZoom: null });
+    },
     { enabled: !isAuthFlowRoute },
   );
   useShortcut("newChat", () => {

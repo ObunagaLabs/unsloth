@@ -236,6 +236,18 @@ export const ja = {
           label: "サイドバーの表示切り替え",
           description: "サイドバーを表示または非表示にします",
         },
+        zoomIn: {
+          label: "拡大",
+          description: "UIの表示倍率を拡大します",
+        },
+        zoomOut: {
+          label: "縮小",
+          description: "UIの表示倍率を縮小します",
+        },
+        resetZoom: {
+          label: "ズームをリセット",
+          description: "UIの表示倍率を100%にリセットします",
+        },
         openSettings: {
           label: "設定を開く",
           description: "設定ダイアログを開きます",

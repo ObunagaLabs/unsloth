@@ -12,7 +12,10 @@ export type ShortcutId =
   | "openKeyboardShortcuts"
   | "newChat"
   | "searchChats"
-  | "toggleSidebar";
+  | "toggleSidebar"
+  | "zoomIn"
+  | "zoomOut"
+  | "resetZoom";
 
 export type ShortcutGroup = "general" | "chat";
 
@@ -63,6 +66,27 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
       "settings.keyboardShortcuts.actions.toggleSidebar.description",
     group: "general",
     defaultBinding: "Mod+KeyB",
+  },
+  {
+    id: "zoomIn",
+    labelKey: "settings.keyboardShortcuts.actions.zoomIn.label",
+    descriptionKey: "settings.keyboardShortcuts.actions.zoomIn.description",
+    group: "general",
+    defaultBinding: "Mod+Equal",
+  },
+  {
+    id: "zoomOut",
+    labelKey: "settings.keyboardShortcuts.actions.zoomOut.label",
+    descriptionKey: "settings.keyboardShortcuts.actions.zoomOut.description",
+    group: "general",
+    defaultBinding: "Mod+Minus",
+  },
+  {
+    id: "resetZoom",
+    labelKey: "settings.keyboardShortcuts.actions.resetZoom.label",
+    descriptionKey: "settings.keyboardShortcuts.actions.resetZoom.description",
+    group: "general",
+    defaultBinding: "Mod+Digit0",
   },
   {
     id: "openSettings",
@@ -220,6 +244,7 @@ function keyToCode(key: string): string {
     "\\": "Backslash",
     "-": "Minus",
     "=": "Equal",
+    "+": "Equal",
     "`": "Backquote",
   };
   return punctuation[key] ?? key;
@@ -238,7 +263,6 @@ export function matchesBinding(
   mac = isMacPlatform(),
 ): boolean {
   const code = event.code || keyToCode(event.key ?? "");
-  if (code !== binding.code) return false;
   const modHeld = mac ? event.metaKey : event.ctrlKey;
   // Off-platform modifier: on macOS a bare Ctrl must not satisfy a Mod binding,
   // and on Windows/Linux the Meta (Windows) key must not either.
@@ -249,6 +273,32 @@ export function matchesBinding(
   } else if (otherModHeld) {
     return false;
   }
+
+  // Equal / Zoom in: '+' is Shift+'=' on standard layouts, so allow shift when matching Equal
+  if (
+    binding.code === "Equal" &&
+    (code === "Equal" || code === "NumpadAdd" || event.key === "+" || event.key === "=")
+  ) {
+    return event.altKey === binding.alt;
+  }
+
+  // Minus / Zoom out: allow NumpadSubtract
+  if (
+    binding.code === "Minus" &&
+    (code === "Minus" || code === "NumpadSubtract" || event.key === "-")
+  ) {
+    return event.shiftKey === binding.shift && event.altKey === binding.alt;
+  }
+
+  // Digit0 / Reset zoom: allow Numpad0
+  if (
+    binding.code === "Digit0" &&
+    (code === "Digit0" || code === "Numpad0" || event.key === "0")
+  ) {
+    return event.shiftKey === binding.shift && event.altKey === binding.alt;
+  }
+
+  if (code !== binding.code) return false;
   return event.shiftKey === binding.shift && event.altKey === binding.alt;
 }
 
