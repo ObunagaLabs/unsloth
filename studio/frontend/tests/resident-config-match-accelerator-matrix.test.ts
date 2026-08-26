@@ -66,7 +66,7 @@ const BLANK = {
   chatTemplateOverride: null,
 };
 
-/** What `/api/inference/status` reports per host, measured against a running Studio rather
+/** What `/api/inference/status` reports per host, measured against a running Unsloth rather
  * than copied from the type: a default CUDA load answers auto / -1 / 0 / null / false. */
 const ACCELERATORS: Record<string, Record<string, unknown>> = {
   "nvidia-cuda": {
@@ -399,7 +399,7 @@ test("a CPU-only host distinguishes zero offloaded layers from automatic", () =>
   );
 });
 
-test("a config stored by an older Studio does not throw and does not over-adopt", () => {
+test("a config stored by an older Unsloth does not throw and does not over-adopt", () => {
   // Blobs written before a field existed lack the key. Optional ones express no opinion
   // and adopt; a missing tensorParallel cannot be confirmed and reloads. Neither throws.
   // Cast at the boundary on purpose: these come off localStorage, so the point is the

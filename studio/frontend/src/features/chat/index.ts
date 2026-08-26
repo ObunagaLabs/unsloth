@@ -52,6 +52,7 @@ export {
   type Preset,
 } from "./chat-settings-sheet";
 export { useChatRuntimeStore } from "./stores/chat-runtime-store";
+export { useChatActive, useInComparePane } from "./runtime-provider";
 export {
   CHAT_RAG_CAPTION_KEY,
   CHAT_RAG_OCR_KEY,
@@ -75,6 +76,16 @@ export {
 export { useToolAwaitingApproval } from "./tool-approval";
 export { PermissionModeDropdown } from "./permission-mode-select";
 export { useChatSearchStore } from "./stores/chat-search-store";
+export type { ChatNavigationState } from "./stores/chat-navigation-store";
+export {
+  adjacentChatItem,
+  countUnreadRows,
+  nextAttentionChatItem,
+  openChatItemById,
+  recentChatItemAtSlot,
+  useChatNavigationStore,
+  visibleChatItems,
+} from "./stores/chat-navigation-store";
 export { usePinnedChatsStore } from "./stores/pinned-chats-store";
 export { usePinnedProjectsStore } from "./stores/pinned-projects-store";
 export {
@@ -232,7 +243,7 @@ export {
   listStoredChatThreads,
   markThreadIncognito,
 } from "./utils/chat-history-storage";
-export { recordedSandboxSessionId } from "./utils/recorded-sandbox-session";
+export { allRecordedSandboxSessionIds } from "./utils/recorded-sandbox-session";
 export {
   markChatThreadDeleted,
   removeChatThreadTombstones,
@@ -277,6 +288,7 @@ export {
   CONVERSATION_MARKDOWN_LABEL,
 } from "./utils/conversation-markdown";
 export {
+  COMBINED_EXPORT_FORMATS_LIST,
   EXPORT_FORMATS_LIST,
   buildFineTuneJsonl,
   bulkExportConversationsByScope,
@@ -343,5 +355,7 @@ export {
   StudioSpeechSynthesisAdapter,
   createConfiguredUtterance,
   curateSystemVoices,
+  generateCustomTtsAudio,
   generateStudioTtsAudio,
+  releaseTtsAudioUrl,
 } from "./adapters/studio-speech-synthesis-adapter";
