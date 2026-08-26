@@ -22,7 +22,7 @@ import {
   listLocalModels,
 } from "@/features/hub/inventory/api";
 import { isHiddenModelId } from "@/features/hub/lib/hidden-models";
-import { resolveInitialConfig } from "@/features/model-picker";
+import { isServedByMlx, resolveInitialConfig } from "@/features/model-picker";
 import { isMlxId } from "@/features/model-picker/components/model-selector/recommended-fit";
 import { loadManagedLlamaFlags } from "@/features/model-picker/api/llama-flags";
 import { fetchLoadExtraArgs } from "@/features/model-picker/api/model-overrides";
@@ -50,6 +50,7 @@ import {
   type SearchImageEntry,
   type SearchImagesToolResult,
 } from "../search-images/search-images";
+import { mlxSpeculativeLoadFields } from "@/lib/speculative-modes";
 import { parseParamCountB } from "@/lib/model-size";
 import { createLoadingToastIcon, toast } from "@/lib/toast";
 import { notifyPromptQueueRunFailed } from "../utils/prompt-queue-boundary";
@@ -2241,6 +2242,13 @@ const VISIBLE_MODEL_RUNTIME_KEYS = [
   // The rest of the group mlxRuntimeStateFrom writes, or a background autoload
   // leaves its width and verdict on the restored model.
   "mlxKvBits",
+  "mlxSpeculativeMode",
+  "mlxDraftModel",
+  "mlxDraftBlockSize",
+  "loadedMlxSpeculativeMode",
+  "loadedMlxDraftModel",
+  "loadedMlxDraftBlockSize",
+  "mlxSpeculativeReason",
   "loadedMlxKvBitsRequested",
   "mlxKvQuantReason",
   "mlxKvQuantNote",
@@ -3127,6 +3135,15 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
     const effectiveChatTemplateOverride = config.chatTemplateOverride?.trim()
       ? config.chatTemplateOverride
       : null;
+    const autoLoadPlatform = usePlatformStore.getState();
+    const mlxSpeculativeFields = mlxSpeculativeLoadFields(
+      config,
+      isServedByMlx(
+        candidate.kind === "gguf",
+        autoLoadPlatform.deviceType,
+        autoLoadPlatform.chatOnlyReason,
+      ),
+    );
     if (
       !(await canAutoLoadRecordingFailures(failureLabel, {
         model_path: modelPath,
@@ -3139,6 +3156,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         // The same values the load below sends.
         speculative_type: effectiveSpeculativeType,
         spec_draft_n_max: effectiveSpecDraftNMax,
+        ...mlxSpeculativeFields,
         // The same remembered-derived GPU pick the load below sends.
         ...(candidate.kind === "gguf"
           ? {
@@ -3188,6 +3206,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
       chat_template_override: effectiveChatTemplateOverride,
       cache_type_kv: config.kvCacheDtype,
       mlx_kv_bits: config.mlxKvBits ?? null,
+      ...mlxSpeculativeFields,
       speculative_type: effectiveSpeculativeType,
       spec_draft_n_max: effectiveSpecDraftNMax,
       tensor_parallel: effectiveTensorParallel,

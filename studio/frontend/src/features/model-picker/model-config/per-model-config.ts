@@ -13,6 +13,10 @@ import type { GpuIndexKind } from "@/hooks/use-gpu-info";
 import {
   DRAFT_N_MAX_SPEC_TYPES,
   SEPARATE_DRAFT_MODEL_SPEC_TYPES,
+  type MlxSpeculativeMode,
+  normalizeMlxDraftBlockSize,
+  normalizeMlxDraftModel,
+  normalizeMlxSpeculativeMode,
 } from "@/lib/speculative-modes";
 
 export interface PerModelConfig {
@@ -21,6 +25,9 @@ export interface PerModelConfig {
   kvCacheDtype: string | null;
   /** MLX KV cache quantization width. Optional so older blobs still parse. */
   mlxKvBits?: number | null;
+  mlxSpeculativeMode?: MlxSpeculativeMode;
+  mlxDraftModel?: string | null;
+  mlxDraftBlockSize?: number | null;
   speculativeType: string | null;
   specDraftNMax: number | null;
   /** KV cache dtype for the DRAFT context (--spec-draft-type-k/-v), sized and
@@ -66,6 +73,9 @@ export const DEFAULT_PER_MODEL_CONFIG: PerModelConfig = {
   maxSeqLength: null,
   kvCacheDtype: null,
   mlxKvBits: null,
+  mlxSpeculativeMode: "auto",
+  mlxDraftModel: null,
+  mlxDraftBlockSize: null,
   speculativeType: null,
   specDraftNMax: null,
   specDraftCacheDtype: null,
@@ -153,7 +163,7 @@ export function presetLoadSettingNames(
     return "context length, KV cache dtype, speculative decoding, GPU layers";
   }
   return isServedByMlx(isGguf, deviceType, chatOnlyReason)
-    ? "max seq length, KV cache dtype"
+    ? "max seq length, KV cache dtype, speculative decoding"
     : "max seq length";
 }
 
@@ -209,11 +219,12 @@ export {
 const STORAGE_KEY = "unsloth_model_configs";
 const LEGACY_STORAGE_KEY = "unsloth_load_settings";
 const LEGACY_MIGRATION_FLAG = "unsloth_model_configs_migrated";
-// v2 added nBatch / nUbatch, v3 llamaExtraArgs, v4 disableVision and v5 the
+// v2 added nBatch / nUbatch, v3 llamaExtraArgs, v4 disableVision, v5 the
 // llama-server tuning group (loadMode / specDraftCacheDtype / ctxCheckpoints /
-// cacheRam); a client from before any of them would normalize the field it does
-// not know straight back out of the record.
-const STORAGE_SCHEMA_VERSION = 5;
+// cacheRam) and v6 MLX speculation; a client from before any of them would
+// normalize the field it does not know straight back out of the record.
+const STORAGE_SCHEMA_VERSION = 6;
+const PRE_MLX_SPECULATIVE_SCHEMA_VERSION = 5;
 const PRE_SERVER_TUNING_SCHEMA_VERSION = 4;
 const PRE_VISION_SCHEMA_VERSION = 3;
 const PRE_EXTRA_ARGS_SCHEMA_VERSION = 2;
@@ -234,6 +245,9 @@ const STORED_CONFIG_FIELDS = new Set([
   "maxSeqLength",
   "kvCacheDtype",
   "mlxKvBits",
+  "mlxSpeculativeMode",
+  "mlxDraftModel",
+  "mlxDraftBlockSize",
   "speculativeType",
   "specDraftNMax",
   "specDraftCacheDtype",
@@ -754,6 +768,10 @@ function warnDroppedFields(
 }
 
 function normalizeV1(partial: RawConfig): PerModelConfig {
+  const mlxSpeculativeMode = normalizeMlxSpeculativeMode(
+    partial.mlxSpeculativeMode,
+    "auto",
+  );
   const rawSpecType =
     typeof partial.speculativeType === "string"
       ? canonicalizeSpeculativeType(partial.speculativeType)
@@ -789,6 +807,15 @@ function normalizeV1(partial: RawConfig): PerModelConfig {
       MLX_KV_BITS.includes(partial.mlxKvBits)
         ? partial.mlxKvBits
         : null,
+    mlxSpeculativeMode,
+    mlxDraftModel: normalizeMlxDraftModel(
+      partial.mlxDraftModel,
+      mlxSpeculativeMode,
+    ),
+    mlxDraftBlockSize: normalizeMlxDraftBlockSize(
+      partial.mlxDraftBlockSize,
+      mlxSpeculativeMode,
+    ),
     kvCacheDtype:
       typeof partial.kvCacheDtype === "string" &&
       VALID_KV_CACHE_DTYPES.has(partial.kvCacheDtype)
@@ -863,22 +890,30 @@ function toStoredConfig(config: PerModelConfig): StoredPerModelConfig {
   // is what a pre-vision client reconstructs anyway, so a record that merely
   // carries the key at its default loses nothing by staying in that client's
   // reach -- and stamping every record v4 would put the whole store out of it.
-  // The tuning group above it follows the same rule: only a record that actually
-  // sets one of the four is put out of a pre-v5 client's reach.
+  // The tuning group above it and the MLX speculation group above that follow
+  // the same rule: only a record that actually sets one is put out of reach.
+  const hasMlxSpeculation =
+    normalized.mlxSpeculativeMode !==
+      DEFAULT_PER_MODEL_CONFIG.mlxSpeculativeMode ||
+    normalized.mlxDraftModel != null ||
+    normalized.mlxDraftBlockSize != null;
   const hasServerTuning =
     normalized.loadMode != null ||
     normalized.specDraftCacheDtype != null ||
     normalized.ctxCheckpoints != null ||
     normalized.cacheRam != null;
-  const version = hasServerTuning
+  const version = hasMlxSpeculation
     ? STORAGE_SCHEMA_VERSION
-    : normalized.disableVision
-      ? PRE_SERVER_TUNING_SCHEMA_VERSION
-      : normalized.llamaExtraArgs != null && normalized.llamaExtraArgs.length > 0
-        ? PRE_VISION_SCHEMA_VERSION
-        : normalized.nBatch != null || normalized.nUbatch != null
-          ? PRE_EXTRA_ARGS_SCHEMA_VERSION
-          : PRE_BATCH_SCHEMA_VERSION;
+    : hasServerTuning
+      ? PRE_MLX_SPECULATIVE_SCHEMA_VERSION
+      : normalized.disableVision
+        ? PRE_SERVER_TUNING_SCHEMA_VERSION
+        : normalized.llamaExtraArgs != null &&
+            normalized.llamaExtraArgs.length > 0
+          ? PRE_VISION_SCHEMA_VERSION
+          : normalized.nBatch != null || normalized.nUbatch != null
+            ? PRE_EXTRA_ARGS_SCHEMA_VERSION
+            : PRE_BATCH_SCHEMA_VERSION;
   return {
     version,
     ...normalized,
@@ -1024,6 +1059,10 @@ export function isDefaultConfig(config: PerModelConfig): boolean {
     config.maxSeqLength == null &&
     (config.kvCacheDtype ?? null) === DEFAULT_PER_MODEL_CONFIG.kvCacheDtype &&
     (config.mlxKvBits ?? null) === DEFAULT_PER_MODEL_CONFIG.mlxKvBits &&
+    (config.mlxSpeculativeMode ?? "auto") ===
+      DEFAULT_PER_MODEL_CONFIG.mlxSpeculativeMode &&
+    config.mlxDraftModel == null &&
+    config.mlxDraftBlockSize == null &&
     config.speculativeType === DEFAULT_PER_MODEL_CONFIG.speculativeType &&
     config.specDraftNMax == null &&
     config.nParallel == null &&

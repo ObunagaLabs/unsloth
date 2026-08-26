@@ -2,6 +2,10 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import type { TransformersUpgradeInfo } from "@/features/transformers-upgrade";
+import type {
+  MlxSpeculativeMode,
+  MlxSpeculativeResolvedMode,
+} from "@/lib/speculative-modes";
 
 export type CpuFallbackReason = "vulkan_startup_crash";
 
@@ -68,6 +72,12 @@ export interface LoadModelRequest {
   chat_template_override?: string | null;
   cache_type_kv?: string | null;
   mlx_kv_bits?: number | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_speculative_mode?: MlxSpeculativeMode;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_model?: string | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_block_size?: number | null;
   /**
    * Speculative decoding mode for GGUF models. Canonical values: "auto"
    * (platform-aware: DSpark or DFlash when the model ships that sidecar, else
@@ -261,6 +271,20 @@ export interface LoadModelResponse {
   cache_type_kv?: string | null;
   mlx_kv_bits?: number | null;
   mlx_kv_bits_requested?: number | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_speculative_mode?: MlxSpeculativeResolvedMode;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_speculative_mode_requested?: MlxSpeculativeMode;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_model?: string | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_model_requested?: string | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_block_size?: number | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_block_size_requested?: number | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_speculative_reason?: string | null;
   mlx_kv_quant_eligibility?: string | null;
   mlx_kv_quant_reason?: string | null;
   chat_template_override_reason?: string | null;
@@ -368,6 +392,20 @@ export interface InferenceStatusResponse {
   cache_type_kv?: string | null;
   mlx_kv_bits?: number | null;
   mlx_kv_bits_requested?: number | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_speculative_mode?: MlxSpeculativeResolvedMode;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_speculative_mode_requested?: MlxSpeculativeMode;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_model?: string | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_model_requested?: string | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_block_size?: number | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_draft_block_size_requested?: number | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  mlx_speculative_reason?: string | null;
   mlx_kv_quant_eligibility?: string | null;
   mlx_kv_quant_reason?: string | null;
   chat_template_override_reason?: string | null;

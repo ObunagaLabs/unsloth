@@ -165,6 +165,25 @@ const GPU_LAYERS_AUTO = -1;
 async function getInferenceStatus() {
   return { active_model: null };
 }
+const NO_MLX_REASONS = new Set(["mlx_unavailable", "intel_mac", "detection_failed"]);
+
+function isServedByMlx(
+  isGguf: boolean,
+  deviceType: string | null | undefined,
+  chatOnlyReason?: string | null,
+) {
+  return !isGguf && deviceType === "mac" && !NO_MLX_REASONS.has(chatOnlyReason ?? "");
+}
+
+function mlxSpeculativeLoadFields(intent: any, enabled: boolean) {
+  const mode = enabled ? (intent?.mlxSpeculativeMode ?? "auto") : "off";
+  return {
+    mlx_speculative_mode: mode,
+    mlx_draft_model: mode === "off" ? null : (intent?.mlxDraftModel ?? null),
+    mlx_draft_block_size: mode === "off" ? null : (intent?.mlxDraftBlockSize ?? null),
+  };
+}
+
 function isExternalModelId(value: unknown) {
   return typeof value === "string" && value.startsWith("external::");
 }

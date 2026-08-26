@@ -106,6 +106,16 @@ _MLX_RUNTIME_MIRROR_FIELDS = (
     "mlx_kv_quant_note",
     "chat_template_override_requested",
     "chat_template_override_reason",
+    "load_in_4bit",
+    "mlx_speculative_mode_requested",
+    "mlx_draft_model_requested",
+    "mlx_draft_block_size_requested",
+    "mlx_speculative_effective_mode",
+    "mlx_speculative_effective_draft_model",
+    "mlx_speculative_effective_block_size",
+    "mlx_speculative_pinned_mode",
+    "mlx_speculative_pinned_draft_model",
+    "mlx_speculative_reason",
 )
 
 
@@ -477,6 +487,7 @@ class InferenceOrchestrator:
         self._stop_dispatcher()  # before killing subprocess
         if self._proc is None or not self._proc.is_alive():
             self._proc = None
+            self._cleanup_interrupted_mtp_staging()
             return True
 
         # 1. Cancel any ongoing generation first (instant via mp.Event)
@@ -537,8 +548,20 @@ class InferenceOrchestrator:
         self._cancel_event = None
         self._drain_event = None
         self._reset_worker_scoped_state()
+        self._cleanup_interrupted_mtp_staging()
         logger.info("Inference subprocess shut down")
         return True
+
+    @staticmethod
+    def _cleanup_interrupted_mtp_staging() -> None:
+        try:
+            from core.inference.mlx_speculative import cleanup_native_mtp_staging
+            cleanup_native_mtp_staging()
+        except Exception:
+            logger.warning(
+                "Failed to clean interrupted MLX MTP staging checkpoints",
+                exc_info = True,
+            )
 
     def _reset_worker_scoped_state(self) -> None:
         """Drop bookkeeping that only means anything for the worker that just died.
@@ -1359,6 +1382,12 @@ class InferenceOrchestrator:
         mlx_kv_bits: Optional[int] = None,
         chat_template_override: Optional[str] = None,
         load_cancel_event: Optional[threading.Event] = None,
+        mlx_speculative_mode: str = "off",
+        mlx_draft_model: Optional[str] = None,
+        mlx_draft_block_size: Optional[int] = None,
+        mlx_speculative_resolved_mode: Optional[str] = None,
+        mlx_speculative_resolved_draft_model: Optional[str] = None,
+        mlx_speculative_resolution_reason: Optional[str] = None,
     ) -> bool:
         """Load a model for inference.
 
@@ -1398,6 +1427,12 @@ class InferenceOrchestrator:
                 else None,
                 "mlx_kv_bits": mlx_kv_bits,
                 "chat_template_override": chat_template_override,
+                "mlx_speculative_mode": mlx_speculative_mode,
+                "mlx_draft_model": mlx_draft_model,
+                "mlx_draft_block_size": mlx_draft_block_size,
+                "mlx_speculative_resolved_mode": mlx_speculative_resolved_mode,
+                "mlx_speculative_resolved_draft_model": mlx_speculative_resolved_draft_model,
+                "mlx_speculative_resolution_reason": mlx_speculative_resolution_reason,
             }
             resolved_gpu_ids, gpu_selection = prepare_gpu_selection(
                 gpu_ids,

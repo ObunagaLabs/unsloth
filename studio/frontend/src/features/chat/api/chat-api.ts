@@ -17,6 +17,7 @@ import { isHuggingFaceOffline } from "@/features/hub/lib/network";
 import { consumeNativePathToken } from "@/features/native-intents/api";
 import { formatApiErrorBody } from "@/lib/format-fastapi-error";
 import { withModelLoadNotice } from "@/lib/model-lifecycle-events";
+import type { MlxSpeculativeOptions } from "@/lib/speculative-modes";
 import type {
   MessageRecord,
   ModelType,
@@ -217,6 +218,21 @@ export async function getInferenceStatus(
   return parseJsonOrThrow<InferenceStatusResponse>(response);
 }
 
+export async function getMlxSpeculativeOptions(
+  targetModel: string,
+  hfToken?: string | null,
+  signal?: AbortSignal,
+): Promise<MlxSpeculativeOptions> {
+  const query = new URLSearchParams({ target_model: targetModel });
+  // The probe behind this reads the target's configuration, which a gated repository answers
+  // only for a caller that carries the token.
+  const response = await authFetch(
+    `/api/inference/mlx-speculative/options?${query}`,
+    { headers: hubTokenHeader(hfToken), signal },
+  );
+  return parseJsonOrThrow<MlxSpeculativeOptions>(response);
+}
+
 export async function getApiMonitor(): Promise<ApiMonitorResponse> {
   const response = await authFetch("/api/inference/monitor");
   return parseJsonOrThrow<ApiMonitorResponse>(response);
@@ -358,6 +374,11 @@ export async function validateModel(
       // with /load in both directions.
       speculative_type: payload.speculative_type ?? null,
       spec_draft_n_max: payload.spec_draft_n_max ?? null,
+      // The MLX tuple decides the same preflight: without it validate approves Off while
+      // /load judges the drafter, and the refusal lands after the switch has been committed to.
+      mlx_speculative_mode: payload.mlx_speculative_mode ?? "off",
+      mlx_draft_model: payload.mlx_draft_model ?? null,
+      mlx_draft_block_size: payload.mlx_draft_block_size ?? null,
     }),
   });
   return parseJsonOrThrow<ValidateModelResponse>(response);
