@@ -52,6 +52,9 @@ import {
 } from "../search-images/search-images";
 import { parseParamCountB } from "@/lib/model-size";
 import { createLoadingToastIcon, toast } from "@/lib/toast";
+import {
+  mergeConsecutiveSameRoleMessages,
+} from "../utils/merge-same-role-messages";
 import { notifyPromptQueueRunFailed } from "../utils/prompt-queue-boundary";
 import {
   adoptPreStreamRunReservation,
@@ -1818,7 +1821,11 @@ export async function buildOutboundMessagesForTokenCount(
     }
   }
 
-  return outboundMessages as OpenAIChatMessage[];
+  // Mirror the adapter's send-time merge so the count prices the same
+  // message list the completion actually sends.
+  return mergeConsecutiveSameRoleMessages(
+    outboundMessages as OpenAIChatMessage[],
+  );
 }
 
 /**
@@ -4895,6 +4902,12 @@ export function createOpenAIStreamAdapter(
           : disabledToolGuard;
       addSystemInstruction(outboundMessages, effectiveDisabledToolGuard);
       addSystemInstruction(outboundMessages, artifactInstruction);
+      // Last step before send: collapse same-role neighbors (cancel/retry
+      // leaves [user, user]) so strict alternating templates accept the
+      // payload. Skips assistant tool_calls turns and role="tool" results.
+      const outboundMerged = mergeConsecutiveSameRoleMessages(
+        outboundMessages as OpenAIChatMessage[],
+      );
 
       // Block when ANY image is in the outbound payload (current or prior
       // turns) and the loaded model can't process images. Once a chat
@@ -5044,7 +5057,7 @@ export function createOpenAIStreamAdapter(
           const result = await generateAudio(
             {
               model: params.checkpoint,
-              messages: outboundMessages,
+              messages: outboundMerged,
               // Same run in both registries: without it the backend files this under no
               // thread, and the stop-chats prompt counts the named local run and the
               // unnamed backend one as two.
@@ -5663,7 +5676,7 @@ export function createOpenAIStreamAdapter(
             }
             return {
               model: externalSelection.modelId,
-              messages: outboundMessages,
+              messages: outboundMerged,
               stream: true,
               // Never forwarded upstream (the proxy sends an explicit field list);
               // the trailing assistant turn is what asks a provider to continue.
@@ -5891,7 +5904,7 @@ export function createOpenAIStreamAdapter(
 
           return {
             model: params.checkpoint,
-            messages: outboundMessages,
+            messages: outboundMerged,
             stream: true,
             ...(continuation ? { continue_final_message: true } : {}),
             // Opt into the trailing usage chunk so the context-usage bar
