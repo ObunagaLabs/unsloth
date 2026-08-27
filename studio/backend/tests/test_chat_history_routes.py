@@ -407,6 +407,40 @@ def test_chat_settings_payload_rejects_junk_per_model_params():
         )
 
 
+def test_conditional_chat_settings_payload_validates_both_sides():
+    payload = chat_history.ConditionalChatSettingsPayload.model_validate(
+        {
+            "expected": {"inferenceParams": {"presencePenalty": 0.0}},
+            "expectedAbsent": ["reasoningEnabled"],
+            "expectedAbsentPaths": [["inferenceParams", "topK"]],
+            "patch": {"inferenceParams": {"presencePenalty": 1.5}},
+        }
+    )
+
+    assert payload.expected.inferenceParams.presencePenalty == 0.0
+    assert payload.expectedAbsent == ["reasoningEnabled"]
+    assert payload.expectedAbsentPaths == [["inferenceParams", "topK"]]
+    assert payload.patch.inferenceParams.presencePenalty == 1.5
+
+    with pytest.raises(ValidationError):
+        chat_history.ConditionalChatSettingsPayload.model_validate(
+            {
+                "expected": {},
+                "expectedAbsent": ["unknownSetting"],
+                "patch": {},
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        chat_history.ConditionalChatSettingsPayload.model_validate(
+            {
+                "expected": {},
+                "expectedAbsentPaths": [["unknownSetting", "topK"]],
+                "patch": {},
+            }
+        )
+
+
 def test_chat_settings_payload_accepts_preset_load_config():
     payload = chat_history.ChatSettingsPayload.model_validate(
         {

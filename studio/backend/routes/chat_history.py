@@ -67,6 +67,7 @@ from storage.studio_db import (
     upsert_chat_legacy_imports,
     upsert_chat_message,
     upsert_chat_settings_merge,
+    upsert_chat_settings_merge_if_current,
     write_chat_thread_settings,
     upsert_chat_thread,
 )
@@ -534,6 +535,38 @@ class ChatSettingsPayload(BaseModel):
 
 class ChatSettingsResponse(BaseModel):
     settings: dict[str, Any]
+
+
+class ConditionalChatSettingsPayload(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    expected: ChatSettingsPayload
+    expectedAbsent: list[str] = Field(default_factory = list)
+    expectedAbsentPaths: list[list[str]] = Field(default_factory = list)
+    patch: ChatSettingsPayload
+
+    @field_validator("expectedAbsent")
+    @classmethod
+    def _known_absent_fields(cls, value: list[str]) -> list[str]:
+        unknown = set(value) - set(ChatSettingsPayload.model_fields)
+        if unknown:
+            unknown_names = ", ".join(sorted(unknown))
+            raise ValueError(f"Unknown chat settings field(s): {unknown_names}")
+        return value
+
+    @field_validator("expectedAbsentPaths")
+    @classmethod
+    def _known_absent_paths(cls, value: list[list[str]]) -> list[list[str]]:
+        for path in value:
+            if len(path) < 2 or any(not segment for segment in path):
+                raise ValueError("Expected-absent paths require at least two non-empty segments")
+            if path[0] not in ChatSettingsPayload.model_fields:
+                raise ValueError(f"Unknown chat settings field: {path[0]}")
+        return value
+
+
+class ConditionalChatSettingsResponse(ChatSettingsResponse):
+    applied: bool
 
 
 class ChatMessagesBatchRequest(BaseModel):
@@ -1536,6 +1569,28 @@ async def clear_history(
 @router.get("/settings", response_model = ChatSettingsResponse)
 def get_settings(current_subject: str = Depends(get_current_subject)):
     return ChatSettingsResponse(settings = list_chat_settings())
+
+
+@router.post("/settings/compare-and-set", response_model = ConditionalChatSettingsResponse)
+def compare_and_set_settings(
+    payload: ConditionalChatSettingsPayload, current_subject: str = Depends(get_current_subject)
+):
+    try:
+        settings, applied = upsert_chat_settings_merge_if_current(
+            payload.expected.model_dump(exclude_unset = True),
+            payload.patch.model_dump(exclude_unset = True),
+            payload.expectedAbsent,
+            payload.expectedAbsentPaths,
+        )
+        return ConditionalChatSettingsResponse(settings = settings, applied = applied)
+    except CorruptSettingsError as exc:
+        raise log_and_http_error(
+            exc,
+            409,
+            safe_curated_detail(exc),
+            event = "chat_history.compare_and_set_settings_conflict",
+            log = logger,
+        ) from exc
 
 
 @router.put("/settings", response_model = ChatSettingsResponse)

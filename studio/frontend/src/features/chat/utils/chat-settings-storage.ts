@@ -4,6 +4,8 @@
 import {
   getChatSettings,
   saveChatSettingsPatch,
+  saveChatSettingsPatchIfCurrent,
+  type ChatSettingsPath,
   type PersistedChatPreset,
   type PersistedChatSettings,
   type PersistedInferenceParams,
@@ -252,7 +254,7 @@ function sanitizeInt(value: unknown, min: number): number | undefined {
     : undefined;
 }
 
-function sanitizeChatSettings(value: unknown): PersistedChatSettings {
+export function sanitizeChatSettings(value: unknown): PersistedChatSettings {
   if (!isRecord(value)) return {};
 
   const settings: PersistedChatSettings = {};
@@ -511,4 +513,22 @@ export async function savePersistedChatSettingsPatch(
   return sanitizeChatSettings(
     await saveChatSettingsPatch(sanitizeChatSettings(patch), options),
   );
+}
+
+export async function savePersistedChatSettingsPatchIfCurrent(
+  expected: PersistedChatSettings,
+  patch: PersistedChatSettings,
+  expectedAbsent: Array<keyof PersistedChatSettings> = [],
+  expectedAbsentPaths: ChatSettingsPath[] = [],
+): Promise<{ settings: PersistedChatSettings; applied: boolean }> {
+  const result = await saveChatSettingsPatchIfCurrent(
+    sanitizeChatSettings(expected),
+    sanitizeChatSettings(patch),
+    expectedAbsent,
+    expectedAbsentPaths,
+  );
+  return {
+    settings: sanitizeChatSettings(result.settings),
+    applied: result.applied,
+  };
 }
