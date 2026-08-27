@@ -31,6 +31,19 @@ from core.inference.video_families import MAX_VIDEO_NUM_FRAMES
 from picker.schemas import MAX_CHAT_TEMPLATE_BYTES
 
 
+_AGENT_TASK_SESSION_PREFIX = "agent-task-"
+
+
+def is_reserved_agent_task_session_id(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(_AGENT_TASK_SESSION_PREFIX)
+
+
+def _reject_reserved_agent_task_binding(value: Any) -> Any:
+    if is_reserved_agent_task_session_id(value):
+        raise ValueError("Background agent session IDs are server-owned.")
+    return value
+
+
 class LoadRequest(BaseModel):
     """Request to load a model for inference"""
 
@@ -1504,7 +1517,7 @@ class TextContentPart(BaseModel):
 
 
 class ImageUrl(BaseModel):
-    """Image URL object — supports data URIs and remote URLs."""
+    """Image URL object: supports data URIs and remote URLs."""
 
     url: str = Field(..., description = "data:image/png;base64,... or https://...")
     detail: Optional[Literal["auto", "low", "high", "original"]] = "auto"
@@ -1918,7 +1931,7 @@ class ChatCompletionRequest(BaseModel):
     )
     bypass_permissions: Optional[bool] = Field(
         False,
-        description = "[x-unsloth] Bypass Permissions: when true, skip the tool-call confirmation gate AND disable the python/terminal execution sandbox (safety checks, command blocklist, resource limits). edit_file is likewise unconfined: an absolute path resolves as written and edits the real file there, instead of being held to the conversation's working directory. Secret env vars are still stripped. Takes precedence over confirm_tool_calls.",
+        description = "[x-unsloth] Bypass Permissions: when true, skip the tool-call confirmation gate AND disable the python/terminal execution sandbox (safety checks, command blocklist, resource limits). For ordinary chats, edit_file is likewise unconfined: an absolute path resolves as written and edits the real file there. Project sessions remain confined to the selected workspace for every tool. Secret env vars are still stripped. Takes precedence over confirm_tool_calls.",
     )
     permission_mode: Optional[str] = Field(
         None,
@@ -1985,6 +1998,12 @@ class ChatCompletionRequest(BaseModel):
         None,
         description = "[x-unsloth] Session/thread ID for scoping tool execution sandbox.",
     )
+    project_context_snapshot_id: Optional[str] = Field(
+        None,
+        min_length = 32,
+        max_length = 128,
+        description = "[x-unsloth] Opaque server-owned project context snapshot.",
+    )
     thread_id: Optional[str] = Field(
         None,
         description = "[x-unsloth] Conversation ID for scoping stateful tool sessions (e.g. stdio MCP); stays per-thread where session_id may be shared project-wide.",
@@ -2039,6 +2058,11 @@ class ChatCompletionRequest(BaseModel):
             "every other provider. Treated as enabled when omitted."
         ),
     )
+
+    @field_validator("session_id", "thread_id", "cancel_id", mode = "before")
+    @classmethod
+    def _reject_server_owned_agent_task_ids(cls, value: Any) -> Any:
+        return _reject_reserved_agent_task_binding(value)
 
     @field_validator("enable_prompt_caching", mode = "before")
     @classmethod
@@ -2328,6 +2352,16 @@ class ChatCountTokensRequest(BaseModel):
         ...,
         description = "Conversation messages in OpenAI chat form",
     )
+    session_id: Optional[str] = Field(
+        None,
+        description = "[x-unsloth] Persisted project/session ID used to resolve workspace context.",
+    )
+    project_context_snapshot_id: Optional[str] = Field(
+        None,
+        min_length = 32,
+        max_length = 128,
+        description = "[x-unsloth] Opaque server-owned project context snapshot.",
+    )
     tools: Optional[list[dict]] = Field(
         None,
         description = "Optional OpenAI tool definitions included in the prompt",
@@ -2384,6 +2418,11 @@ class ChatCountTokensRequest(BaseModel):
         "left to extra='allow') so an omitted flag reads as None instead of raising AttributeError.",
     )
 
+    @field_validator("session_id", mode = "before")
+    @classmethod
+    def _reject_server_owned_agent_task_id(cls, value: Any) -> Any:
+        return _reject_reserved_agent_task_binding(value)
+
     @field_validator("permission_mode", mode = "before")
     @classmethod
     def _coerce_permission_mode(cls, value: Any) -> Any:
@@ -2404,6 +2443,11 @@ class ToolConfirmRequest(BaseModel):
     session_id: Optional[str] = None
     approval_id: Optional[str] = None
     decision: Literal["allow", "deny"] = "deny"
+
+    @field_validator("session_id", mode = "before")
+    @classmethod
+    def _reject_server_owned_agent_task_id(cls, value: Any) -> Any:
+        return _reject_reserved_agent_task_binding(value)
 
 
 # ── OpenAI shell-tool container management ─────────────────────
@@ -2755,7 +2799,7 @@ class ResponsesRequest(BaseModel):
     tool_choice: Optional[Any] = Field(
         None,
         description = (
-            "'auto' | 'required' | 'none' | {'type': 'function', 'name': ...} — "
+            "'auto' | 'required' | 'none' | {'type': 'function', 'name': ...}: "
             "the Responses-shape forcing object is translated to the Chat "
             "Completions nested shape internally."
         ),
@@ -2769,6 +2813,33 @@ class ResponsesRequest(BaseModel):
     user: Optional[str] = None
     text: Optional[Any] = None
     reasoning: Optional[Any] = None
+
+    # Typed Unsloth transport fields. Keeping these out of ``model_extra`` makes
+    # the Responses to Chat adapter carry the same project workspace and
+    # cancellation scope through both its streaming and non-streaming paths.
+    session_id: Optional[str] = Field(
+        None,
+        description = "[x-unsloth] Persisted project/session ID for workspace context and tools.",
+    )
+    project_context_snapshot_id: Optional[str] = Field(
+        None,
+        min_length = 32,
+        max_length = 128,
+        description = "[x-unsloth] Opaque server-owned project context snapshot.",
+    )
+    thread_id: Optional[str] = Field(
+        None,
+        description = "[x-unsloth] Conversation ID for stateful tool sessions.",
+    )
+    cancel_id: Optional[str] = Field(
+        None,
+        description = "[x-unsloth] Per-request cancellation token.",
+    )
+
+    @field_validator("session_id", "thread_id", "cancel_id", mode = "before")
+    @classmethod
+    def _reject_server_owned_agent_task_ids(cls, value: Any) -> Any:
+        return _reject_reserved_agent_task_binding(value)
 
     model_config = {"extra": "allow"}
 
@@ -3097,6 +3168,12 @@ class AnthropicMessagesRequest(BaseModel):
     ] = None
     preserve_thinking: Optional[bool] = None
     session_id: Optional[str] = None
+    project_context_snapshot_id: Optional[str] = Field(
+        None,
+        min_length = 32,
+        max_length = 128,
+        description = "[x-unsloth] Opaque server-owned project context snapshot.",
+    )
     thread_id: Optional[str] = Field(
         None,
         description = "[x-unsloth] Conversation ID for scoping stateful tool sessions (e.g. stdio MCP); stays per-thread where session_id may be shared project-wide.",
@@ -3119,6 +3196,11 @@ class AnthropicMessagesRequest(BaseModel):
         description = "[x-unsloth] Opt-in tool-call recovery; mirrors the Chat Completions nudge_tool_calls field and defaults off.",
     )
     model_config = {"extra": "allow"}
+
+    @field_validator("session_id", "thread_id", "cancel_id", mode = "before")
+    @classmethod
+    def _reject_server_owned_agent_task_ids(cls, value: Any) -> Any:
+        return _reject_reserved_agent_task_binding(value)
 
     def resolved_enable_thinking(self) -> Optional[bool]:
         """Effective on/off, preferring the x-unsloth field over `thinking`."""
