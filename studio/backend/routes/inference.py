@@ -6443,6 +6443,23 @@ def _llama_public_model_id(llama_backend, fallback: Optional[str] = None) -> Opt
     )
 
 
+def _loading_public_id(model_path: Optional[str]) -> Optional[str]:
+    """The id ``/api/inference/status`` publishes for a load still in flight.
+
+    The request carries whatever the client sent, which for an on-device model is an
+    absolute path. What the same load reports once it lands is path-free (see
+    ``_llama_status_model_ids`` and ``core.inference.model_ids.public_model_id``), so
+    reporting it mid-load must be too: a registered native-lease label if the grant has
+    been redeemed, else the clean public id.
+    """
+    if not model_path:
+        return model_path
+    label = display_label_for_native_path(model_path)
+    if label != model_path:
+        return label
+    return public_model_id(model_path) or model_path
+
+
 def _llama_status_model_ids(llama_backend) -> "tuple[Optional[str], Optional[str]]":
     """The ``(active_model, model_identifier)`` pair ``/api/inference/status`` publishes
     for a loaded GGUF. A native-lease load reports only the display label, never the
@@ -11728,6 +11745,7 @@ _scoped_load_attempts_lock = threading.Lock()
 _scoped_load_attempts: dict[tuple[str, str], _ScopedLoadAttempt] = {}
 _scoped_load_cancel_tombstones: dict[tuple[str, str], tuple[str, float]] = {}
 _running_load_attempt: Optional[_ScopedLoadAttempt] = None
+_pending_load_attempts: dict[str, _ScopedLoadAttempt] = {}
 _SCOPED_LOAD_CANCEL_TOMBSTONE_TTL_S = 60.0
 # Bound on waiting for a cancel's teardown to report back. Only the /unload
 # handler sets cancel_complete for a running attempt, so a disconnect or a
@@ -11910,6 +11928,8 @@ async def load_model_gated(
     from core.inference.llama_keepwarm import inference_lifecycle_gate
 
     attempt = _begin_load_attempt(request, current_subject)
+    with _scoped_load_attempts_lock:
+        _pending_load_attempts[attempt.token] = attempt
     try:
         _raise_if_sidecar_swap_in_progress()
         # Hold the lifecycle gate across the load so idle auto-unload can't unload the
@@ -11938,6 +11958,8 @@ async def load_model_gated(
         get_llama_cpp_backend()._loaded_by_user_action = user_initiated
         return response
     finally:
+        with _scoped_load_attempts_lock:
+            _pending_load_attempts.pop(attempt.token, None)
         _finish_load_attempt(attempt)
 
 
@@ -14773,6 +14795,18 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
         _installed_tag = _freshness.get("installed_tag")
         _latest_tag = _freshness.get("latest_tag")
 
+        with _scoped_load_attempts_lock:
+            _tracked_loading_id = (
+                _running_load_attempt.model_path if _running_load_attempt is not None else ""
+            )
+            if not _tracked_loading_id:
+                _queued = next(iter(_pending_load_attempts.values()), None)
+                _tracked_loading_id = _queued.model_path if _queued is not None else ""
+        # The attempt holds what the client sent, which for an on-device model is a path.
+        _tracked_loading_id = _loading_public_id(_tracked_loading_id) or ""
+        _loading = [_tracked_loading_id] if _tracked_loading_id else []
+        backend = _peek_inference_backend()
+
         # If a GGUF model is loaded via llama-server, report that
         if llama_backend.is_loaded:
             _model_id = llama_backend.model_identifier
@@ -14810,7 +14844,7 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
                     llama_backend, _native_grant_backed, _model_id
                 ),
                 gguf_variant = llama_backend.hf_variant,
-                loading = [],
+                loading = _loading,
                 # Plus anything the Unsloth registry still holds: the GGUF load
                 # only unloaded the ACTIVE one, so a model cached behind it is
                 # still in VRAM and was invisible to every client reading this.
@@ -14839,9 +14873,9 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
 
         # Otherwise report Unsloth backend status. Peek rather than build: no singleton means
         # nothing is loaded, and the chat UI polls this from first paint.
-        backend = _peek_inference_backend()
         if backend is None:
             return InferenceStatusResponse(
+                loading = _loading,
                 llama_cpp_supports_mtp = _supports_mtp,
                 llama_cpp_prebuilt_stale = _stale,
                 llama_cpp_installed_tag = _installed_tag,
@@ -14870,6 +14904,15 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
             load_inference_config(backend.active_model_name) if backend.active_model_name else None
         )
 
+        # The backend names the load it is running and the attempt registry names the
+        # one the route accepted; they are the same load, so compare the public ids or
+        # a model loaded from a path would be listed twice.
+        _loading_models = list(getattr(backend, "loading_models", set()))
+        if _tracked_loading_id and not any(
+            _loading_public_id(_name) == _tracked_loading_id for _name in _loading_models
+        ):
+            _loading_models.append(_tracked_loading_id)
+
         return InferenceStatusResponse(
             active_model = backend.active_model_name,
             model_identifier = backend.active_model_name,
@@ -14889,7 +14932,7 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
             mlx_kv_quant_note = model_info.get("mlx_kv_quant_note"),
             chat_template_override = model_info.get("chat_template_override_requested"),
             chat_template_override_reason = model_info.get("chat_template_override_reason"),
-            loading = list(getattr(backend, "loading_models", set())),
+            loading = _loading_models,
             loaded = list(backend.models.keys()),
             inference = inference_config,
             requires_trust_remote_code = _resolve_loaded_trust_remote_code(

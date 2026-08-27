@@ -162,9 +162,31 @@ const GPU_LAYERS_AUTO = -1;
 // The sliced region now includes the queue-specific empty-model resolver and
 // visible-state snapshot helpers, so their imported contracts must exist even
 // though these scenarios call autoLoadSmallestModel directly.
+let STATUS_CALLS = 0;
 async function getInferenceStatus() {
-  return { active_model: null };
+  // Fail initial reads or settle the simulated CLI load when requested.
+  const call = STATUS_CALLS++;
+  if (call < (SCENARIO.statusFailures ?? 0)) {
+    throw new Error("status unavailable");
+  }
+  const loading = SCENARIO.serverLoading ?? [];
+  const clearsAfter = SCENARIO.serverLoadingClearsAfter ?? null;
+  const settled = clearsAfter !== null && call >= clearsAfter;
+  // A replacement keeps the outgoing model resident and reported until the
+  // incoming one lands, so status names both at once.
+  const resident = SCENARIO.serverResident ?? null;
+  const active = settled ? (loading[0] ?? resident) : resident;
+  return {
+    active_model: active,
+    model_identifier: active,
+    loading: settled ? [] : loading,
+  };
 }
+// Defined above the sliced region in chat-adapter.ts, so the slice would call a
+// name the harness lacks. Reached only when the lease is already held, which no
+// scenario here does.
+async function waitForModelReady(_signal?: any) {}
+const window: any = { location: { href: "http://localhost/chat" } };
 function isExternalModelId(value: unknown) {
   return typeof value === "string" && value.startsWith("external::");
 }
@@ -191,16 +213,29 @@ function snapshotQueuedChatRunSettings(state: any) {
 function makeStore(): any {
   const state: any = {
     hfToken: null,
-    params: { maxSeqLength: 4096, checkpoint: "" },
+    // The visible selection the queued resolver reads; external means the turn
+    // has to resolve a local model of its own.
+    params: { maxSeqLength: 4096, checkpoint: SCENARIO?.visibleCheckpoint ?? "" },
     activeGgufVariant: null,
     activePresetSource: null,
     gpuMemoryMode: "auto",
     selectedGpuIds: null,
     models: [],
+    modelLoading: false,
+    activeThreadEpoch: 0,
+    queuedSettingsEpoch: 0,
+    contextUsage: null,
+    contextUsageByThreadId: {},
     setCheckpoint: () => {},
     setModelRequiresTrustRemoteCode: () => {},
     setParams: (p: any) => { state.params = p; },
     setModels: (m: any[]) => { state.models = m; },
+    beginModelLoading: () => {
+      if (state.modelLoading) return null;
+      state.modelLoading = true;
+      return { id: 1 };
+    },
+    endModelLoading: () => { state.modelLoading = false; },
   };
   return state;
 }
@@ -333,7 +368,13 @@ function mmprojFallbackMessage(reason: string) {
   return `mmproj fallback: ${reason}`;
 }
 
-async function tryAdoptServerActiveModel() { return false; }
+async function tryAdoptServerActiveModel(options: any) {
+  // Record adoption without reproducing store hydration.
+  const id = options?.status?.active_model;
+  if (!id) return false;
+  EVENTS.push({ kind: "adoptServerModel", id });
+  return true;
+}
 function resolveSpeculativeSettingsForLoad() {
   return { speculativeType: null, specDraftNMax: 0 };
 }
@@ -585,6 +626,7 @@ SCENARIO_HELPERS = """
       size_bytes: 1_100_000_000,
       capabilities: { can_chat: true, requires_variant: false },
     };
+    const EXTERNAL = "external::openai/gpt-5";
     const scenario = (over) => ({
       ggufRepos: [],
       modelRepos: [],
@@ -597,6 +639,12 @@ SCENARIO_HELPERS = """
       platformFetched: true,
       variants: {},
       lastLoaded: null,
+      // Simulated /status load state and failures.
+      serverLoading: [],
+      serverResident: null,
+      statusFailures: 0,
+      serverLoadingClearsAfter: null,
+      visibleCheckpoint: "",
       validate: VALIDATE_OK,
       load: LOADED,
       download: () => "complete",
@@ -696,33 +744,52 @@ def _build_harness(run_dir: Path):
         "wrong-model assertions rather than saying what is actually missing."
     )
     (run_dir / "harness.ts").write_text(
-        "// @ts-nocheck\n" + PREAMBLE + "\n" + body + "\nexport { autoLoadSmallestModel };\n",
+        "// @ts-nocheck\n"
+        + PREAMBLE
+        + "\n"
+        + body
+        + "\nexport { autoLoadSmallestModel, resolveQueuedEmptyLocalModel };\n",
         encoding = "utf-8",
     )
 
 
-def _run(scenario_expr: str) -> dict:
+def _run(
+    scenario_expr: str,
+    prelude: str = "",
+    *,
+    queued: bool = False,
+) -> dict:
     _require_node()
     # Its own directory per invocation: a shared file lets one runner read another's rewrite.
     TEMP.mkdir(parents = True, exist_ok = True)
     run_dir = Path(tempfile.mkdtemp(prefix = "run", dir = TEMP))
     _build_harness(run_dir)
+    # The real send path always supplies an abort signal, so every scenario
+    # exercises the signal plumbing whichever entry point it enters through.
+    entry = (
+        "resolveQueuedEmptyLocalModel(signal)"
+        if queued
+        else "autoLoadSmallestModel({ abortSignal: signal })"
+    )
     script = (
         textwrap.dedent(
             """
         // @ts-nocheck
-        import { autoLoadSmallestModel, setScenario, EVENTS } from "./harness.ts";
+        import {
+          autoLoadSmallestModel,
+          resolveQueuedEmptyLocalModel,
+          setScenario,
+          EVENTS,
+        } from "./harness.ts";
         """
         )
         + SCENARIO_HELPERS
+        + textwrap.dedent(prelude)
         + textwrap.dedent(
             f"""
         setScenario({scenario_expr});
-        // The real send path always supplies one, so the signal plumbing is
-        // exercised by every scenario.
-        const result = await autoLoadSmallestModel({{
-          abortSignal: new AbortController().signal,
-        }});
+        const signal = new AbortController().signal;
+        const result = await {entry};
         console.log(JSON.stringify({{ result, events: EVENTS }}));
         """
         )
@@ -1572,3 +1639,129 @@ def test_an_unclassified_local_row_is_never_auto_loaded(fmt):
 
     assert "/models/x" not in _loaded_paths(out)
     assert _loaded_paths(out) == [DEFAULT_MODEL]
+
+
+# Advance the helper's clock directly to its timeout.
+_EXPIRE_CLI_LOAD_WAIT = """
+const realNow = Date.now.bind(Date);
+let nowCalls = 0;
+Date.now = () => realNow() + (nowCalls++ === 0 ? 0 : 600_001);
+"""
+
+
+def test_send_retries_status_then_waits_for_and_adopts_the_cli_model():
+    """Send retries status, waits for the CLI load, and adopts its model."""
+    out = _run(
+        "scenario({ statusFailures: 1, serverLoading: ['org/slow-model-GGUF'],"
+        " serverLoadingClearsAfter: 2,"
+        " ggufRepos: [GEMMA], variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })"
+    )
+
+    adopted = [e["id"] for e in out["events"] if e["kind"] == "adoptServerModel"]
+    assert adopted == ["org/slow-model-GGUF"]
+    assert _loaded_paths(out) == []
+    assert _downloads_started(out) == []
+    assert out["result"]["loaded"] is True
+    # Announced once, not once per poll.
+    assert [t["msg"] for t in _toasts(out, "toast.info")] == [
+        "Waiting for model to finish loading…"
+    ]
+
+
+def test_a_load_still_in_flight_at_the_cap_refuses_instead_of_auto_loading():
+    """The wait cap must not release auto-load over a running CLI load."""
+    out = _run(
+        "scenario({ serverLoading: ['org/slow-model-GGUF'],"
+        " ggufRepos: [GEMMA], variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })",
+        prelude = _EXPIRE_CLI_LOAD_WAIT,
+    )
+
+    assert _loaded_paths(out) == []
+    assert _downloads_started(out) == []
+    assert out["result"]["loaded"] is False
+    assert out["result"]["loadFailureReported"] is True
+    assert [t["msg"] for t in _toasts(out, "toast.error")] == ["A model is still loading"]
+
+
+def test_an_idle_server_still_auto_loads():
+    """An idle server still reaches automatic loading."""
+    out = _run("scenario({ ggufRepos: [GEMMA], variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })")
+
+    assert _loaded_paths(out) == [GEMMA_REPO]
+    assert out["result"]["loaded"] is True
+    assert _toasts(out, "toast.info") == []
+
+
+def test_a_status_endpoint_that_never_answers_refuses_rather_than_guessing():
+    """An unavailable status endpoint must not be treated as idle."""
+    out = _run(
+        "scenario({ statusFailures: 99, ggufRepos: [GEMMA],"
+        " variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })"
+    )
+
+    assert _loaded_paths(out) == []
+    assert out["result"]["loaded"] is False
+    assert out["result"]["loadFailureReported"] is True
+    assert [t["msg"] for t in _toasts(out, "toast.error")] == ["Could not reach the model server"]
+
+
+# A queued turn whose thread carries no model resolves one of its own, and the visible
+# tab may be on a provider model meanwhile. That resolver reads /status directly, so it
+# needs the same in-flight-load gate the sweep above has.
+
+
+def test_a_queued_turn_binds_the_incoming_model_not_the_one_being_replaced():
+    """During a replacement the status names the resident model and the incoming one at
+    once, and only the incoming one is what this turn will actually run against."""
+    out = _run(
+        "scenario({ visibleCheckpoint: EXTERNAL, serverResident: 'org/outgoing-GGUF',"
+        " serverLoading: ['org/slow-model-GGUF'], serverLoadingClearsAfter: 2,"
+        " ggufRepos: [GEMMA], variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })",
+        queued = True,
+    )
+
+    assert out["result"]["loaded"] is True
+    assert out["result"]["modelRuntime"]["checkpoint"] == "org/slow-model-GGUF"
+    assert _loaded_paths(out) == []
+    assert _downloads_started(out) == []
+
+
+def test_a_queued_turn_refuses_rather_than_auto_loading_over_a_cli_load():
+    """The wait cap must not release the queued sweep over a running CLI load either."""
+    out = _run(
+        "scenario({ visibleCheckpoint: EXTERNAL, serverLoading: ['org/slow-model-GGUF'],"
+        " ggufRepos: [GEMMA], variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })",
+        prelude = _EXPIRE_CLI_LOAD_WAIT,
+        queued = True,
+    )
+
+    assert _loaded_paths(out) == []
+    assert _downloads_started(out) == []
+    assert out["result"]["loaded"] is False
+    assert out["result"]["loadFailureReported"] is True
+    assert out["result"]["modelRuntime"] is None
+    assert [t["msg"] for t in _toasts(out, "toast.error")] == ["A model is still loading"]
+
+
+def test_a_queued_turn_still_binds_a_resident_model_on_an_idle_server():
+    out = _run(
+        "scenario({ visibleCheckpoint: EXTERNAL, serverResident: 'org/resident-GGUF',"
+        " ggufRepos: [GEMMA], variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })",
+        queued = True,
+    )
+
+    assert out["result"]["loaded"] is True
+    assert out["result"]["modelRuntime"]["checkpoint"] == "org/resident-GGUF"
+    assert _loaded_paths(out) == []
+    assert _toasts(out, "toast.info") == []
+
+
+def test_a_queued_turn_on_an_empty_idle_server_still_auto_loads():
+    out = _run(
+        "scenario({ visibleCheckpoint: EXTERNAL, ggufRepos: [GEMMA],"
+        " variants: { [GEMMA.repo_id]: GEMMA_VARIANTS } })",
+        queued = True,
+    )
+
+    assert _loaded_paths(out) == [GEMMA_REPO]
+    assert out["result"]["loaded"] is True

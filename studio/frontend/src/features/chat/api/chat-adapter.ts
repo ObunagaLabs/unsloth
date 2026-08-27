@@ -170,6 +170,7 @@ import type {
   CpuFallbackReason,
   MmprojFallbackReason,
   GgufVariantDetail,
+  InferenceStatusResponse,
   OpenAIChatChunk,
   OpenAIChatCompletionsRequest,
   OpenAIChatMessage,
@@ -2870,6 +2871,98 @@ async function ensureDefaultModelDownloaded(
   });
 }
 
+// The test harness slices helpers from here; keep them below MAX_AUTO_LOAD_ATTEMPTS.
+// Slow downloads and llama-server warm-up need a long cap.
+const CLI_LOAD_ADOPT_MAX_MS = 600_000;
+
+type ServerLoadBlocked = "still-loading" | "status-unavailable";
+
+type SettledServerStatus =
+  | { outcome: "settled"; status: InferenceStatusResponse }
+  | { outcome: "stopped"; status?: undefined }
+  | { outcome: ServerLoadBlocked; status?: undefined };
+
+/**
+ * Poll until nothing is loading. A status carrying `loading` still names the model
+ * being replaced, so no caller may read a residency off it; it can only be waited
+ * out. `stopEarly` abandons the wait once the caller stops needing an answer, and
+ * a caller that passes none never has to consider that outcome.
+ */
+async function waitForSettledServerStatus(options: {
+  abortSignal?: AbortSignal;
+  stopEarly: () => boolean;
+}): Promise<SettledServerStatus>;
+async function waitForSettledServerStatus(options?: {
+  abortSignal?: AbortSignal;
+}): Promise<Exclude<SettledServerStatus, { outcome: "stopped" }>>;
+async function waitForSettledServerStatus(options?: {
+  abortSignal?: AbortSignal;
+  stopEarly?: () => boolean;
+}): Promise<SettledServerStatus> {
+  const deadline = Date.now() + CLI_LOAD_ADOPT_MAX_MS;
+  let failures = 0;
+  let announced = false;
+
+  for (;;) {
+    options?.abortSignal?.throwIfAborted();
+    if (options?.stopEarly?.()) return { outcome: "stopped" };
+
+    let status: InferenceStatusResponse | null = null;
+    try {
+      status = await getInferenceStatus();
+      failures = 0;
+    } catch {
+      // A failed read is not evidence the server is idle.
+      if (++failures >= 2) return { outcome: "status-unavailable" };
+    }
+
+    options?.abortSignal?.throwIfAborted();
+    if (options?.stopEarly?.()) return { outcome: "stopped" };
+    if (status && (status.loading?.length ?? 0) === 0) {
+      return { outcome: "settled", status };
+    }
+    if (status && !announced) {
+      toast.info("Waiting for model to finish loading…");
+      announced = true;
+    }
+    if (Date.now() >= deadline) return { outcome: "still-loading" };
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+/** Name the reason nothing loaded, so the caller's generic advice stays suppressed. */
+function reportBlockedServerLoad(outcome: ServerLoadBlocked): void {
+  const stillLoading = outcome === "still-loading";
+  toast.error(
+    stillLoading ? "A model is still loading" : "Could not reach the model server",
+    {
+      description: stillLoading
+        ? "Send again once it finishes, or pick a model in the top bar."
+        : "Check that the server is running, then send again.",
+    },
+  );
+}
+
+type CliLoadAdoption = "adopted" | "server-idle" | ServerLoadBlocked;
+
+/** Wait out a server-started load and adopt it before automatic loading. */
+async function adoptInFlightServerLoad(
+  abortSignal?: AbortSignal,
+): Promise<CliLoadAdoption> {
+  const settled = await waitForSettledServerStatus({
+    abortSignal,
+    stopEarly: () => Boolean(useChatRuntimeStore.getState().params.checkpoint),
+  });
+  if (settled.outcome === "stopped") return "adopted";
+  if (settled.outcome !== "settled") return settled.outcome;
+  return (await tryAdoptServerActiveModel({
+    allowWhileModelLoading: true,
+    status: settled.status,
+  }))
+    ? "adopted"
+    : "server-idle";
+}
+
 async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
   loaded: boolean;
   blockedByTrustRemoteCode: boolean;
@@ -2878,10 +2971,19 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
 }> {
   options?.abortSignal?.throwIfAborted();
   if (!options?.skipAdoptServerModel) {
-    const adoptedServerModel = await tryAdoptServerActiveModel();
+    const adoption = await adoptInFlightServerLoad(options?.abortSignal);
     options?.abortSignal?.throwIfAborted();
-    if (adoptedServerModel) {
+    if (adoption === "adopted") {
       return { loaded: true, blockedByTrustRemoteCode: false };
+    }
+    if (adoption !== "server-idle") {
+      // Never auto-load unless status confirmed the server is idle.
+      reportBlockedServerLoad(adoption);
+      return {
+        loaded: false,
+        blockedByTrustRemoteCode: false,
+        loadFailureReported: true,
+      };
     }
   }
 
@@ -3863,11 +3965,21 @@ async function resolveQueuedEmptyLocalModel(abortSignal: AbortSignal): Promise<{
       // Hold the lifecycle lease across the probe. Its response cannot become
       // stale behind a foreground or sibling queued load, and only this owner
       // may clear modelLoading afterward.
-      // A failed probe is not evidence that the local server is empty. Fail
-      // closed so a transient status error cannot replace a valid resident
-      // model with the recorded/default auto-load candidate.
-      const status = await getInferenceStatus();
+      // A failed probe is not evidence that the local server is empty, and neither
+      // is one read mid-replacement. Fail closed so neither a transient status
+      // error nor the model being evicted can stand in for the incoming one.
+      const settled = await waitForSettledServerStatus({ abortSignal });
       abortSignal.throwIfAborted();
+      if (settled.outcome !== "settled") {
+        reportBlockedServerLoad(settled.outcome);
+        return {
+          loaded: false,
+          blockedByTrustRemoteCode: false,
+          loadFailureReported: true,
+          modelRuntime: null,
+        };
+      }
+      const status = settled.status;
       // The other door into adoption, bypassing tryAdoptServerActiveModel: a speech
       // model is not one chat can queue against, so read the slot as empty and let the
       // sweep below load a real chat model.

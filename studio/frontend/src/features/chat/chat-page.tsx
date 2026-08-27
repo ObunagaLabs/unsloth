@@ -3679,13 +3679,21 @@ export function ChatPage({
 
   useEffect(() => {
     if (getTrainingCompareHandoff()) return;
-    void refresh({ includeLoras: false });
+    const controller = new AbortController();
+    void refresh({
+      includeLoras: true,
+      signal: controller.signal,
+      waitForServerModel: !useChatRuntimeStore.getState().params.checkpoint,
+    });
     const timeoutId = window.setTimeout(() => {
       if (!inventoryRefreshStartedRef.current) {
         refreshDeferredModelInventories();
       }
     }, 1200);
-    return () => window.clearTimeout(timeoutId);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timeoutId);
+    };
   }, [refresh, refreshDeferredModelInventories]);
 
   useEffect(() => {

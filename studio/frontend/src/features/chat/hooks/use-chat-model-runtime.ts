@@ -75,6 +75,7 @@ import {
   clampLocalReasoningEffort,
   normalizeSpeculativeType,
   resolveInferenceCheckpointId,
+  tryAdoptServerActiveModel,
 } from "../lib/apply-inference-status-to-store";
 import {
   isIdleUnloadedStatus,
@@ -207,6 +208,48 @@ const MODEL_LOAD_TOAST_CLASSNAMES = {
 } as const;
 
 const LORA_SUFFIX_RE = /_(\d{9,})$/;
+
+const CLI_LOAD_POLL_IDLE_MS = 60_000;
+const CLI_LOAD_POLL_MAX_MS = 600_000;
+
+async function waitForServerModel(signal?: AbortSignal): Promise<void> {
+  const started = Date.now();
+  let sawLoad = false;
+
+  while (
+    !signal?.aborted &&
+    !useChatRuntimeStore.getState().params.checkpoint &&
+    !useChatRuntimeStore.getState().modelLoading
+  ) {
+    let status: InferenceStatusResponse | null = null;
+    try {
+      status = await getInferenceStatus();
+    } catch {
+      // A later poll can recover from a transient status failure.
+    }
+    if (
+      signal?.aborted ||
+      useChatRuntimeStore.getState().params.checkpoint ||
+      useChatRuntimeStore.getState().modelLoading
+    ) {
+      return;
+    }
+
+    if (status) {
+      const loading = (status.loading?.length ?? 0) > 0;
+      sawLoad ||= loading;
+      if (!loading && status.active_model) {
+        await tryAdoptServerActiveModel({ status });
+        return;
+      }
+      if (!loading && sawLoad) return;
+    }
+    const elapsed = Date.now() - started;
+    if (!sawLoad && elapsed >= CLI_LOAD_POLL_IDLE_MS) return;
+    if (elapsed >= CLI_LOAD_POLL_MAX_MS) return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
 
 function parseTrailingEpoch(input: string): number | undefined {
   const match = input.match(LORA_SUFFIX_RE);
@@ -376,12 +419,7 @@ function getTransformersUpgradeRequiredMessage(modelName: string): string {
  * is a thin wrapper over it. External selections are left untouched since they
  * have no backend mirror.
  */
-// Bumped by every call. Two refreshes can be in flight at once -- a media load
-// announces itself before its POST and again once the backend has committed the
-// eviction -- and they read the status at different moments. Completion order is
-// not the order they were issued in, so without this the older one could land
-// last and re-pin the model the newer one had just seen released, leaving chat
-// claiming a model that 400s on send until the load finally settled.
+// Prevent older concurrent status reads from overwriting newer results.
 let syncGeneration = 0;
 let lastIdleUnloadArmed = false;
 
@@ -399,16 +437,18 @@ async function syncInferenceStatusToStore(options?: {
   signal?: AbortSignal;
   includeLoras?: boolean;
   preserveIdleUnloaded?: boolean;
+  /** A TTS load owns the chat slot even though Chat did not start the load. */
+  externalChatSlotLoad?: boolean;
 }): Promise<void> {
   const signal = options?.signal;
   const includeLoras = options?.includeLoras ?? true;
-  // Last issued wins: it read the freshest status, whichever answers first.
   const generation = ++syncGeneration;
   const superseded = () => generation !== syncGeneration;
   const { setModels, setLoras, setCheckpoint, setModelsError } =
     useChatRuntimeStore.getState();
   setModelsError(null);
   try {
+    const selectedAtStart = useChatRuntimeStore.getState().params.checkpoint;
     const [listRes, statusRes, lorasRes, idleUnloadArmed] = await Promise.all([
       listModels(),
       getInferenceStatus(),
@@ -418,10 +458,6 @@ async function syncInferenceStatusToStore(options?: {
         : Promise.resolve(false),
     ]);
 
-    // Cancellation can land while the requests above are in flight. Bail
-    // before writing backend state back -- cancelLoading already cleared it.
-    // Same for a refresh that a later one has already superseded: its answer
-    // describes a moment that has passed.
     if (signal?.aborted || superseded()) return;
 
     setModels(listRes.models.map(toChatModelRow));
@@ -429,15 +465,24 @@ async function syncInferenceStatusToStore(options?: {
       setLoras(lorasRes.loras.map(toLoraSummary));
     }
 
-    const selectedCheckpoint = useChatRuntimeStore.getState().params.checkpoint;
+    const selectedCheckpoint =
+      useChatRuntimeStore.getState().params.checkpoint;
     const isExternalSelectionActive = isExternalModelId(selectedCheckpoint);
+    const selectionChanged = selectedCheckpoint !== selectedAtStart;
+    const statusLoading = (statusRes.loading?.length ?? 0) > 0;
     // The local selection is re-derived from this status on every mount, so adopting a
     // TTS model made it the chat model without the user picking it. Read the slot as
     // empty and the eviction branch below clears the stale pick, as it does for an
     // image or video load.
     const chatActiveModel =
-      statusRes.active_model && !isSpeechOnlyStatus(statusRes);
-    if (chatActiveModel && !isExternalSelectionActive) {
+      statusRes.active_model &&
+      !isSpeechOnlyStatus(statusRes) &&
+      !(statusLoading && options?.externalChatSlotLoad);
+    if (
+      chatActiveModel &&
+      !isExternalSelectionActive &&
+      !selectionChanged
+    ) {
       const checkpointId = resolveInferenceCheckpointId(statusRes);
       if (checkpointId) {
         const previousGgufVariant =
@@ -473,7 +518,11 @@ async function syncInferenceStatusToStore(options?: {
           void refreshContextUsage({ threadId: hydrated.activeThreadId });
         }
       }
-    } else if (!chatActiveModel && !isExternalSelectionActive) {
+    } else if (
+      !chatActiveModel &&
+      !isExternalSelectionActive &&
+      !selectionChanged
+    ) {
       if (isIdleUnloadedStatus(statusRes, idleUnloadArmed)) return;
       // Loading an image, video or audio model evicts the chat one (the GPU arbiter
       // allows a single owner), and nothing else here would say so: the picker
@@ -492,12 +541,12 @@ async function syncInferenceStatusToStore(options?: {
         loadedIsDiffusion: false,
       });
       // A known prior resident or a definitive speech-only owner both prove the
-      // persisted Chat pick is stale. A load in flight has no active model yet
-      // either, so never clear while one is starting.
+      // persisted Chat pick is stale. Do not clear for a Chat load that this tab
+      // started. TTS is different because it owns this same slot.
       if (
         (wasResident || isSpeechOnlyStatus(statusRes)) &&
         selectedCheckpoint &&
-        !modelLoading
+        (!modelLoading || options?.externalChatSlotLoad)
       ) {
         // Already the clean id the header shows: resolveInferenceCheckpointId
         // put it there, not a load path.
@@ -514,8 +563,7 @@ async function syncInferenceStatusToStore(options?: {
       }
     }
   } catch (error) {
-    // A superseded refresh reports nothing, or a stale failure would raise a
-    // toast about a read whose answer would have been discarded anyway.
+    // Discard failures from cancelled or superseded reads.
     if (signal?.aborted || superseded()) return;
     const message =
       error instanceof Error ? error.message : "Failed to load models";
@@ -634,12 +682,18 @@ export function useChatModelRuntime() {
   );
 
   const refresh = useCallback(
-    (options?: {
+    async (options?: {
+      waitForServerModel?: boolean;
       signal?: AbortSignal;
       includeLoras?: boolean;
       preserveIdleUnloaded?: boolean;
-    }) =>
-      syncInferenceStatusToStore(options),
+      externalChatSlotLoad?: boolean;
+    }) => {
+      await syncInferenceStatusToStore(options);
+      if (options?.waitForServerModel) {
+        await waitForServerModel(options.signal);
+      }
+    },
     [],
   );
 
@@ -659,7 +713,10 @@ export function useChatModelRuntime() {
         // image or video load POST, before the download starts, so waiting for
         // the load to finish left the picker and the header naming a model that
         // had already gone and that 400s on send, for the whole download.
-        void refresh({ includeLoras: false });
+        void refresh({
+          includeLoras: false,
+          externalChatSlotLoad: runtime === "tts",
+        });
       }),
     [refresh],
   );
@@ -832,6 +889,7 @@ export function useChatModelRuntime() {
         // another tab can swap the resident model, which this one is never told about
         // (the lifecycle events are dispatched on its own window).
         const adoptable = (status: InferenceStatusResponse) =>
+          (status.loading?.length ?? 0) === 0 &&
           residentModelMatchesPick(status, {
             id: modelId,
             loadPath,
