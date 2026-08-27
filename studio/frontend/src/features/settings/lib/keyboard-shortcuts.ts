@@ -244,7 +244,6 @@ function keyToCode(key: string): string {
     "\\": "Backslash",
     "-": "Minus",
     "=": "Equal",
-    "+": "Equal",
     "`": "Backquote",
   };
   return punctuation[key] ?? key;
@@ -261,6 +260,7 @@ export function matchesBinding(
     altKey: boolean;
   },
   mac = isMacPlatform(),
+  shortcutId?: ShortcutId,
 ): boolean {
   const code = event.code || keyToCode(event.key ?? "");
   const modHeld = mac ? event.metaKey : event.ctrlKey;
@@ -274,28 +274,27 @@ export function matchesBinding(
     return false;
   }
 
-  // Equal / Zoom in: '+' is Shift+'=' on standard layouts, so allow shift when matching Equal
-  if (
-    binding.code === "Equal" &&
-    (code === "Equal" || code === "NumpadAdd" || event.key === "+" || event.key === "=")
-  ) {
-    return event.altKey === binding.alt;
-  }
-
-  // Minus / Zoom out: allow NumpadSubtract
-  if (
-    binding.code === "Minus" &&
-    (code === "Minus" || code === "NumpadSubtract" || event.key === "-")
-  ) {
-    return event.shiftKey === binding.shift && event.altKey === binding.alt;
-  }
-
-  // Digit0 / Reset zoom: allow Numpad0
-  if (
-    binding.code === "Digit0" &&
-    (code === "Digit0" || code === "Numpad0" || event.key === "0")
-  ) {
-    return event.shiftKey === binding.shift && event.altKey === binding.alt;
+  // Zoom-specific aliasing: Numpad and Shift+= / + keys for zoom actions
+  if (shortcutId === "zoomIn") {
+    const isPlusOrEqual =
+      code === "Equal" ||
+      code === "NumpadAdd" ||
+      event.key === "+" ||
+      event.key === "=";
+    if (isPlusOrEqual) {
+      return event.altKey === binding.alt;
+    }
+  } else if (shortcutId === "zoomOut") {
+    const isMinus =
+      code === "Minus" || code === "NumpadSubtract" || event.key === "-";
+    if (isMinus) {
+      return event.shiftKey === binding.shift && event.altKey === binding.alt;
+    }
+  } else if (shortcutId === "resetZoom") {
+    const isZero = code === "Digit0" || code === "Numpad0" || event.key === "0";
+    if (isZero) {
+      return event.shiftKey === binding.shift && event.altKey === binding.alt;
+    }
   }
 
   if (code !== binding.code) return false;

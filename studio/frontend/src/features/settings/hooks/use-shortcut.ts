@@ -65,7 +65,7 @@ export function useShortcut(
     if (!binding || !enabled || !owned) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
-      if (!matchesBinding(binding, event)) return;
+      if (!matchesBinding(binding, event, undefined, id)) return;
       if (skipInTextFields && isTextEntryFocused()) return;
       event.preventDefault();
       handlerRef.current(event);

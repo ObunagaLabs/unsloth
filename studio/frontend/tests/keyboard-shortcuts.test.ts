@@ -363,20 +363,28 @@ test("a hint label follows the override and disappears when cleared", () => {
 test("zoom shortcuts match plus, equal, minus and zero with modifiers", () => {
   const zoomIn = parseBinding("Mod+Equal");
   assert.ok(zoomIn);
-  // Matches Cmd+= and Cmd++ (Shift+Equal)
+  // Matches Cmd+= and Cmd++ (Shift+Equal) for zoomIn action
+  assert.ok(matchesBinding(zoomIn, keyEvent("Equal", { metaKey: true }), true, "zoomIn"));
+  assert.ok(matchesBinding(zoomIn, keyEvent("Equal", { metaKey: true, shiftKey: true }), true, "zoomIn"));
+  assert.ok(matchesBinding(zoomIn, keyEvent("NumpadAdd", { metaKey: true }), true, "zoomIn"));
+  assert.ok(matchesBinding(zoomIn, { ...keyEvent(""), key: "+", metaKey: true }, true, "zoomIn"));
+
+  // Non-zoom shortcut on Mod+Equal strictly checks shift and code
   assert.ok(matchesBinding(zoomIn, keyEvent("Equal", { metaKey: true }), true));
-  assert.ok(matchesBinding(zoomIn, keyEvent("Equal", { metaKey: true, shiftKey: true }), true));
-  assert.ok(matchesBinding(zoomIn, keyEvent("NumpadAdd", { metaKey: true }), true));
-  assert.ok(matchesBinding(zoomIn, { ...keyEvent(""), key: "+", metaKey: true }, true));
+  assert.equal(matchesBinding(zoomIn, keyEvent("Equal", { metaKey: true, shiftKey: true }), true), false);
+  assert.equal(matchesBinding(zoomIn, keyEvent("NumpadAdd", { metaKey: true }), true), false);
 
   const zoomOut = parseBinding("Mod+Minus");
   assert.ok(zoomOut);
-  assert.ok(matchesBinding(zoomOut, keyEvent("Minus", { metaKey: true }), true));
-  assert.ok(matchesBinding(zoomOut, keyEvent("NumpadSubtract", { metaKey: true }), true));
+  assert.ok(matchesBinding(zoomOut, keyEvent("Minus", { metaKey: true }), true, "zoomOut"));
+  assert.ok(matchesBinding(zoomOut, keyEvent("NumpadSubtract", { metaKey: true }), true, "zoomOut"));
+  assert.equal(matchesBinding(zoomOut, keyEvent("NumpadSubtract", { metaKey: true }), true), false);
 
   const resetZoom = parseBinding("Mod+Digit0");
   assert.ok(resetZoom);
-  assert.ok(matchesBinding(resetZoom, keyEvent("Digit0", { metaKey: true }), true));
-  assert.ok(matchesBinding(resetZoom, keyEvent("Numpad0", { metaKey: true }), true));
+  assert.ok(matchesBinding(resetZoom, keyEvent("Digit0", { metaKey: true }), true, "resetZoom"));
+  assert.ok(matchesBinding(resetZoom, keyEvent("Numpad0", { metaKey: true }), true, "resetZoom"));
+  assert.equal(matchesBinding(resetZoom, keyEvent("Numpad0", { metaKey: true }), true), false);
 });
+
 
