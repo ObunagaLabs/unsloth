@@ -197,6 +197,10 @@ def _agent_messages(context: Any) -> list[dict[str, str]]:
     )
 
     project = studio_db.get_chat_project(context.project_id) or {}
+    from core.agent_workspace.state import get_background_task
+
+    durable_task = get_background_task(context.task_id) or {}
+    delegation_policy = (durable_task.get("payload") or {}).get("delegationPolicy") or {}
     instructions = _bounded_text(project.get("instructions"), _MAX_PROJECT_INSTRUCTIONS)
     goal = _bounded_text(context.goal_snapshot, _MAX_GOAL)
     plan = ""
@@ -219,6 +223,31 @@ def _agent_messages(context: Any) -> list[dict[str, str]]:
         "provided tools for concrete work, preserve unrelated user changes, and report "
         "verification honestly.",
     ]
+    if context.delegation_role:
+        role_guidance = (
+            " If you change code, commit the bounded result in your assigned worktree "
+            "and report the commit SHA so the parent can collect it."
+            if context.delegation_role == "implementer"
+            else ""
+        )
+        sections.append(
+            '<delegation role="'
+            + escape_project_context(str(context.delegation_role))
+            + '" depth="'
+            + str(int(context.delegation_depth))
+            + '">You are a bounded child agent. Stay within the assigned role and '
+            "return concrete evidence to the parent task."
+            + role_guidance
+            + "</delegation>"
+        )
+    elif bool(delegation_policy.get("enabled")):
+        sections.append(
+            "<child_agents>You may delegate independent bounded work with "
+            "delegate_agent. Each child gets a separate Git worktree and the same "
+            "immutable runtime. Use child_agent_status to collect every result, do "
+            "not finish while children are active, and cherry-pick only reviewed "
+            "child commits into your own worktree.</child_agents>"
+        )
     if instructions:
         sections.append(
             "<project_instructions>"
@@ -240,8 +269,12 @@ def _agent_messages(context: Any) -> list[dict[str, str]]:
     ]
 
 
-def _agent_tools(full_access: bool) -> list[dict[str, Any]]:
-    from core.inference.tools import ALL_TOOLS, apply_full_access_tool_descriptions
+def _agent_tools(context: Any, full_access: bool) -> list[dict[str, Any]]:
+    from core.inference.tools import (
+        AGENT_DELEGATION_TOOLS,
+        ALL_TOOLS,
+        apply_full_access_tool_descriptions,
+    )
 
     allowed = {"edit_file", "python", "terminal", "web_search"}
     tools = [
@@ -249,6 +282,14 @@ def _agent_tools(full_access: bool) -> list[dict[str, Any]]:
         for tool in ALL_TOOLS
         if (tool.get("function") or {}).get("name") in allowed
     ]
+    from core.agent_workspace.state import get_background_task
+
+    task = get_background_task(context.task_id) or {}
+    policy = (task.get("payload") or {}).get("delegationPolicy") or {}
+    if bool(policy.get("enabled")) and int(context.delegation_depth) < int(
+        policy.get("maxDepth") or 0
+    ):
+        tools.extend(json.loads(json.dumps(AGENT_DELEGATION_TOOLS)))
     return apply_full_access_tool_descriptions(tools) if full_access else tools
 
 
@@ -370,6 +411,9 @@ async def _run_local(
     tools: list[dict[str, Any]],
     session_id: str,
     cancel_event: threading.Event,
+    *,
+    max_tool_calls: int,
+    tool_timeout: int,
 ) -> dict[str, Any]:
     from core.inference.model_ids import model_id_matches
     from core.inference.orchestrator import peek_inference_backend
@@ -396,8 +440,8 @@ async def _run_local(
             max_tokens = max_tokens,
             cancel_event = cancel_event,
             reasoning_effort = snapshot.get("reasoningEffort"),
-            max_tool_iterations = 25,
-            tool_call_timeout = 300,
+            max_tool_iterations = max_tool_calls,
+            tool_call_timeout = tool_timeout,
             session_id = session_id,
             thread_id = session_id,
             confirm_tool_calls = False,
@@ -431,8 +475,8 @@ async def _run_local(
         max_tokens = max_tokens,
         cancel_event = cancel_event,
         reasoning_effort = snapshot.get("reasoningEffort"),
-        max_tool_iterations = 25,
-        tool_call_timeout = 300,
+        max_tool_iterations = max_tool_calls,
+        tool_call_timeout = tool_timeout,
         session_id = session_id,
         thread_id = session_id,
         confirm_tool_calls = False,
@@ -486,6 +530,9 @@ async def _run_codex(
     tools: list[dict[str, Any]],
     session_id: str,
     cancel_event: threading.Event,
+    *,
+    max_tool_calls: int,
+    tool_timeout: int,
 ) -> dict[str, Any]:
     from core.inference.openai_codex_auth import CodexAuthError, resolve_access
     from core.inference.openai_codex_client import OpenAICodexClient
@@ -529,8 +576,8 @@ async def _run_codex(
     )
     policy = CodexToolPolicy(
         tools = tools,
-        max_calls = 25,
-        timeout = 300,
+        max_calls = max_tool_calls,
+        timeout = tool_timeout,
         permission_mode = snapshot["permissionMode"],
         confirm_calls = False,
         bypass_permissions = snapshot["permissionMode"] == "full",
@@ -563,6 +610,9 @@ async def _run_external(
     tools: list[dict[str, Any]],
     session_id: str,
     cancel_event: threading.Event,
+    *,
+    max_tool_calls: int,
+    tool_timeout: int,
 ) -> dict[str, Any]:
     from core.inference.external_provider import ExternalProviderClient
     from core.inference.external_tool_transport import OAICompatTransport
@@ -615,8 +665,8 @@ async def _run_external(
     )
     policy = ToolLoopPolicy(
         tools = tools,
-        max_calls = 25,
-        timeout = 300,
+        max_calls = max_tool_calls,
+        timeout = tool_timeout,
         permission_mode = snapshot["permissionMode"],
         confirm_calls = False,
         bypass_permissions = snapshot["permissionMode"] == "full",
@@ -656,17 +706,44 @@ async def _execute(context: Any, cancel_event: threading.Event) -> dict[str, Any
     if os.path.normcase(str(bound_cwd)) != os.path.normcase(str(context.cwd.resolve(strict = True))):
         raise AgentWorkspaceError("The background agent workspace binding changed.")
     messages = _agent_messages(context)
-    tools = _agent_tools(snapshot["permissionMode"] == "full")
+    tools = _agent_tools(context, snapshot["permissionMode"] == "full")
+    budget = context.delegation_budget or {}
+    max_tool_calls = max(1, min(200, int(budget.get("maxToolCalls") or 25)))
+    tool_timeout = max(1, min(300, int(budget.get("wallSeconds") or 300)))
     if cancel_event.is_set():
         return {"output": "", "outputBytes": 0, "outputTruncated": False}
     if snapshot["kind"] == "local":
-        result = await _run_local(snapshot, messages, tools, session_id, cancel_event)
+        result = await _run_local(
+            snapshot,
+            messages,
+            tools,
+            session_id,
+            cancel_event,
+            max_tool_calls = max_tool_calls,
+            tool_timeout = tool_timeout,
+        )
     else:
         _current_provider(snapshot)
         if snapshot["providerType"] == "openai_codex":
-            result = await _run_codex(snapshot, messages, tools, session_id, cancel_event)
+            result = await _run_codex(
+                snapshot,
+                messages,
+                tools,
+                session_id,
+                cancel_event,
+                max_tool_calls = max_tool_calls,
+                tool_timeout = tool_timeout,
+            )
         else:
-            result = await _run_external(snapshot, messages, tools, session_id, cancel_event)
+            result = await _run_external(
+                snapshot,
+                messages,
+                tools,
+                session_id,
+                cancel_event,
+                max_tool_calls = max_tool_calls,
+                tool_timeout = tool_timeout,
+            )
     return {
         **result,
         "model": snapshot["model"],
@@ -680,14 +757,32 @@ async def _execute(context: Any, cancel_event: threading.Event) -> dict[str, Any
 
 def execute_background_agent(context: Any, cancel_event: threading.Event) -> dict[str, Any]:
     """Run one durable task through the selected internal inference transport."""
+    budget = context.delegation_budget or {}
+    wall_seconds = int(budget.get("wallSeconds") or 0)
+    expired = threading.Event()
+    timer = None
+    if wall_seconds > 0:
+        def exhaust_budget() -> None:
+            expired.set()
+            cancel_event.set()
+
+        timer = threading.Timer(wall_seconds, exhaust_budget)
+        timer.daemon = True
+        timer.start()
     try:
-        return asyncio.run(_execute(context, cancel_event))
+        result = asyncio.run(_execute(context, cancel_event))
+        if expired.is_set():
+            raise AgentWorkspaceError("The child-agent wall-time budget was exhausted.")
+        return result
     except AgentWorkspaceError:
         raise
     except Exception as exc:
         raise AgentWorkspaceError(
             "The selected inference runtime failed before the background task completed."
         ) from exc
+    finally:
+        if timer is not None:
+            timer.cancel()
 
 
 __all__ = [

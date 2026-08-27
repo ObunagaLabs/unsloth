@@ -209,7 +209,8 @@ def test_agent_task_failure_cancel_retry_and_output_bounds(tmp_path):
 
         retried = manager.retry(failed["id"], start = False)
         assert retried["status"] == "queued"
-        assert retried["parentTaskId"] == failed["id"]
+        assert retried["parentTaskId"] is None
+        assert retried["retryOfTaskId"] == failed["id"]
         assert retried["attempt"] == 2
         assert retried["goalSnapshot"] == failed["goalSnapshot"]
 
@@ -400,7 +401,8 @@ def test_retry_preserves_durable_worktree_link_after_interruption(tmp_path, monk
     finally:
         manager._executor.shutdown(wait = True)
 
-    assert retried["parentTaskId"] == task["id"]
+    assert retried["parentTaskId"] is None
+    assert retried["retryOfTaskId"] == task["id"]
     assert retried["worktreeId"] == worktree["id"]
     assert get_worktree(worktree["id"])["backgroundTaskId"] == retried["id"]
     update_background_task(retried["id"], "cancelled")

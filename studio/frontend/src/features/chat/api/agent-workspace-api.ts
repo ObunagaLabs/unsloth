@@ -20,6 +20,7 @@ export type {
   AgentBackgroundPermissionMode,
   AgentBackgroundRuntimeKind,
   AgentBackgroundRuntimeSelection,
+  AgentDelegationPolicy,
 } from "./agent-workspace-requests";
 
 export interface AgentWorkspaceCapabilities {
@@ -231,6 +232,15 @@ export interface AgentBackgroundTask {
   status: AgentBackgroundStatus;
   attempt: number;
   parentTaskId: string | null;
+  retryOfTaskId: string | null;
+  rootTaskId: string | null;
+  delegationRole: "explorer" | "implementer" | "verifier" | "reviewer" | null;
+  delegationDepth: number;
+  delegationBudget: {
+    maxOutputTokens: number;
+    maxToolCalls: number;
+    wallSeconds: number;
+  } | null;
   result: AgentVerificationRun | Record<string, unknown> | null;
   error: string | null;
   cancelRequested: boolean;
@@ -609,6 +619,57 @@ export async function listAgentBackgroundTasks(
     agentWorkspaceRequestPath(projectId, "background", { limit }),
   );
   return result.tasks;
+}
+
+export async function getAgentBackgroundTaskTree(
+  projectId: string,
+  taskId: string,
+): Promise<{ rootTaskId: string; tasks: AgentBackgroundTask[]; truncated: boolean }> {
+  return request(
+    agentWorkspaceRequestPath(
+      projectId,
+      `background/${encodeURIComponent(taskId)}/tree`,
+    ),
+  );
+}
+
+export function queueAgentChild(
+  projectId: string,
+  parentTaskId: string,
+  payload: {
+    role: "explorer" | "implementer" | "verifier" | "reviewer";
+    instruction: string;
+    budget: {
+      maxOutputTokens: number;
+      maxToolCalls: number;
+      wallSeconds: number;
+    };
+    worktreeId: string;
+    cleanupWorktreeOnCancel?: boolean;
+    start?: boolean;
+  },
+): Promise<AgentBackgroundTask> {
+  return request(
+    agentWorkspaceRequestPath(
+      projectId,
+      `background/${encodeURIComponent(parentTaskId)}/children`,
+    ),
+    agentWorkspaceJsonRequest("POST", payload),
+  );
+}
+
+export function cancelAgentChild(
+  projectId: string,
+  parentTaskId: string,
+  childTaskId: string,
+): Promise<AgentBackgroundTask> {
+  return request(
+    agentWorkspaceRequestPath(
+      projectId,
+      `background/${encodeURIComponent(parentTaskId)}/children/${encodeURIComponent(childTaskId)}/cancel`,
+    ),
+    agentWorkspaceJsonRequest("POST"),
+  );
 }
 
 export function queueAgentVerification(

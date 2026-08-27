@@ -26,6 +26,9 @@ _BACKGROUND_PAYLOAD_LIMIT = 256 * 1024
 _BACKGROUND_RESULT_LIMIT = 1024 * 1024
 _PLAN_SNAPSHOT_LIMIT = 512 * 1024
 _NOT_PROVIDED = object()
+_DELEGATION_ROLES = frozenset({"explorer", "implementer", "verifier", "reviewer"})
+_MAX_DELEGATION_DEPTH = 1
+_MAX_DELEGATION_CHILDREN = 8
 
 
 def _database_key(conn: sqlite3.Connection) -> str:
@@ -107,6 +110,11 @@ def _ensure_state_schema(conn: sqlite3.Connection) -> None:
                 status TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
                 parent_task_id TEXT REFERENCES agent_background_tasks(id) ON DELETE SET NULL,
+                retry_of_task_id TEXT REFERENCES agent_background_tasks(id) ON DELETE SET NULL,
+                root_task_id TEXT REFERENCES agent_background_tasks(id) ON DELETE SET NULL,
+                delegation_role TEXT,
+                delegation_depth INTEGER NOT NULL DEFAULT 0,
+                delegation_budget_json TEXT,
                 result_json TEXT,
                 error TEXT,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
@@ -164,6 +172,7 @@ def _ensure_state_schema(conn: sqlite3.Connection) -> None:
         background_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(agent_background_tasks)").fetchall()
         }
+        had_retry_lineage = "retry_of_task_id" in background_columns
         background_migrations = {
             "goal_snapshot": "TEXT",
             "goal_status_snapshot": "TEXT",
@@ -173,10 +182,33 @@ def _ensure_state_schema(conn: sqlite3.Connection) -> None:
             "plan_task_id": "TEXT",
             "plan_snapshot_json": "TEXT",
             "worktree_id": "TEXT",
+            "retry_of_task_id": "TEXT",
+            "root_task_id": "TEXT",
+            "delegation_role": "TEXT",
+            "delegation_depth": "INTEGER NOT NULL DEFAULT 0",
+            "delegation_budget_json": "TEXT",
         }
         for column, type_name in background_migrations.items():
             if column not in background_columns:
                 conn.execute(f"ALTER TABLE agent_background_tasks ADD COLUMN {column} {type_name}")
+        if not had_retry_lineage:
+            # Before delegation existed parent_task_id represented retry ancestry.
+            # Preserve that history explicitly, then reserve parent_task_id for a
+            # real child-agent relationship.
+            conn.execute(
+                """
+                UPDATE agent_background_tasks
+                SET retry_of_task_id = parent_task_id, parent_task_id = NULL
+                WHERE parent_task_id IS NOT NULL
+                """
+            )
+        conn.execute(
+            """
+            UPDATE agent_background_tasks
+            SET root_task_id = id
+            WHERE root_task_id IS NULL AND kind = 'agent'
+            """
+        )
         verification_run_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(agent_verification_runs)").fetchall()
         }
@@ -881,6 +913,11 @@ def _background_task(row: sqlite3.Row) -> dict:
         "status": row["status"],
         "attempt": row["attempt"],
         "parentTaskId": row["parent_task_id"],
+        "retryOfTaskId": row["retry_of_task_id"],
+        "rootTaskId": row["root_task_id"],
+        "delegationRole": row["delegation_role"],
+        "delegationDepth": int(row["delegation_depth"] or 0),
+        "delegationBudget": _loads(row["delegation_budget_json"], None),
         "result": _loads(row["result_json"], None),
         "error": row["error"],
         "cancelRequested": bool(row["cancel_requested"]),
@@ -903,6 +940,8 @@ def create_background_task(
     payload: dict,
     *,
     parent_task_id: Optional[str] = None,
+    retry_of_task_id: Optional[str] = None,
+    root_task_id: Optional[str] = None,
     attempt: int = 1,
     goal_snapshot: Optional[str] = None,
     goal_status_snapshot: Optional[str] = None,
@@ -914,6 +953,8 @@ def create_background_task(
     worktree_id: Optional[str] = None,
 ) -> dict:
     task_id = str(uuid.uuid4())
+    if kind == "agent" and root_task_id is None:
+        root_task_id = task_id
     current = now_ms()
     encoded_payload = _encoded_json(
         payload, limit = _BACKGROUND_PAYLOAD_LIMIT, label = "Background task payload"
@@ -936,8 +977,9 @@ def create_background_task(
                 goal_snapshot, goal_status_snapshot, goal_updated_at,
                 plan_id, plan_revision, plan_task_id, plan_snapshot_json,
                 worktree_id, status, attempt, parent_task_id,
+                retry_of_task_id, root_task_id,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -954,6 +996,8 @@ def create_background_task(
                 worktree_id,
                 attempt,
                 parent_task_id,
+                retry_of_task_id,
+                root_task_id,
                 current,
                 current,
             ),
@@ -967,6 +1011,76 @@ def create_background_task(
         conn.close()
 
 
+def _normalized_delegation_policy(value: Optional[dict]) -> dict:
+    policy = dict(value or {})
+    allowed = {
+        "enabled",
+        "maxChildren",
+        "maxParallelChildren",
+        "maxDepth",
+        "totalChildOutputTokens",
+        "totalChildToolCalls",
+        "totalChildWallSeconds",
+    }
+    if set(policy) - allowed:
+        raise AgentWorkspaceError("Agent delegation policy is invalid.")
+    enabled = bool(policy.get("enabled", False))
+
+    def bounded(name: str, default: int, minimum: int, maximum: int) -> int:
+        value = policy.get(name, default)
+        if isinstance(value, bool):
+            raise AgentWorkspaceError("Agent delegation policy is invalid.")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise AgentWorkspaceError("Agent delegation policy is invalid.") from exc
+        if parsed < minimum or parsed > maximum:
+            raise AgentWorkspaceError("Agent delegation policy is invalid.")
+        return parsed
+
+    max_children = bounded("maxChildren", 4, 1, _MAX_DELEGATION_CHILDREN)
+    max_parallel = bounded("maxParallelChildren", 2, 1, max_children)
+    max_depth = bounded("maxDepth", 1, 1, _MAX_DELEGATION_DEPTH)
+    return {
+        "enabled": enabled,
+        "maxChildren": max_children,
+        "maxParallelChildren": max_parallel,
+        "maxDepth": max_depth,
+        "totalChildOutputTokens": bounded(
+            "totalChildOutputTokens", 32_768, 1, 262_144
+        ),
+        "totalChildToolCalls": bounded("totalChildToolCalls", 100, 1, 1_000),
+        "totalChildWallSeconds": bounded("totalChildWallSeconds", 3_600, 1, 86_400),
+    }
+
+
+def _normalized_delegation_budget(value: Optional[dict]) -> dict:
+    if not isinstance(value, dict) or set(value) != {
+        "maxOutputTokens",
+        "maxToolCalls",
+        "wallSeconds",
+    }:
+        raise AgentWorkspaceError("Child-agent budget is invalid.")
+    limits = {
+        "maxOutputTokens": (1, 32_768),
+        "maxToolCalls": (1, 200),
+        "wallSeconds": (1, 7_200),
+    }
+    normalized = {}
+    for name, (minimum, maximum) in limits.items():
+        raw = value.get(name)
+        if isinstance(raw, bool):
+            raise AgentWorkspaceError("Child-agent budget is invalid.")
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise AgentWorkspaceError("Child-agent budget is invalid.") from exc
+        if parsed < minimum or parsed > maximum:
+            raise AgentWorkspaceError("Child-agent budget is invalid.")
+        normalized[name] = parsed
+    return normalized
+
+
 def create_agent_background_task(
     project_id: str,
     instruction: str,
@@ -976,6 +1090,10 @@ def create_agent_background_task(
     plan_task_id: Optional[str] = None,
     worktree_id: Optional[str] = None,
     cleanup_worktree_on_cancel: bool = False,
+    delegation_policy: Optional[dict] = None,
+    parent_task_id: Optional[str] = None,
+    delegation_role: Optional[str] = None,
+    delegation_budget: Optional[dict] = None,
 ) -> dict:
     """Atomically snapshot project context and queue one provider-neutral agent run."""
     instruction = instruction.strip()
@@ -988,14 +1106,6 @@ def create_agent_background_task(
 
     task_id = str(uuid.uuid4())
     current = now_ms()
-    payload = {
-        "instruction": instruction,
-        "cleanupWorktreeOnCancel": bool(cleanup_worktree_on_cancel),
-        "runtime": runtime_snapshot,
-    }
-    encoded_payload = _encoded_json(
-        payload, limit = _BACKGROUND_PAYLOAD_LIMIT, label = "Background task payload"
-    )
     conn = connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1009,9 +1119,106 @@ def create_agent_background_task(
         if project is None:
             raise AgentWorkspaceError("Project not found.")
 
+        parent = None
+        root_task_id = task_id
+        delegation_depth = 0
+        normalized_budget = None
+        normalized_role = None
+        normalized_policy = _normalized_delegation_policy(delegation_policy)
+        if parent_task_id is not None:
+            parent = conn.execute(
+                "SELECT * FROM agent_background_tasks WHERE id = ? AND project_id = ?",
+                (parent_task_id, project_id),
+            ).fetchone()
+            if parent is None or parent["kind"] != "agent":
+                raise AgentWorkspaceError("Parent agent task not found.")
+            if parent["status"] not in {"queued", "running", "cancelling"}:
+                raise AgentWorkspaceError("Only an active agent can delegate child work.")
+            parent_payload = _loads(parent["payload_json"], {})
+            policy = _normalized_delegation_policy(parent_payload.get("delegationPolicy"))
+            if not policy["enabled"]:
+                raise AgentWorkspaceError("Child-agent delegation is disabled for this task.")
+            if parent_payload.get("workspaceMode") != "owned":
+                raise AgentWorkspaceError("Child-agent delegation requires an owned parent worktree.")
+            normalized_role = str(delegation_role or "").strip().lower()
+            if normalized_role not in _DELEGATION_ROLES:
+                raise AgentWorkspaceError("Child-agent role is invalid.")
+            normalized_budget = _normalized_delegation_budget(delegation_budget)
+            if worktree_id is None:
+                raise AgentWorkspaceError("A child agent requires an owned worktree.")
+            root_task_id = str(parent["root_task_id"] or parent["id"])
+            delegation_depth = int(parent["delegation_depth"] or 0) + 1
+            if delegation_depth > int(policy["maxDepth"]):
+                raise AgentWorkspaceError("Child-agent delegation depth is exhausted.")
+            existing_children = conn.execute(
+                """
+                SELECT status, delegation_budget_json
+                FROM agent_background_tasks
+                WHERE root_task_id = ? AND parent_task_id IS NOT NULL
+                """,
+                (root_task_id,),
+            ).fetchall()
+            if len(existing_children) >= int(policy["maxChildren"]):
+                raise AgentWorkspaceError("Child-agent count budget is exhausted.")
+            live_children = sum(
+                row["status"] in {"queued", "running", "cancelling"}
+                for row in existing_children
+            )
+            if live_children >= int(policy["maxParallelChildren"]):
+                raise AgentWorkspaceError("Child-agent parallel budget is exhausted.")
+            reserved = {"maxOutputTokens": 0, "maxToolCalls": 0, "wallSeconds": 0}
+            for row in existing_children:
+                prior_budget = _loads(row["delegation_budget_json"], {})
+                for name in reserved:
+                    reserved[name] += max(0, int(prior_budget.get(name) or 0))
+            ceilings = {
+                "maxOutputTokens": int(policy["totalChildOutputTokens"]),
+                "maxToolCalls": int(policy["totalChildToolCalls"]),
+                "wallSeconds": int(policy["totalChildWallSeconds"]),
+            }
+            if any(
+                reserved[name] + int(normalized_budget[name]) > ceilings[name]
+                for name in ceilings
+            ):
+                raise AgentWorkspaceError("Child-agent resource budget is exhausted.")
+            runtime_snapshot = parent_payload.get("runtime")
+            delegation_policy = None
+            normalized_policy = policy
+            project = {
+                "goal": parent["goal_snapshot"],
+                "goal_status": parent["goal_status_snapshot"],
+                "goal_updated_at": parent["goal_updated_at"],
+            }
+            plan_id = parent["plan_id"]
+            plan_task_id = parent["plan_task_id"]
+        elif normalized_policy["enabled"] and worktree_id is None:
+            raise AgentWorkspaceError("Delegating agents require an owned worktree.")
+
+        payload = {
+            "instruction": instruction,
+            "cleanupWorktreeOnCancel": bool(cleanup_worktree_on_cancel),
+            "runtime": runtime_snapshot,
+            "workspaceMode": "owned" if worktree_id else "primary",
+            "delegationPolicy": normalized_policy,
+        }
+        if normalized_budget is not None and isinstance(runtime_snapshot, dict):
+            payload["runtime"] = {
+                **runtime_snapshot,
+                "maxOutputTokens": min(
+                    int(runtime_snapshot.get("maxOutputTokens") or 8_192),
+                    int(normalized_budget["maxOutputTokens"]),
+                ),
+            }
+        encoded_payload = _encoded_json(
+            payload, limit = _BACKGROUND_PAYLOAD_LIMIT, label = "Background task payload"
+        )
+
         plan_snapshot = None
         plan_revision = None
-        if plan_id is not None:
+        if parent is not None:
+            plan_snapshot = _loads(parent["plan_snapshot_json"], None)
+            plan_revision = parent["plan_revision"]
+        elif plan_id is not None:
             plan_row = conn.execute(
                 "SELECT * FROM agent_plans WHERE id = ? AND project_id = ?",
                 (plan_id, project_id),
@@ -1056,8 +1263,10 @@ def create_agent_background_task(
                 goal_snapshot, goal_status_snapshot, goal_updated_at,
                 plan_id, plan_revision, plan_task_id, plan_snapshot_json,
                 worktree_id, status, attempt, parent_task_id,
+                retry_of_task_id, root_task_id, delegation_role,
+                delegation_depth, delegation_budget_json,
                 created_at, updated_at
-            ) VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, NULL, ?, ?)
+            ) VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, NULL, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -1071,6 +1280,19 @@ def create_agent_background_task(
                 plan_task_id,
                 encoded_plan,
                 worktree_id,
+                parent_task_id,
+                root_task_id,
+                normalized_role,
+                delegation_depth,
+                (
+                    _encoded_json(
+                        normalized_budget,
+                        limit = 16_384,
+                        label = "Child-agent budget",
+                    )
+                    if normalized_budget is not None
+                    else None
+                ),
                 current,
                 current,
             ),
@@ -1153,6 +1375,18 @@ def update_background_task(
             raise AgentWorkspaceError(
                 f"Background task cannot transition from {previous} to {status}."
             )
+        if status == "completed":
+            live_child = conn.execute(
+                """
+                SELECT 1 FROM agent_background_tasks
+                WHERE parent_task_id = ? AND status IN ('queued', 'running', 'cancelling')
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if live_child is not None:
+                conn.rollback()
+                raise AgentWorkspaceError("The parent agent still has active child agents.")
         cursor = conn.execute(
             f"UPDATE agent_background_tasks SET {', '.join(assignments)} "
             "WHERE id = ? AND status = ?",
@@ -1252,6 +1486,52 @@ def list_background_tasks(project_id: str, limit: int = 100) -> list[dict]:
         conn.close()
 
 
+def list_background_task_tree(project_id: str, task_id: str) -> dict:
+    """Return one delegation root and its bounded descendants and retries."""
+    conn = connection()
+    try:
+        task = conn.execute(
+            "SELECT * FROM agent_background_tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        ).fetchone()
+        if task is None:
+            raise AgentWorkspaceError("Background task not found.")
+        root_id = str(task["root_task_id"] or task["id"])
+        rows = conn.execute(
+            """
+            SELECT * FROM agent_background_tasks
+            WHERE project_id = ? AND (root_task_id = ? OR id = ?)
+            ORDER BY delegation_depth, created_at, id
+            LIMIT 512
+            """,
+            (project_id, root_id, root_id),
+        ).fetchall()
+        tasks = [_background_task(row) for row in rows]
+        return {
+            "rootTaskId": root_id,
+            "tasks": tasks,
+            "truncated": len(tasks) >= 512,
+        }
+    finally:
+        conn.close()
+
+
+def list_active_child_tasks(task_id: str) -> list[dict]:
+    conn = connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM agent_background_tasks
+            WHERE parent_task_id = ? AND status IN ('queued', 'running', 'cancelling')
+            ORDER BY created_at, id
+            """,
+            (task_id,),
+        ).fetchall()
+        return [_background_task(row) for row in rows]
+    finally:
+        conn.close()
+
+
 def list_active_background_tasks(project_id: str) -> list[dict]:
     """Return every task that must stop before its project row can be deleted."""
     conn = connection()
@@ -1323,8 +1603,10 @@ def retry_background_task(task_id: str) -> dict:
                 goal_snapshot, goal_status_snapshot, goal_updated_at,
                 plan_id, plan_revision, plan_task_id, plan_snapshot_json,
                 worktree_id, status, attempt, parent_task_id,
+                retry_of_task_id, root_task_id, delegation_role,
+                delegation_depth, delegation_budget_json,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 retried_id,
@@ -1340,7 +1622,12 @@ def retry_background_task(task_id: str) -> dict:
                 previous["plan_snapshot_json"],
                 worktree_id,
                 int(previous["attempt"]) + 1,
+                previous["parent_task_id"],
                 task_id,
+                previous["root_task_id"] or retried_id,
+                previous["delegation_role"],
+                int(previous["delegation_depth"] or 0),
+                previous["delegation_budget_json"],
                 current,
                 current,
             ),

@@ -54,7 +54,18 @@ export interface AgentBackgroundAgentRequestPayload {
   planTaskId?: string;
   worktreeId?: string;
   cleanupWorktreeOnCancel?: boolean;
+  delegationPolicy?: AgentDelegationPolicy;
   start?: boolean;
+}
+
+export interface AgentDelegationPolicy {
+  enabled: boolean;
+  maxChildren: number;
+  maxParallelChildren: number;
+  maxDepth: 1;
+  totalChildOutputTokens: number;
+  totalChildToolCalls: number;
+  totalChildWallSeconds: number;
 }
 
 export type AgentBackgroundRuntimeKind = "local" | "provider";
@@ -139,6 +150,15 @@ export function agentBackgroundAgentRequest(
       planTaskId: payload.planTaskId || undefined,
       worktreeId: payload.worktreeId || undefined,
       cleanupWorktreeOnCancel: payload.cleanupWorktreeOnCancel ?? false,
+      delegationPolicy: payload.delegationPolicy ?? {
+        enabled: false,
+        maxChildren: 4,
+        maxParallelChildren: 2,
+        maxDepth: 1,
+        totalChildOutputTokens: 32_768,
+        totalChildToolCalls: 100,
+        totalChildWallSeconds: 3_600,
+      },
       start: payload.start ?? false,
     }),
   };

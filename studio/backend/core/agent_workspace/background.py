@@ -24,6 +24,7 @@ from .state import (
     get_verification_config,
     list_all_active_background_tasks,
     list_active_background_tasks,
+    list_active_child_tasks,
     retry_background_task,
     update_background_task,
 )
@@ -56,6 +57,11 @@ class AgentTaskContext:
     project_root: Path
     expected_project_root_identity: tuple[int, int]
     project_workspace_binding: tuple[Optional[str], ...]
+    parent_task_id: Optional[str]
+    root_task_id: str
+    delegation_role: Optional[str]
+    delegation_depth: int
+    delegation_budget: Optional[dict]
 
     def run_command(
         self,
@@ -183,6 +189,7 @@ class BackgroundTaskManager:
         plan_task_id: Optional[str] = None,
         worktree_id: Optional[str] = None,
         cleanup_worktree_on_cancel: bool = False,
+        delegation_policy: Optional[dict] = None,
         start: bool = True,
     ) -> dict:
         with self._lock:
@@ -203,6 +210,7 @@ class BackgroundTaskManager:
                 plan_task_id = plan_task_id,
                 worktree_id = worktree_id,
                 cleanup_worktree_on_cancel = cleanup_worktree_on_cancel,
+                delegation_policy = delegation_policy,
             )
             if worktree_id:
                 try:
@@ -214,6 +222,45 @@ class BackgroundTaskManager:
                         error = "The durable worktree task link could not be finalized.",
                     )
                     raise
+        return self.start(task["id"]) if start else task
+
+    def enqueue_child_agent(
+        self,
+        project_id: str,
+        parent_task_id: str,
+        instruction: str,
+        *,
+        role: str,
+        budget: dict,
+        worktree_id: str,
+        cleanup_worktree_on_cancel: bool = False,
+        start: bool = True,
+    ) -> dict:
+        """Queue a role-bound child using the parent's immutable runtime ceiling."""
+        with self._lock:
+            self._require_project_available_locked(project_id)
+            if start and self._agent_executor is None:
+                raise AgentWorkspaceError(
+                    "No background agent executor is registered for this runtime."
+                )
+            task = create_agent_background_task(
+                project_id,
+                instruction,
+                worktree_id = worktree_id,
+                cleanup_worktree_on_cancel = cleanup_worktree_on_cancel,
+                parent_task_id = parent_task_id,
+                delegation_role = role,
+                delegation_budget = budget,
+            )
+            try:
+                sync_worktree_background_task_marker(project_id, worktree_id, task["id"])
+            except Exception:
+                update_background_task(
+                    task["id"],
+                    "cancelled",
+                    error = "The durable child worktree link could not be finalized.",
+                )
+                raise
         return self.start(task["id"]) if start else task
 
     @staticmethod
@@ -306,6 +353,11 @@ class BackgroundTaskManager:
             project_root = workspace.root,
             expected_project_root_identity = project_root_identity,
             project_workspace_binding = BackgroundTaskManager._project_workspace_binding(project),
+            parent_task_id = task.get("parentTaskId"),
+            root_task_id = str(task.get("rootTaskId") or task["id"]),
+            delegation_role = task.get("delegationRole"),
+            delegation_depth = int(task.get("delegationDepth") or 0),
+            delegation_budget = task.get("delegationBudget"),
         )
 
     @staticmethod
@@ -444,6 +496,10 @@ class BackgroundTaskManager:
                 result = self._cancelled_worktree_result(task, result)
                 update_background_task(task_id, "cancelled", result = result)
             else:
+                if list_active_child_tasks(task_id):
+                    raise AgentWorkspaceError(
+                        "The parent agent still has active child agents."
+                    )
                 self._revalidate_agent_completion(task, context)
                 update_background_task(task_id, "completed", result = result)
         except Exception as exc:
@@ -497,6 +553,10 @@ class BackgroundTaskManager:
             self._verification_runs.pop(task_id, None)
 
     def cancel(self, task_id: str) -> dict:
+        # Children are independent workers but not independent authority. Stop
+        # descendants before the parent can settle or release its worktree.
+        for child in list_active_child_tasks(task_id):
+            self.cancel(child["id"])
         with self._lock:
             task = get_background_task(task_id)
             if task is None:

@@ -50,6 +50,7 @@ from core.agent_workspace.state import (
     get_plan,
     get_verification_config,
     list_background_tasks,
+    list_background_task_tree,
     list_plans,
     list_worktrees,
     set_verification_config,
@@ -333,6 +334,26 @@ class BackgroundAgentRuntimeRequest(BaseModel):
     maxOutputTokens: int = Field(default = 8192, ge = 1, le = 32_768)
 
 
+class AgentDelegationPolicyRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    enabled: bool = False
+    maxChildren: int = Field(default = 4, ge = 1, le = 8)
+    maxParallelChildren: int = Field(default = 2, ge = 1, le = 8)
+    maxDepth: int = Field(default = 1, ge = 1, le = 1)
+    totalChildOutputTokens: int = Field(default = 32_768, ge = 1, le = 262_144)
+    totalChildToolCalls: int = Field(default = 100, ge = 1, le = 1_000)
+    totalChildWallSeconds: int = Field(default = 3_600, ge = 1, le = 86_400)
+
+
+class ChildAgentBudgetRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    maxOutputTokens: int = Field(default = 8_192, ge = 1, le = 32_768)
+    maxToolCalls: int = Field(default = 25, ge = 1, le = 200)
+    wallSeconds: int = Field(default = 300, ge = 1, le = 7_200)
+
+
 class BackgroundAgentRequest(BaseModel):
     model_config = ConfigDict(extra = "forbid")
 
@@ -341,6 +362,20 @@ class BackgroundAgentRequest(BaseModel):
     planId: Optional[str] = Field(default = None, max_length = 128)
     planTaskId: Optional[str] = Field(default = None, max_length = 128)
     worktreeId: Optional[str] = Field(default = None, max_length = 128)
+    cleanupWorktreeOnCancel: bool = False
+    delegationPolicy: AgentDelegationPolicyRequest = Field(
+        default_factory = AgentDelegationPolicyRequest
+    )
+    start: bool = True
+
+
+class ChildAgentRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    role: Literal["explorer", "implementer", "verifier", "reviewer"]
+    instruction: str = Field(min_length = 1, max_length = 32_768)
+    budget: ChildAgentBudgetRequest = Field(default_factory = ChildAgentBudgetRequest)
+    worktreeId: str = Field(min_length = 1, max_length = 128)
     cleanupWorktreeOnCancel: bool = False
     start: bool = True
 
@@ -806,6 +841,7 @@ def queue_background_agent(
                 plan_task_id = payload.planTaskId,
                 worktree_id = payload.worktreeId,
                 cleanup_worktree_on_cancel = payload.cleanupWorktreeOnCancel,
+                delegation_policy = payload.delegationPolicy.model_dump(),
                 start = payload.start,
             )
         )
@@ -827,6 +863,23 @@ def background_tasks(
     }
 
 
+@router.get("/projects/{project_id}/background/{task_id}/tree")
+def background_task_tree(
+    project_id: str,
+    task_id: str,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        tree = list_background_task_tree(project_id, task_id)
+        return {
+            **tree,
+            "tasks": [_public_background_task(task) for task in tree["tasks"]],
+        }
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
 def _background_for_project(project_id: str, task_id: str) -> dict:
     task = get_background_task(task_id)
     if task is None or task["projectId"] != project_id:
@@ -838,6 +891,55 @@ def _require_ui_for_provider_task(task: dict, via_api_key: bool) -> None:
     runtime = (task.get("payload") or {}).get("runtime") or {}
     if task.get("kind") == "agent" and runtime.get("kind") == "provider":
         require_ui_session(via_api_key)
+
+
+@router.post("/projects/{project_id}/background/{task_id}/children")
+def queue_child_agent(
+    project_id: str,
+    task_id: str,
+    payload: ChildAgentRequest,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+) -> dict:
+    parent = _background_for_project(project_id, task_id)
+    _require_ui_for_provider_task(parent, via_api_key)
+    try:
+        _require_execution_boundary()
+        return _public_background_task(
+            background_manager.enqueue_child_agent(
+                project_id,
+                task_id,
+                payload.instruction,
+                role = payload.role,
+                budget = payload.budget.model_dump(),
+                worktree_id = payload.worktreeId,
+                cleanup_worktree_on_cancel = payload.cleanupWorktreeOnCancel,
+                start = payload.start,
+            )
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post(
+    "/projects/{project_id}/background/{task_id}/children/{child_id}/cancel"
+)
+def cancel_child_agent(
+    project_id: str,
+    task_id: str,
+    child_id: str,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+) -> dict:
+    parent = _background_for_project(project_id, task_id)
+    child = _background_for_project(project_id, child_id)
+    if child.get("parentTaskId") != parent["id"]:
+        raise HTTPException(status_code = 404, detail = "Child agent not found.")
+    _require_ui_for_provider_task(child, via_api_key)
+    try:
+        return _public_background_task(background_manager.cancel(child_id))
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
 
 
 @router.post("/projects/{project_id}/background/{task_id}/start")

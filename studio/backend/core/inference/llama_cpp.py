@@ -25940,6 +25940,7 @@ class LlamaCppBackend:
             has_text_only_provisional_card,
             is_always_safe_tool,
             is_high_risk_tool_call,
+            project_rule_for_tool_call,
         )
 
         # "full" and bypass_permissions are the same switch, whichever arrives
@@ -27500,6 +27501,13 @@ class LlamaCppBackend:
                             decision.as_assistant_tool_call()
                         )
 
+                    project_rule = project_rule_for_tool_call(
+                        session_id,
+                        decision.tool_name,
+                        decision.arguments,
+                    )
+                    project_effect = str((project_rule or {}).get("effect") or "")
+
                     # Bypass wins here too, so a direct internal caller with both
                     # flags never prompts. "auto" pauses only high-risk calls;
                     # "off" never prompts (sandbox stays on).
@@ -27512,6 +27520,10 @@ class LlamaCppBackend:
                         needs_confirm = is_high_risk_tool_call(
                             decision.tool_name, decision.arguments
                         )
+                    if project_effect == "allow":
+                        needs_confirm = False
+                    elif project_effect == "prompt" and confirm_tool_calls:
+                        needs_confirm = True
                     approval_id = new_approval_id() if needs_confirm else ""
                     decision_slot = (
                         begin_tool_decision(session_id, approval_id) if needs_confirm else None
@@ -27571,6 +27583,10 @@ class LlamaCppBackend:
                     finally:
                         if decision_slot is not None:
                             abort_tool_decision(decision_slot, approval_id)
+
+                    project_rule_approved = (
+                        project_effect != "prompt" or _decision not in {None, "deny"}
+                    )
 
                     _effective_timeout = None if tool_call_timeout >= 9999 else tool_call_timeout
                     # RAG: cap paraphrased KB re-searches that slip past the dup guard.
@@ -27751,6 +27767,8 @@ class LlamaCppBackend:
                                     )
                             if accepts_output_callback(execute_tool):
                                 kwargs["output_callback"] = _output_callback
+                            if accepts_kwarg(execute_tool, "project_rule_approved"):
+                                kwargs["project_rule_approved"] = project_rule_approved
                             kwargs.update(search_images_kwargs(execute_tool, _decision.tool_name))
                             return execute_tool(
                                 _decision.tool_name,

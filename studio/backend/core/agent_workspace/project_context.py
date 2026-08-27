@@ -183,6 +183,27 @@ def _project_context_block(project: dict) -> str:
     fields = []
     if instructions:
         fields.append("<project_instructions>\n" + instructions + "\n</project_instructions>")
+    project_id = str(project.get("id") or "")
+    if project_id:
+        from .project_automation import (
+            render_project_rules_guidance,
+            render_project_skills_guidance,
+        )
+
+        automation = "\n\n".join(
+            value
+            for value in (
+                render_project_rules_guidance(project_id),
+                render_project_skills_guidance(project_id),
+            )
+            if value
+        )
+        if automation:
+            fields.append(
+                "<project_automation>\n"
+                + escape_project_context(automation)
+                + "\n</project_automation>"
+            )
     if goal:
         fields.append(goal)
     if not fields:

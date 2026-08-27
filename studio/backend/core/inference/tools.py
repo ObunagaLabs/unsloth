@@ -9876,11 +9876,19 @@ def _edit_file_confined_project(
     new: str,
     replace_all: bool,
 ) -> str:
-    """Perform a project edit through descriptor-relative, no-follow operations."""
+    """Perform a project edit through the native no-follow project boundary."""
     name = os.path.basename(target)
+    boundary_type = _ConfinedProjectEdit
+    boundary_errors: tuple[type[BaseException], ...] = (OSError,)
+    if sys.platform == "win32":
+        from core.agent_workspace.common import AgentWorkspaceError
+        from core.agent_workspace.windows_traversal import WindowsVerifiedMutation
+
+        boundary_type = WindowsVerifiedMutation
+        boundary_errors = (OSError, AgentWorkspaceError)
     try:
-        boundary = _ConfinedProjectEdit(workdir, target, expected_root_identity)
-    except OSError as exc:
+        boundary = boundary_type(workdir, target, expected_root_identity)
+    except boundary_errors as exc:
         return f"Error: cannot safely open the project workspace for '{name}': {exc}."
     try:
         if not old:
@@ -10576,6 +10584,76 @@ SEARCH_CONVERSATION_TOOL = {
     },
 }
 
+# These tools are intentionally absent from ALL_TOOLS. They are exposed only to
+# a durable background task whose server-side delegation policy allows them.
+DELEGATE_AGENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "delegate_agent",
+        "description": (
+            "Start one bounded child coding agent in a separate Studio-owned Git "
+            "worktree. Delegate only independent work, keep the role narrow, and "
+            "use child_agent_status to collect its result before finishing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "instruction": {
+                    "type": "string",
+                    "description": "Concrete, self-contained task for the child.",
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["explorer", "implementer", "verifier", "reviewer"],
+                },
+                "max_output_tokens": {"type": "integer", "minimum": 1},
+                "max_tool_calls": {"type": "integer", "minimum": 1},
+                "wall_seconds": {"type": "integer", "minimum": 1},
+            },
+            "required": [
+                "instruction",
+                "role",
+                "max_output_tokens",
+                "max_tool_calls",
+                "wall_seconds",
+            ],
+        },
+    },
+}
+
+CHILD_AGENT_STATUS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "child_agent_status",
+        "description": (
+            "List this task's direct child agents and their bounded results. Use "
+            "this after delegate_agent and do not finish while a child is active."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+CANCEL_CHILD_AGENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "cancel_child_agent",
+        "description": "Cancel one direct child agent created by this task.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Direct child task ID."},
+            },
+            "required": ["task_id"],
+        },
+    },
+}
+
+AGENT_DELEGATION_TOOLS = [
+    DELEGATE_AGENT_TOOL,
+    CHILD_AGENT_STATUS_TOOL,
+    CANCEL_CHILD_AGENT_TOOL,
+]
+
 ALL_TOOLS = [
     WEB_SEARCH_TOOL,
     PYTHON_TOOL,
@@ -10801,6 +10879,204 @@ async def get_enabled_mcp_tools() -> list[dict]:
 _TIMEOUT_UNSET = object()
 
 
+def _delegation_task_scope(session_id: "str | None") -> "dict | None":
+    if not session_id or not session_id.startswith(_AGENT_TASK_SESSION_PREFIX):
+        return None
+    return _agent_task_project_scope(session_id)
+
+
+def _tool_project_id(session_id: "str | None") -> "str | None":
+    if not session_id:
+        return None
+    if session_id.startswith(_AGENT_TASK_SESSION_PREFIX):
+        scope = _agent_task_project_scope(session_id)
+        return str(scope["project_id"]) if scope is not None else None
+    if not session_id.startswith(_PROJECT_SESSION_PREFIX) or _thread_exists(session_id):
+        return None
+    project_id = session_id[len(_PROJECT_SESSION_PREFIX) :]
+    return project_id if project_id and _project_exists(project_id) else None
+
+
+def project_rule_for_tool_call(
+    session_id: "str | None",
+    name: str,
+    arguments: dict,
+) -> "dict | None":
+    """Resolve the persisted server-side rule for one project tool call."""
+    project_id = _tool_project_id(session_id)
+    if project_id is None:
+        return None
+    try:
+        from core.agent_workspace.project_automation import resolve_project_rule
+
+        return resolve_project_rule(project_id, name, arguments)
+    except Exception:  # noqa: BLE001 - policy lookup uncertainty fails closed below
+        return {
+            "name": "unavailable project policy",
+            "effect": "deny",
+            "guidance": "Project rules could not be verified for this call.",
+        }
+
+
+def _project_rule_rejection(
+    session_id: "str | None",
+    name: str,
+    arguments: dict,
+    *,
+    approved: bool,
+) -> str:
+    rule = project_rule_for_tool_call(session_id, name, arguments)
+    if rule is None:
+        return ""
+    effect = str(rule.get("effect") or "deny")
+    if effect == "allow" or (effect == "prompt" and approved):
+        return ""
+    guidance = str(rule.get("guidance") or "").strip()[:1000]
+    detail = f" {guidance}" if guidance else ""
+    if effect == "prompt":
+        return (
+            f"Error: project rule '{rule.get('name')}' requires explicit approval for "
+            f"{name}; the call was not approved.{detail}"
+        )
+    return f"Error: project rule '{rule.get('name')}' denies {name}.{detail}"
+
+
+def _public_child_agent(task: dict) -> dict:
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    output = str(result.get("output") or "")
+    return {
+        "id": task.get("id"),
+        "role": task.get("delegationRole"),
+        "status": task.get("status"),
+        "attempt": task.get("attempt"),
+        "worktreeId": task.get("worktreeId"),
+        "error": str(task.get("error") or "")[:4096] or None,
+        "output": output[:16_000],
+        "outputTruncated": bool(result.get("outputTruncated")) or len(output) > 16_000,
+        "engine": result.get("engine"),
+    }
+
+
+def _delegate_agent(arguments: dict, session_id: "str | None") -> str:
+    scope = _delegation_task_scope(session_id)
+    if scope is None:
+        return "Error: child-agent delegation is available only inside an active agent task."
+    instruction = arguments.get("instruction")
+    role = arguments.get("role")
+    if not isinstance(instruction, str) or not instruction.strip():
+        return "Error: 'instruction' must be a non-empty string."
+    if not isinstance(role, str):
+        return "Error: 'role' must name a supported child-agent role."
+    budget_names = {
+        "maxOutputTokens": arguments.get("max_output_tokens"),
+        "maxToolCalls": arguments.get("max_tool_calls"),
+        "wallSeconds": arguments.get("wall_seconds"),
+    }
+    budget: dict[str, int] = {}
+    for name, value in budget_names.items():
+        if isinstance(value, bool):
+            return "Error: child-agent budget values must be positive integers."
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return "Error: child-agent budget values must be positive integers."
+        if parsed < 1:
+            return "Error: child-agent budget values must be positive integers."
+        budget[name] = parsed
+
+    worktree = None
+    try:
+        from core.agent_workspace.background import manager as background_manager
+        from core.agent_workspace.git_service import _git
+        from core.agent_workspace.worktrees import (
+            cleanup_worktree,
+            create_worktree,
+            owned_worktree_path,
+        )
+
+        parent_path = owned_worktree_path(
+            scope["project_id"],
+            scope["worktree_id"],
+            background_task_id = scope["task_id"],
+        )
+        base_ref, truncated = _git(
+            parent_path,
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+            output_limit = 256,
+        )
+        if truncated:
+            raise RuntimeError("the parent Git revision could not be bounded")
+        worktree = create_worktree(scope["project_id"], base_ref = base_ref.strip())
+        child = background_manager.enqueue_child_agent(
+            scope["project_id"],
+            scope["task_id"],
+            instruction.strip(),
+            role = role,
+            budget = budget,
+            worktree_id = worktree["id"],
+            start = True,
+        )
+        return json.dumps(_public_child_agent(child), ensure_ascii = False, sort_keys = True)
+    except Exception as exc:  # noqa: BLE001 - the tool returns a bounded failure to the model
+        retained = False
+        if worktree is not None:
+            try:
+                cleanup_worktree(scope["project_id"], worktree["id"])
+            except Exception:  # noqa: BLE001 - uncertain state must be retained
+                retained = True
+        suffix = " The unused worktree was retained for inspection." if retained else ""
+        return f"Error: child agent could not be started: {str(exc)[:1000]}.{suffix}"
+
+
+def _child_agent_status(session_id: "str | None") -> str:
+    scope = _delegation_task_scope(session_id)
+    if scope is None:
+        return "Error: child-agent status is available only inside an active agent task."
+    try:
+        from core.agent_workspace.state import list_background_task_tree
+
+        tree = list_background_task_tree(scope["project_id"], scope["task_id"])
+        children = [
+            _public_child_agent(task)
+            for task in tree["tasks"]
+            if task.get("parentTaskId") == scope["task_id"]
+        ]
+        return json.dumps(
+            {"children": children, "truncated": bool(tree.get("truncated"))},
+            ensure_ascii = False,
+            sort_keys = True,
+        )
+    except Exception as exc:  # noqa: BLE001 - the tool returns a bounded failure to the model
+        return f"Error: child-agent status is unavailable: {str(exc)[:1000]}."
+
+
+def _cancel_child_agent(arguments: dict, session_id: "str | None") -> str:
+    scope = _delegation_task_scope(session_id)
+    if scope is None:
+        return "Error: child-agent cancellation is available only inside an active agent task."
+    child_id = arguments.get("task_id")
+    if not isinstance(child_id, str) or not child_id.strip():
+        return "Error: 'task_id' must be a direct child task ID."
+    try:
+        from core.agent_workspace.background import manager as background_manager
+        from core.agent_workspace.state import get_background_task
+
+        child = get_background_task(child_id.strip())
+        if (
+            child is None
+            or child.get("projectId") != scope["project_id"]
+            or child.get("parentTaskId") != scope["task_id"]
+        ):
+            return "Error: direct child agent not found."
+        return json.dumps(
+            _public_child_agent(background_manager.cancel(child["id"])),
+            ensure_ascii = False,
+            sort_keys = True,
+        )
+    except Exception as exc:  # noqa: BLE001 - the tool returns a bounded failure to the model
+        return f"Error: child agent could not be cancelled: {str(exc)[:1000]}."
+
+
 def _render_html_result(arguments: dict) -> str:
     code = arguments.get("code")
     if not isinstance(code, str) or not code.strip():
@@ -10837,6 +11113,7 @@ def execute_tool(
     context_tokens = _UNSET_CONTEXT_TOKENS,
     search_images: bool = False,
     result_budget_tokens: int | None = None,
+    project_rule_approved: bool = False,
 ) -> str:
     """Execute a tool by name with the given arguments; returns a string.
 
@@ -10863,6 +11140,14 @@ def execute_tool(
     # turn's own tool exchanges existed, which is precisely the undercount that lets the
     # last result overflow.
     _REQUEST_RESULT_BUDGET.set(result_budget_tokens)
+    policy_rejection = _project_rule_rejection(
+        session_id,
+        name,
+        arguments,
+        approved = bool(project_rule_approved),
+    )
+    if policy_rejection:
+        return _fit_result_to_room(policy_rejection, name)
     effective_timeout = _EXEC_TIMEOUT if timeout is _TIMEOUT_UNSET else timeout
     if name == "search_knowledge_base":
         return _fit_result_to_room(
@@ -10894,6 +11179,12 @@ def execute_tool(
         )
     if name == "render_html":
         return _fit_result_to_room(_render_html_result(arguments), name)
+    if name == "delegate_agent":
+        return _fit_result_to_room(_delegate_agent(arguments, session_id), name)
+    if name == "child_agent_status":
+        return _fit_result_to_room(_child_agent_status(session_id), name)
+    if name == "cancel_child_agent":
+        return _fit_result_to_room(_cancel_child_agent(arguments, session_id), name)
     if name.startswith(MCP_TOOL_PREFIX):
         try:
             _, server_id, tool_name = name.split("__", 2)
