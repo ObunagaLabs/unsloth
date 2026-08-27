@@ -466,9 +466,7 @@ def test_reconcile_pins_one_embedding_model_for_every_file(rag_home, stub_embedd
 
 
 @requires_sqlite_vec
-def test_reconcile_overlaps_the_next_parse_with_embedding(
-    rag_home, stub_embeddings, monkeypatch
-):
+def test_reconcile_overlaps_the_next_parse_with_embedding(rag_home, stub_embeddings, monkeypatch):
     source, folder = _folder(rag_home)
     (source / "a-first.txt").write_text("first document words", encoding = "utf-8")
     (source / "b-second.txt").write_text("second document words", encoding = "utf-8")
@@ -487,7 +485,12 @@ def test_reconcile_overlaps_the_next_parse_with_embedding(
             second_parsed.set()
         return pages
 
-    def observe_encode(texts, *, model_name = None, normalize = True):
+    def observe_encode(
+        texts,
+        *,
+        model_name = None,
+        normalize = True,
+    ):
         if any("first document" in text for text in texts):
             overlap_observed.append(second_parsed.wait(5))
         return real_encode(texts, model_name = model_name, normalize = normalize)
@@ -499,10 +502,13 @@ def test_reconcile_overlaps_the_next_parse_with_embedding(
 
     assert result["status"] == "completed"
     assert overlap_observed == [True]
-    assert _row(
-        "SELECT COUNT(*) AS count FROM linked_folder_files WHERE folder_id=?",
-        (folder["id"],),
-    )["count"] == 2
+    assert (
+        _row(
+            "SELECT COUNT(*) AS count FROM linked_folder_files WHERE folder_id=?",
+            (folder["id"],),
+        )["count"]
+        == 2
+    )
 
 
 @requires_sqlite_vec

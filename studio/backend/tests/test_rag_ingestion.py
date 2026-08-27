@@ -195,9 +195,7 @@ def test_ingestion_dedupe_by_hash(rag_home, stub_embeddings, tmp_path):
         conn.close()
 
 
-def test_ingestion_uses_a_supplied_content_hash(
-    rag_home, stub_embeddings, tmp_path, monkeypatch
-):
+def test_ingestion_uses_a_supplied_content_hash(rag_home, stub_embeddings, tmp_path, monkeypatch):
     path = _write(tmp_path, "doc.txt", "alpha bravo charlie")
     scope = store.kb_scope("K1")
     content_hash = ingestion._sha256_file(path)
