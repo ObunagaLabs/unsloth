@@ -1200,6 +1200,7 @@ from .vision import FastBaseModel
 from .diffusion import FastDiffusionModel, is_diffusion_model_type
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
 )
 
 try:
@@ -2036,6 +2037,8 @@ class FastModel(FastBaseModel):
             if _num_labels is not None:
                 from transformers import AutoModelForSequenceClassification
                 auto_model = AutoModelForSequenceClassification
+            elif AutoModelForSeq2SeqLM._model_mapping.get(type(model_config), None) is not None:
+                auto_model = AutoModelForSeq2SeqLM
             elif is_vlm:
                 # Check if the model's auto_map supports the VLM auto class.
                 # Some repo-code VL models register only a generic auto class and not
