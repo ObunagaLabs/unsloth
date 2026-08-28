@@ -354,13 +354,16 @@ def start_ingestion(
     ocr: bool | None = None,
     caption: bool | None = None,
     dedupe: bool = True,
+    content_hash: str | None = None,
     linked_folder_id: str | None = None,
     linked_relative_path: str | None = None,
     background: bool = True,
 ) -> tuple[str, str]:
     """Create the document + job rows and spawn the worker, returning
     ``(document_id, job_id)``. A duplicate content hash in this scope returns the
-    existing id with an already-completed job (no re-ingest)."""
+    existing id with an already-completed job (no re-ingest). ``content_hash`` may
+    be supplied for a trusted snapshot whose SHA-256 was already computed; normal
+    upload callers leave it unset."""
     ext = os.path.splitext(stored_path)[1].lower()
     if ext not in config.UPLOAD_EXTS:
         raise ValueError(f"unsupported file type: {ext}")
@@ -368,7 +371,7 @@ def start_ingestion(
     # Reclaim queues for finished jobs so the registry stays bounded.
     _reap_finished_jobs()
 
-    sha = _sha256_file(stored_path)
+    sha = content_hash if content_hash is not None else _sha256_file(stored_path)
     conn = rag_db.get_connection()
     try:
         # Named before the transaction opens, because naming the embedder on a fresh

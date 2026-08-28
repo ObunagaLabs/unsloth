@@ -195,6 +195,34 @@ def test_ingestion_dedupe_by_hash(rag_home, stub_embeddings, tmp_path):
         conn.close()
 
 
+def test_ingestion_uses_a_supplied_content_hash(rag_home, stub_embeddings, tmp_path, monkeypatch):
+    path = _write(tmp_path, "doc.txt", "alpha bravo charlie")
+    scope = store.kb_scope("K1")
+    content_hash = ingestion._sha256_file(path)
+    monkeypatch.setattr(
+        ingestion,
+        "_sha256_file",
+        lambda _path: pytest.fail("a supplied content hash must avoid a second file read"),
+    )
+
+    doc_id, job_id = ingestion.start_ingestion(
+        scope,
+        "K1",
+        None,
+        "doc.txt",
+        path,
+        content_hash = content_hash,
+        background = False,
+    )
+
+    assert _wait_completed(job_id)["status"] == "completed"
+    conn = rag_db.get_connection()
+    try:
+        assert store.get_document(conn, doc_id)["sha256"] == content_hash
+    finally:
+        conn.close()
+
+
 def test_manual_upload_does_not_dedupe_to_linked_folder_document(
     rag_home, stub_embeddings, tmp_path
 ):
