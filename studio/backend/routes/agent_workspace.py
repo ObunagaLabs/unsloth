@@ -253,7 +253,9 @@ def _graph_requires_execution(graph: dict, revision: Optional[int] = None) -> bo
     return any(node["type"] in {"loop", "model"} for node in document["nodes"])
 
 
-def _require_graph_provider_session(project_id: str, graph_id: str, revision: Optional[int], via_api_key: bool) -> None:
+def _require_graph_provider_session(
+    project_id: str, graph_id: str, revision: Optional[int], via_api_key: bool
+) -> None:
     document = get_graph_revision(project_id, graph_id, revision)
     if document is None:
         raise HTTPException(status_code = 404, detail = "Graph revision not found.")
@@ -624,9 +626,7 @@ def save_graph(
 ) -> dict:
     _project(project_id)
     try:
-        return _public_graph_value(
-            create_graph(project_id, payload.model_dump(exclude_none = True))
-        )
+        return _public_graph_value(create_graph(project_id, payload.model_dump(exclude_none = True)))
     except AgentWorkspaceError as exc:
         raise _workspace_error(exc) from exc
 
