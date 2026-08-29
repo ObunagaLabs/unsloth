@@ -50,6 +50,7 @@ import {
   INVENTORY_FRESHNESS_WINDOW_MS,
   useDeviceInventorySources,
 } from "@/features/hub/inventory";
+import { modelIdsMatch } from "@/features/hub/lib/model-identity";
 import {
   type DeletedModelRef,
   type ExternalConnectionRef,
@@ -225,6 +226,12 @@ import { usePinnedProjectsStore } from "./stores/pinned-projects-store";
 import { useResearchRunStore } from "./stores/research-run-store";
 import { buildChatTourSteps } from "./tour";
 import type { ChatView, MessageRecord } from "./types";
+import {
+  type ComparePairReadState,
+  checkpointCompareClass,
+  comparePairReadState,
+  resolveComparePaneThreadIds,
+} from "./utils/compare-pane-threads";
 import {
   getStoredChatThread,
   isExpectedBackgroundChatStorageError,

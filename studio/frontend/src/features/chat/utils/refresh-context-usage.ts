@@ -312,7 +312,7 @@ export async function refreshContextUsage(
     const { input_tokens: inputTokens, model: countedModel } =
       await countChatInputTokens({
         model: capturedCheckpoint,
-        messages: outbound,
+        ...countHistory,
         session_id: sessionId,
         ...buildLocalTokenCountReasoning(),
         ...countExtras,

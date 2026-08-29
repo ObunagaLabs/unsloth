@@ -69,6 +69,7 @@ import {
   stripSearchImageTokens,
 } from "../search-images/search-images";
 import { readThreadCreationClaim } from "../utils/chat-thread-creation-claim";
+import { ggufCompactionRequestFields } from "../utils/auto-compaction";
 import {
   adoptPreStreamRunReservation,
   findPreStreamRunReservation,
@@ -77,6 +78,10 @@ import {
   releasePreStreamRunReservation,
 } from "../utils/pre-stream-run-reservation";
 import { notifyPromptQueueRunFailed } from "../utils/prompt-queue-boundary";
+import {
+  studioToolHistoryRequestFields,
+  type ToolHistoryMessage,
+} from "../utils/studio-tool-history";
 import {
   consumeQueuedChatRunSettings,
   shouldPersistResolvedQueuedModel,
@@ -119,7 +124,7 @@ import { pickFriendlyContainerName } from "../lib/friendly-names";
 import { isSpeechOnlyStatus } from "../lib/speech-only-status";
 import {
   resolveFitMaxSeqLength,
-  resolveManualAutoCtxPin,
+  resolveExplicitCtxPin,
 } from "../presets/preset-policy";
 import { resolveLoadMaxSeqLength } from "../presets/preset-policy";
 import {
@@ -1811,9 +1816,9 @@ export const CANVAS_FALLBACK_INSTRUCTION =
  * of createOpenAIStreamAdapter; the tool catalog is priced server-side instead, since
  * --enable-tools can inject schemas the client cannot see.
  */
-export async function buildLocalTokenCountHistory(
+export async function buildOutboundMessagesForTokenCount(
   messages: RunMessages,
-  _threadId: string | undefined,
+  threadId: string | undefined,
 ): Promise<OpenAIChatMessage[]> {
   const outboundMessages = pruneOutboundHistory(messages, true)
     .flatMap((message) => toOpenAIMessages(message, true))
@@ -1827,15 +1832,22 @@ export async function buildLocalTokenCountHistory(
     params.systemPrompt,
     params.systemVariables,
   );
-  if (combinedSystemPrompt) {
+  const projectInstructions = await resolveProjectInstructions(threadId);
+  const fullSystemPrompt = [
+    projectInstructions
+      ? `<project_instructions>\n${projectInstructions}\n</project_instructions>`
+      : "",
+    combinedSystemPrompt,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  if (fullSystemPrompt) {
     outboundMessages.unshift({
       role: "system",
-      content: combinedSystemPrompt,
+      content: fullSystemPrompt,
     });
   }
 
-  // Canvas appends one of these on every request, schema or not, so a count without it reads low.
-  // The adapter's image gate is never why render_html is off here: the count route refuses images.
   const canvasInstruction = artifactsEnabled
     ? supportsTools
       ? CANVAS_TOOL_INSTRUCTION
@@ -1853,8 +1865,24 @@ export async function buildLocalTokenCountHistory(
     }
   }
 
+  return outboundMessages as OpenAIChatMessage[];
+}
+
+export async function buildLocalTokenCountHistory(
+  messages: RunMessages,
+  threadId: string | undefined,
+): Promise<{
+  messages: OpenAIChatMessage[];
+  studio_tool_history?: true;
+}> {
+  const survivingMessages = pruneOutboundHistory(messages, true);
+  const outboundMessages = await buildOutboundMessagesForTokenCount(
+    messages,
+    threadId,
+  );
+
   return {
-    messages: outboundMessages as OpenAIChatMessage[],
+    messages: outboundMessages,
     ...studioToolHistoryRequestFieldsAfterReplay(
       survivingMessages as unknown as ToolHistoryMessage[],
     ),
@@ -2017,6 +2045,22 @@ async function resolveUseAdapter(
   } catch {
     return undefined;
   }
+}
+
+async function resolveProjectInstructions(
+  threadId: string | undefined,
+  readThreadRecord?: ThreadRecordReader,
+): Promise<string> {
+  const projectId = await resolveProjectId(threadId, readThreadRecord);
+  if (!projectId) {
+    return "";
+  }
+
+  const project = await getStoredChatProject(projectId).catch(() => null);
+  if (!project || project.archived) {
+    return "";
+  }
+  return project.instructions?.trim() ?? "";
 }
 
 function latestSlashCommandText(messages: RunMessages): string {

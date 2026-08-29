@@ -52,7 +52,14 @@ from core.agent_workspace.worktrees import (
     begin_project_deletion as begin_worktree_project_deletion,
     finish_project_deletion as finish_worktree_project_deletion,
 )
-from core.inference.llama_server_args import BATCH_MAX, BATCH_MIN, PARALLEL_MAX, PARALLEL_MIN
+from core.inference.llama_server_args import (
+    BATCH_MAX,
+    BATCH_MIN,
+    CACHE_RAM_MAX_MIB,
+    CTX_CHECKPOINTS_MAX,
+    PARALLEL_MAX,
+    PARALLEL_MIN,
+)
 from loggers import get_logger
 from utils.api_errors import safe_validation_errors
 from utils.utils import safe_curated_detail, log_and_http_error

@@ -636,6 +636,8 @@ export interface OpenAIChatCompletionsRequest {
   enabled_tools?: string[];
   /** Local models + enable_tools only. */
   mcp_enabled?: boolean;
+  /** The replayed tool calls came from Studio's own local tool loop. */
+  studio_tool_history?: boolean;
   /** Indicates that Deep Research is armed for the current composer turn. */
   deep_research_armed?: boolean;
   /** Local models + enable_tools only. */

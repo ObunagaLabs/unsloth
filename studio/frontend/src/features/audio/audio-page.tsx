@@ -600,8 +600,7 @@ export function AudioPage({
     const owned =
       sttReady &&
       selected !== null &&
-      claim !== null &&
-      claim === sttLoadedModel;
+      claim !== null && claim === sttLoadedModel;
     const forget = () => {
       deferredSttLoad.current = null;
       selectedSttRepoRef.current = null;
@@ -812,8 +811,7 @@ export function AudioPage({
   /** `keepFallback` is for the one case where the id is not in `clips` yet: the server
    *  persisted the clip but this refresh missed it, so the response audio has to stay
    *  mounted or the player falls through to the empty state. */
-  const selectClip = useCallback(
-    (id: string, keepFallback = false) => {
+  const selectClip = useCallback((id: string, keepFallback = false) => {
       galleryCache.selectedId = id;
       setSelectedId(id);
       if (!keepFallback) setFallbackClip(null);
@@ -1027,11 +1025,11 @@ export function AudioPage({
   const invalidatePendingTtsSelection = useCallback(() => {
     ttsPickGeneration.current += 1;
     pendingRoutedTtsPick.current = null;
-    invalidatePendingStagedTts();
-  }, [invalidatePendingStagedTts]);
+  }, []);
   const transitionMode = useCallback(
     (nextMode: CreateMode) => {
       if (nextMode === mode) {
+        if (nextMode === "transcribe") invalidatePendingStagedTts();
         if (nextMode === "transcribe") invalidatePendingTtsSelection();
         return true;
       }
@@ -1042,6 +1040,7 @@ export function AudioPage({
         return false;
       }
 
+      if (nextMode === "transcribe") invalidatePendingStagedTts();
       if (nextMode === "transcribe") invalidatePendingTtsSelection();
       if (busyRef.current === "generating") generateAbort.current?.abort();
       stopAndDiscardRecording();
@@ -1077,6 +1076,7 @@ export function AudioPage({
       return true;
     },
     [
+      invalidatePendingStagedTts,
       invalidatePendingTtsSelection,
       mode,
       releaseTranscribeSelection,
@@ -1889,8 +1889,7 @@ export function AudioPage({
       generateAbort.current = null;
       busyRef.current = null;
       setBusy(null);
-      if (activeRef.current && modeRef.current === "speak")
-        replayQueuedTtsPick();
+      if (activeRef.current) replayQueuedTtsPick();
     }
   }, [
     prompt,
@@ -2247,11 +2246,7 @@ export function AudioPage({
             // audio worker. Other safetensors exports still need a GGUF build on Mac.
             .filter(
               (lora) =>
-                !isMac ||
-                trainedTtsCheckpointIsRunnableOnMac(
-                  lora.audio_type,
-                  lora.export_type,
-                ),
+                !isMac || trainedTtsCheckpointIsRunnableOnMac(lora.audio_type, lora.export_type),
             )
             // The GGUF flag matters: GGUF_TTS_AUDIO_TYPES leaves csm out because llama.cpp has
             // no CSM decoder, so a csm LoRA exported to GGUF fails at load. Without it the

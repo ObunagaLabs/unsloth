@@ -57,7 +57,11 @@ import { CONVERSATION_MARKDOWN_LABEL } from "./utils/conversation-markdown";
 import { pasteClipboardFiles } from "./utils/clipboard-files";
 import { confirmStopRunningChatsIfNeeded } from "./utils/confirm-stop-running-chats";
 import { requestLocalPromptQueueStop } from "./utils/prompt-queue-boundary";
-import { cancelPreStreamRunReservations } from "./utils/pre-stream-run-reservation";
+import {
+  cancelPreStreamRunReservations,
+  releasePreStreamRunReservation,
+  reservePreStreamRun,
+} from "./utils/pre-stream-run-reservation";
 import {
   interceptCompareProjectSlashCommand,
   parseProjectSlashCommand,
@@ -133,7 +137,7 @@ import {
   bindCompareContextSnapshot,
   releaseCompareContextSnapshot,
 } from "./utils/compare-context-snapshot";
-import { resolveFitMaxSeqLength, resolveManualAutoCtxPin } from "./presets/preset-policy";
+import { resolveFitMaxSeqLength, resolveExplicitCtxPin } from "./presets/preset-policy";
 import { ensureGpuDeviceCache } from "@/hooks/use-gpu-info";
 import {
   parseExternalModelId,
@@ -1969,9 +1973,48 @@ export function SharedComposer({
       }
     } else {
       // Original behavior: fire all handles simultaneously
+      const liveRuntime = useChatRuntimeStore.getState();
+      if (
+        requireStableCheckpoint &&
+        (liveRuntime.modelLoading ||
+          !modelIdsMatch(
+            submittedCompareCheckpoint,
+            liveRuntime.params.checkpoint,
+          ))
+      ) {
+        resetPromptQueue();
+        toast.error("Compare unavailable", {
+          description: "The loaded model changed while preparing the message.",
+        });
+        return;
+      }
+      const handles = Object.values(handlesRef.current);
+      const reservations: symbol[] = [];
+      if (requireStableCheckpoint) {
+        for (const handle of handles) {
+          const token = reservePreStreamRun(handle.threadIds(), {
+            usesLocalModel: true,
+            cancel: () => handle.cancel(),
+          });
+          if (!token) {
+            for (const reservation of reservations) {
+              releasePreStreamRunReservation(reservation);
+            }
+            resetPromptQueue();
+            toast.error("Compare unavailable", {
+              description: "A comparison run is already starting.",
+            });
+            return;
+          }
+          reservations.push(token);
+        }
+      }
       try {
         await bindProjectContextSnapshot();
       } catch (error) {
+        for (const reservation of reservations) {
+          releasePreStreamRunReservation(reservation);
+        }
         resetPromptQueue();
         toast.error("Compare failed", {
           description:
@@ -1982,7 +2025,6 @@ export function SharedComposer({
         return;
       }
       clearSubmittedDraft();
-      const handles = Object.values(handlesRef.current);
       const completions = handles.map((handle) => handle.waitForRunEnd());
       for (const handle of handles) {
         handle.append(content);
