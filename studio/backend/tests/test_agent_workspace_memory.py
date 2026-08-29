@@ -18,7 +18,10 @@ from core.agent_workspace.memory import (
     search_memory,
     write_memory_entry,
 )
-from core.agent_workspace.project_context import resolve_project_context, strip_server_project_context
+from core.agent_workspace.project_context import (
+    resolve_project_context,
+    strip_server_project_context,
+)
 from core.inference.tools import execute_tool
 from storage import studio_db
 from routes import agent_workspace as agent_workspace_routes
@@ -69,7 +72,11 @@ def _message(message_id, thread_id, content):
     )
 
 
-def _wait(manager, task_id, timeout = 5):
+def _wait(
+    manager,
+    task_id,
+    timeout = 5,
+):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         from core.agent_workspace.state import get_background_task
@@ -189,9 +196,7 @@ def test_dream_uses_durable_background_lifecycle(tmp_path):
     _message("message-2", "thread-2", "I prefer focused tests.")
     manager = BackgroundTaskManager(max_workers = 1)
     try:
-        queued = manager.enqueue_dream(
-            "project", thread_ids = ["thread-1", "thread-2"], start = True
-        )
+        queued = manager.enqueue_dream("project", thread_ids = ["thread-1", "thread-2"], start = True)
         completed = _wait(manager, queued["id"])
     finally:
         manager._executor.shutdown(wait = True)
@@ -216,9 +221,7 @@ def test_dream_routes_hold_proposals_until_user_acceptance(tmp_path):
     deadline = time.monotonic() + 5
     dream = None
     while time.monotonic() < deadline:
-        dream = client.get(
-            f"/api/agent-workspace/projects/project/memory/dreams/{dream_id}"
-        ).json()
+        dream = client.get(f"/api/agent-workspace/projects/project/memory/dreams/{dream_id}").json()
         if dream["status"] == "completed":
             break
         time.sleep(0.01)

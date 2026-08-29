@@ -191,7 +191,6 @@ def _project_context_block(project: dict) -> str:
             render_project_rules_guidance,
             render_project_skills_guidance,
         )
-
         automation = "\n\n".join(
             value
             for value in (

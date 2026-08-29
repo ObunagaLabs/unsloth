@@ -84,9 +84,7 @@ def test_manifest_ids_are_stable_and_bound_to_head_and_complete_source(tmp_path)
     assert first["sourceFingerprint"].startswith("c0dec0de")
     assert first["sourceFingerprint"] == repeated["sourceFingerprint"]
     assert _hunk_ids(first, "review.txt") == _hunk_ids(repeated, "review.txt")
-    assert _file(first, "review.txt")["selectionId"] == _file(
-        repeated, "review.txt"
-    )["selectionId"]
+    assert _file(first, "review.txt")["selectionId"] == _file(repeated, "review.txt")["selectionId"]
     assert all(len(value) == 64 for value in _hunk_ids(first, "review.txt"))
 
     (tmp_path / "other.txt").write_text("dirty unrelated source\n", encoding = "utf-8")
@@ -117,9 +115,7 @@ def test_manifest_ids_are_stable_and_bound_to_head_and_complete_source(tmp_path)
     assert len(_hunk_ids(unstaged, "review.txt")) == 1
     assert len(_hunk_ids(head, "review.txt")) == 2
     assert head["hunkCount"] == sum(len(item["hunks"]) for item in head["files"])
-    assert set(_hunk_ids(staged, "review.txt")).isdisjoint(
-        _hunk_ids(unstaged, "review.txt")
-    )
+    assert set(_hunk_ids(staged, "review.txt")).isdisjoint(_hunk_ids(unstaged, "review.txt"))
 
 
 def test_binary_rename_mode_and_untracked_entries_are_whole_file_only(tmp_path):

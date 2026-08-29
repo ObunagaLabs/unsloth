@@ -633,9 +633,9 @@ def queue_memory_dream(
         return _public_background_task(
             background_manager.enqueue_dream(
                 project_id,
-                thread_ids=payload.threadIds,
-                instructions=payload.instructions,
-                start=payload.start,
+                thread_ids = payload.threadIds,
+                instructions = payload.instructions,
+                start = payload.start,
             )
         )
     except AgentWorkspaceError as exc:
@@ -1154,9 +1154,7 @@ def queue_child_agent(
         raise _workspace_error(exc) from exc
 
 
-@router.post(
-    "/projects/{project_id}/background/{task_id}/children/{child_id}/cancel"
-)
+@router.post("/projects/{project_id}/background/{task_id}/children/{child_id}/cancel")
 def cancel_child_agent(
     project_id: str,
     task_id: str,

@@ -117,9 +117,11 @@ def _status_snapshot(repository: Path, pathspec: str) -> tuple[list[str], list[d
             if index >= len(records):
                 return [], [], True
         index += 1
-    return conflicts[:MAX_FILES], untracked[:MAX_FILES], len(conflicts) > MAX_FILES or len(
-        untracked
-    ) > MAX_FILES
+    return (
+        conflicts[:MAX_FILES],
+        untracked[:MAX_FILES],
+        len(conflicts) > MAX_FILES or len(untracked) > MAX_FILES,
+    )
 
 
 def _raw_entries(output: str) -> list[dict]:
@@ -265,12 +267,7 @@ def _stable_id(kind: str, payload: dict) -> str:
 
 
 def _file_manifest(
-    entry: dict,
-    section: str,
-    *,
-    mode: str,
-    head: str,
-    fingerprint: str,
+    entry: dict, section: str, *, mode: str, head: str, fingerprint: str
 ) -> tuple[dict, int, int, int]:
     hunks, additions, deletions, line_count = _structured_hunks(section)
     binary = "\nGIT binary patch\n" in f"\n{section}" or "\nBinary files " in f"\n{section}"
@@ -321,13 +318,7 @@ def _file_manifest(
     )
 
 
-def _untracked_manifest(
-    item: dict,
-    *,
-    mode: str,
-    head: str,
-    fingerprint: str,
-) -> dict:
+def _untracked_manifest(item: dict, *, mode: str, head: str, fingerprint: str) -> dict:
     identity = {
         "mode": mode,
         "head": head,

@@ -239,9 +239,7 @@ def _agent_messages(context: Any) -> list[dict[str, str]]:
             + '" depth="'
             + str(int(context.delegation_depth))
             + '">You are a bounded child agent. Stay within the assigned role and '
-            "return concrete evidence to the parent task."
-            + role_guidance
-            + "</delegation>"
+            "return concrete evidence to the parent task." + role_guidance + "</delegation>"
         )
     elif bool(delegation_policy.get("enabled")):
         sections.append(
@@ -776,6 +774,7 @@ def execute_background_agent(context: Any, cancel_event: threading.Event) -> dic
     expired = threading.Event()
     timer = None
     if wall_seconds > 0:
+
         def exhaust_budget() -> None:
             expired.set()
             cancel_event.set()

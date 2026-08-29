@@ -247,12 +247,15 @@ def test_windows_mutation_uses_delete_deny_guards_and_atomic_commits():
         raw, _attributes, identity = mutation.read(1024)
         assert raw == b"VALUE = 1\r\n"
         assert identity == (1, original.identity)
-        assert mutation.replace(
-            b"VALUE = 2\r\n",
-            expect = raw,
-            mode = 0o644,
-            identity = identity,
-        ) is None
+        assert (
+            mutation.replace(
+                b"VALUE = 2\r\n",
+                expect = raw,
+                mode = 0o644,
+                identity = identity,
+            )
+            is None
+        )
 
     assert ops.content(r"C:\Repo\src\main.py") == b"VALUE = 2\r\n"
     assert len(ops.replacements) == 1
@@ -308,12 +311,15 @@ def test_windows_mutation_detects_stale_file_without_committing(stale_kind):
             original.modified_ns += 1
         else:
             ops.add_file(r"C:\Repo\main.py", raw, identity = 99)
-        assert mutation.replace(
-            b"VALUE = 2\n",
-            expect = raw,
-            mode = 0o644,
-            identity = identity,
-        ) == "changed"
+        assert (
+            mutation.replace(
+                b"VALUE = 2\n",
+                expect = raw,
+                mode = 0o644,
+                identity = identity,
+            )
+            == "changed"
+        )
 
     assert not ops.replacements
     assert not ops.temporary_paths()
@@ -509,20 +515,26 @@ def test_windows_mutation_real_create_replace_stale_and_cleanup(tmp_path):
         assert mutation.create(b"VALUE = 1\r\n") is None
         raw, mode, file_identity = mutation.read(1024)
         assert raw == b"VALUE = 1\r\n"
-        assert mutation.replace(
-            b"VALUE = 2\r\n",
-            expect = raw,
-            mode = mode,
-            identity = file_identity,
-        ) is None
+        assert (
+            mutation.replace(
+                b"VALUE = 2\r\n",
+                expect = raw,
+                mode = mode,
+                identity = file_identity,
+            )
+            is None
+        )
         stale_raw, stale_mode, stale_identity = mutation.read(1024)
         target.write_bytes(b"VALUE = external\r\n")
-        assert mutation.replace(
-            b"VALUE = stale\r\n",
-            expect = stale_raw,
-            mode = stale_mode,
-            identity = stale_identity,
-        ) == "changed"
+        assert (
+            mutation.replace(
+                b"VALUE = stale\r\n",
+                expect = stale_raw,
+                mode = stale_mode,
+                identity = stale_identity,
+            )
+            == "changed"
+        )
 
     assert target.read_bytes() == b"VALUE = external\r\n"
     assert not list(target.parent.glob(".unsloth_edit_*"))

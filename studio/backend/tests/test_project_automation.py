@@ -188,15 +188,9 @@ def test_lifecycle_hooks_use_the_project_boundary_and_persist_each_result(
     result = run_lifecycle_hooks("project", "before_agent")
     assert result["status"] == "failed"
     assert result["requiredFailure"] is True
-    assert [run["hookName"] for run in result["runs"]] == [
-        "advisory",
-        "passing",
-        "blocking",
-    ]
+    assert [run["hookName"] for run in result["runs"]] == ["advisory", "passing", "blocking"]
     assert result["runs"][1]["result"]["output"] == "inside"
-    durable = list_lifecycle_hook_runs(
-        "project", invocation_id = result["invocationId"]
-    )
+    durable = list_lifecycle_hook_runs("project", invocation_id = result["invocationId"])
     assert len(durable) == 3
     assert {run["status"] for run in durable} == {"failed", "passed"}
 
@@ -274,11 +268,14 @@ def test_schedule_skip_and_expired_lease_reconciliation_are_durable(tmp_path):
         misfire_policy = "skip",
         current_time_ms = 0,
     )
-    assert lease_due_schedules(
-        "worker",
-        current_time_ms = 7_200_000,
-        misfire_grace_ms = 1000,
-    ) == []
+    assert (
+        lease_due_schedules(
+            "worker",
+            current_time_ms = 7_200_000,
+            misfire_grace_ms = 1000,
+        )
+        == []
+    )
     after_skip = get_schedule(skipped["id"])
     assert after_skip is not None
     assert after_skip["lastStatus"] == "skipped"

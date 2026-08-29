@@ -525,9 +525,7 @@ class BackgroundTaskManager:
                 update_background_task(task_id, "cancelled", result = result)
             else:
                 if list_active_child_tasks(task_id):
-                    raise AgentWorkspaceError(
-                        "The parent agent still has active child agents."
-                    )
+                    raise AgentWorkspaceError("The parent agent still has active child agents.")
                 self._revalidate_agent_completion(task, context)
                 update_background_task(task_id, "completed", result = result)
         except Exception as exc:
@@ -627,7 +625,9 @@ class BackgroundTaskManager:
                 )
             elif task["status"] in {"running", "cancelling"}:
                 if task["status"] == "running":
-                    task = update_background_task(task_id, "cancelling", cancel_requested = True) or task
+                    task = (
+                        update_background_task(task_id, "cancelling", cancel_requested = True) or task
+                    )
                 event = self._cancellations.get(task_id)
                 if event is not None:
                     event.set()
@@ -639,8 +639,7 @@ class BackgroundTaskManager:
             if task["kind"] == "agent":
                 result = self._cancelled_worktree_result(task, {})
                 queued_cancelled = (
-                    update_background_task(task_id, "cancelled", result = result)
-                    or queued_cancelled
+                    update_background_task(task_id, "cancelled", result = result) or queued_cancelled
                 )
             return queued_cancelled
 

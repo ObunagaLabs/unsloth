@@ -29302,9 +29302,10 @@ class LlamaCppBackend:
                         if decision_slot is not None:
                             abort_tool_decision(decision_slot, approval_id)
 
-                    project_rule_approved = (
-                        project_effect != "prompt" or _decision not in {None, "deny"}
-                    )
+                    project_rule_approved = project_effect != "prompt" or _decision not in {
+                        None,
+                        "deny",
+                    }
 
                     _effective_timeout = None if tool_call_timeout >= 9999 else tool_call_timeout
                     # RAG: cap paraphrased KB re-searches that slip past the dup guard.

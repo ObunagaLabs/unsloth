@@ -144,7 +144,12 @@ def _read_ledger(root: Path) -> dict[str, Any]:
     return value
 
 
-def _atomic_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+def _atomic_write(
+    path: Path,
+    data: bytes,
+    *,
+    mode: int = 0o600,
+) -> None:
     path.parent.mkdir(mode = 0o700, exist_ok = True)
     fd, temporary = tempfile.mkstemp(prefix = f".{path.name}.", dir = str(path.parent))
     temporary_path = Path(temporary)
@@ -204,10 +209,7 @@ def _hash(content: bytes) -> str:
 
 
 def _entry_record(
-    root: Path,
-    relative: str,
-    content: bytes,
-    ledger: dict[str, Any],
+    root: Path, relative: str, content: bytes, ledger: dict[str, Any]
 ) -> dict[str, Any]:
     metadata = ledger.get("entries", {}).get(relative) or {}
     return {
@@ -224,7 +226,11 @@ def _entry_record(
     }
 
 
-def _read_entry_unlocked(root: Path, relative: str, ledger: Optional[dict] = None) -> tuple[bytes, dict]:
+def _read_entry_unlocked(
+    root: Path,
+    relative: str,
+    ledger: Optional[dict] = None,
+) -> tuple[bytes, dict]:
     path = _safe_entry_path(root, relative, create_parent = False)
     try:
         content = path.read_bytes()
@@ -337,9 +343,14 @@ def search_memory(
         score = sum(text.count(term) for term in terms)
         if score:
             content = str(entry.get("content") or "")
-            first = min((content.casefold().find(term) for term in terms if term in content.casefold()), default = 0)
+            first = min(
+                (content.casefold().find(term) for term in terms if term in content.casefold()),
+                default = 0,
+            )
             start = max(0, first - 180)
-            ranked.append((score, entry["updatedAt"] or 0, {**entry, "snippet": content[start : start + 640]}))
+            ranked.append(
+                (score, entry["updatedAt"] or 0, {**entry, "snippet": content[start : start + 640]})
+            )
     ranked.sort(key = lambda item: (item[0], item[1]), reverse = True)
     return [item[2] for item in ranked[: max(1, min(int(top_k), 20))]]
 
@@ -406,7 +417,9 @@ def write_memory_entry(
             "dreamId": _safe_text(dream_id, 256) or None,
         }
         history = list(previous.get("history") or [])
-        history.append({"version": version, "hash": _hash(data), "updatedAt": entries[relative]["updatedAt"]})
+        history.append(
+            {"version": version, "hash": _hash(data), "updatedAt": entries[relative]["updatedAt"]}
+        )
         entries[relative]["history"] = history[-MEMORY_HISTORY_LIMIT:]
         _write_ledger(root, ledger)
         _, result = _read_entry_unlocked(root, relative, ledger)
@@ -502,7 +515,9 @@ def _transcript(thread_id: str, project_id: str) -> Optional[dict[str, Any]]:
     }
 
 
-def _transcript_findings(transcript: dict[str, Any], cancel_event: threading.Event) -> list[dict[str, Any]]:
+def _transcript_findings(
+    transcript: dict[str, Any], cancel_event: threading.Event
+) -> list[dict[str, Any]]:
     findings = []
     for message in transcript["messages"]:
         if cancel_event.is_set():
@@ -535,7 +550,9 @@ def _slug(text: str) -> str:
     return value[:64] or "observation"
 
 
-def run_dream_task(project_id: str, payload: dict[str, Any], cancel_event: threading.Event) -> dict[str, Any]:
+def run_dream_task(
+    project_id: str, payload: dict[str, Any], cancel_event: threading.Event
+) -> dict[str, Any]:
     """Analyze explicitly selected transcripts and return uncommitted proposals."""
     thread_ids = list(dict.fromkeys(str(value) for value in payload.get("threadIds") or []))
     if not thread_ids or len(thread_ids) > TRANSCRIPT_LIMIT:

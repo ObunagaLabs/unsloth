@@ -246,13 +246,15 @@ def _optional_text(value: Any, *, label: str, maximum: int) -> str:
     return text
 
 
-def _raw_text(value: Any, *, label: str, maximum: int, required: bool = False) -> str:
+def _raw_text(
+    value: Any,
+    *,
+    label: str,
+    maximum: int,
+    required: bool = False,
+) -> str:
     text = str(value or "")
-    if (
-        "\x00" in text
-        or len(text.encode("utf-8")) > maximum
-        or (required and not text.strip())
-    ):
+    if "\x00" in text or len(text.encode("utf-8")) > maximum or (required and not text.strip()):
         raise AgentWorkspaceError(f"{label} is invalid.")
     return text
 
@@ -590,12 +592,7 @@ def _skill(row: sqlite3.Row) -> dict:
 
 
 def _normalize_skill(
-    *,
-    name: Any,
-    description: Any,
-    source: Any,
-    guidance: Any,
-    content_digest: Any,
+    *, name: Any, description: Any, source: Any, guidance: Any, content_digest: Any
 ) -> dict:
     normalized_guidance = _raw_text(
         guidance,
@@ -662,7 +659,9 @@ def install_project_skill(
             ),
         )
         conn.commit()
-        row = conn.execute("SELECT * FROM agent_project_skills WHERE id = ?", (skill_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM agent_project_skills WHERE id = ?", (skill_id,)
+        ).fetchone()
         return _skill(row)
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -675,7 +674,9 @@ def install_project_skill(
 def get_project_skill(skill_id: str) -> Optional[dict]:
     conn = connection()
     try:
-        row = conn.execute("SELECT * FROM agent_project_skills WHERE id = ?", (skill_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM agent_project_skills WHERE id = ?", (skill_id,)
+        ).fetchone()
         return _skill(row) if row else None
     finally:
         conn.close()
@@ -713,7 +714,9 @@ def update_project_skill(
     conn = connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM agent_project_skills WHERE id = ?", (skill_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM agent_project_skills WHERE id = ?", (skill_id,)
+        ).fetchone()
         if row is None:
             conn.rollback()
             return None
@@ -727,9 +730,7 @@ def update_project_skill(
             description = row["description"] if description is _UNSET else description,
             source = row["source"] if source is _UNSET else source,
             guidance = next_guidance,
-            content_digest = (
-                row["content_digest"] if content_digest is _UNSET else content_digest
-            ),
+            content_digest = (row["content_digest"] if content_digest is _UNSET else content_digest),
         )
         try:
             cursor = conn.execute(
@@ -779,22 +780,30 @@ def _bounded_json_guidance(header: str, records: list[dict], limit: int) -> str:
     selected: list[dict] = []
     for record in records:
         candidate = selected + [record]
-        rendered = header + "\n" + json.dumps(
-            candidate,
-            ensure_ascii = False,
-            separators = (",", ":"),
-            sort_keys = True,
+        rendered = (
+            header
+            + "\n"
+            + json.dumps(
+                candidate,
+                ensure_ascii = False,
+                separators = (",", ":"),
+                sort_keys = True,
+            )
         )
         if len(rendered.encode("utf-8")) > limit:
             break
         selected = candidate
     if not selected:
         return ""
-    return header + "\n" + json.dumps(
-        selected,
-        ensure_ascii = False,
-        separators = (",", ":"),
-        sort_keys = True,
+    return (
+        header
+        + "\n"
+        + json.dumps(
+            selected,
+            ensure_ascii = False,
+            separators = (",", ":"),
+            sort_keys = True,
+        )
     )
 
 
@@ -946,7 +955,9 @@ def create_lifecycle_hook(
             ),
         )
         conn.commit()
-        row = conn.execute("SELECT * FROM agent_lifecycle_hooks WHERE id = ?", (hook_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM agent_lifecycle_hooks WHERE id = ?", (hook_id,)
+        ).fetchone()
         return _hook(row)
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -959,7 +970,9 @@ def create_lifecycle_hook(
 def get_lifecycle_hook(hook_id: str) -> Optional[dict]:
     conn = connection()
     try:
-        row = conn.execute("SELECT * FROM agent_lifecycle_hooks WHERE id = ?", (hook_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM agent_lifecycle_hooks WHERE id = ?", (hook_id,)
+        ).fetchone()
         return _hook(row) if row else None
     finally:
         conn.close()
@@ -1012,7 +1025,9 @@ def update_lifecycle_hook(
     conn = connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM agent_lifecycle_hooks WHERE id = ?", (hook_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM agent_lifecycle_hooks WHERE id = ?", (hook_id,)
+        ).fetchone()
         if row is None:
             conn.rollback()
             return None
@@ -1127,11 +1142,7 @@ def _begin_hook_run(invocation_id: str, hook: dict) -> dict:
 
 
 def _finish_hook_run(
-    run_id: str,
-    *,
-    status: str,
-    result: Optional[dict],
-    error: Optional[str],
+    run_id: str, *, status: str, result: Optional[dict], error: Optional[str]
 ) -> dict:
     encoded = (
         _json(result, limit = MAX_HOOK_LOG_BYTES + 16 * 1024, label = "Hook result")
@@ -1328,11 +1339,7 @@ def normalize_schedule_cadence(cadence: Any) -> dict:
 
 
 def _valid_local_instant(
-    day: date,
-    *,
-    hour: int,
-    minute: int,
-    zone: ZoneInfo,
+    day: date, *, hour: int, minute: int, zone: ZoneInfo
 ) -> Optional[datetime]:
     naive = datetime.combine(day, datetime_time(hour = hour, minute = minute))
     aware = naive.replace(tzinfo = zone, fold = 0)
@@ -1555,9 +1562,7 @@ def update_schedule(
             payload = _loads(row["payload_json"], {}) if payload is _UNSET else payload,
             cadence = _loads(row["cadence_json"], {}) if cadence is _UNSET else cadence,
             timezone_name = row["timezone"] if timezone_name is _UNSET else timezone_name,
-            misfire_policy = (
-                row["misfire_policy"] if misfire_policy is _UNSET else misfire_policy
-            ),
+            misfire_policy = (row["misfire_policy"] if misfire_policy is _UNSET else misfire_policy),
         )
         is_enabled = bool(row["enabled"]) if enabled is _UNSET else bool(enabled)
         timing_changed = cadence is not _UNSET or timezone_name is not _UNSET
@@ -1710,7 +1715,11 @@ def reconcile_expired_schedule_leases(*, current_time_ms: Optional[int] = None) 
                     SET status = 'interrupted', error = ?, completed_at = ?
                     WHERE id = ? AND status = 'leased'
                     """,
-                    ("The schedule lease expired before reconciliation.", current, row["lease_run_id"]),
+                    (
+                        "The schedule lease expired before reconciliation.",
+                        current,
+                        row["lease_run_id"],
+                    ),
                 )
             conn.execute(
                 """
@@ -1765,7 +1774,11 @@ def lease_due_schedules(
                     SET status = 'interrupted', error = ?, completed_at = ?
                     WHERE id = ? AND status = 'leased'
                     """,
-                    ("The schedule lease expired before reconciliation.", current, row["lease_run_id"]),
+                    (
+                        "The schedule lease expired before reconciliation.",
+                        current,
+                        row["lease_run_id"],
+                    ),
                 )
             conn.execute(
                 """
@@ -1935,12 +1948,7 @@ def list_schedule_runs(project_id: str, *, limit: int = 100) -> list[dict]:
         conn.close()
 
 
-def _delete_revisioned(
-    table: str,
-    item_id: str,
-    expected_revision: int,
-    label: str,
-) -> bool:
+def _delete_revisioned(table: str, item_id: str, expected_revision: int, label: str) -> bool:
     if table not in {"agent_project_skills", "agent_lifecycle_hooks"}:
         raise AssertionError("Unsupported revisioned table.")
     expected = _validate_revision(expected_revision)

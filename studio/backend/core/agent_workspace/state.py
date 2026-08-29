@@ -1068,9 +1068,7 @@ def _normalized_delegation_policy(value: Optional[dict]) -> dict:
         "maxChildren": max_children,
         "maxParallelChildren": max_parallel,
         "maxDepth": max_depth,
-        "totalChildOutputTokens": bounded(
-            "totalChildOutputTokens", 32_768, 1, 262_144
-        ),
+        "totalChildOutputTokens": bounded("totalChildOutputTokens", 32_768, 1, 262_144),
         "totalChildToolCalls": bounded("totalChildToolCalls", 100, 1, 1_000),
         "totalChildWallSeconds": bounded("totalChildWallSeconds", 3_600, 1, 86_400),
     }
@@ -1161,7 +1159,9 @@ def create_agent_background_task(
             if not policy["enabled"]:
                 raise AgentWorkspaceError("Child-agent delegation is disabled for this task.")
             if parent_payload.get("workspaceMode") != "owned":
-                raise AgentWorkspaceError("Child-agent delegation requires an owned parent worktree.")
+                raise AgentWorkspaceError(
+                    "Child-agent delegation requires an owned parent worktree."
+                )
             normalized_role = str(delegation_role or "").strip().lower()
             if normalized_role not in _DELEGATION_ROLES:
                 raise AgentWorkspaceError("Child-agent role is invalid.")
@@ -1183,8 +1183,7 @@ def create_agent_background_task(
             if len(existing_children) >= int(policy["maxChildren"]):
                 raise AgentWorkspaceError("Child-agent count budget is exhausted.")
             live_children = sum(
-                row["status"] in {"queued", "running", "cancelling"}
-                for row in existing_children
+                row["status"] in {"queued", "running", "cancelling"} for row in existing_children
             )
             if live_children >= int(policy["maxParallelChildren"]):
                 raise AgentWorkspaceError("Child-agent parallel budget is exhausted.")
@@ -1199,8 +1198,7 @@ def create_agent_background_task(
                 "wallSeconds": int(policy["totalChildWallSeconds"]),
             }
             if any(
-                reserved[name] + int(normalized_budget[name]) > ceilings[name]
-                for name in ceilings
+                reserved[name] + int(normalized_budget[name]) > ceilings[name] for name in ceilings
             ):
                 raise AgentWorkspaceError("Child-agent resource budget is exhausted.")
             runtime_snapshot = parent_payload.get("runtime")

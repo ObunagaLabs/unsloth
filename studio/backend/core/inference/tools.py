@@ -10638,7 +10638,10 @@ MEMORY_READ_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Memory path, such as project/preferences.md."},
+                "path": {
+                    "type": "string",
+                    "description": "Memory path, such as project/preferences.md.",
+                },
             },
             "required": ["path"],
         },
@@ -10677,7 +10680,10 @@ MEMORY_UPDATE_TOOL = {
             "properties": {
                 "path": {"type": "string", "description": "Existing memory path."},
                 "content": {"type": "string", "description": "Replacement Markdown content."},
-                "expected_hash": {"type": "string", "description": "SHA-256 hash returned by memory_read."},
+                "expected_hash": {
+                    "type": "string",
+                    "description": "SHA-256 hash returned by memory_read.",
+                },
             },
             "required": ["path", "content", "expected_hash"],
         },
@@ -11007,9 +11013,7 @@ def project_memory_tools_enabled(session_id: "str | None") -> bool:
 
 
 def project_rule_for_tool_call(
-    session_id: "str | None",
-    name: str,
-    arguments: dict,
+    session_id: "str | None", name: str, arguments: dict
 ) -> "dict | None":
     """Resolve the persisted server-side rule for one project tool call."""
     project_id = _tool_project_id(session_id)
@@ -11017,7 +11021,6 @@ def project_rule_for_tool_call(
         return None
     try:
         from core.agent_workspace.project_automation import resolve_project_rule
-
         return resolve_project_rule(project_id, name, arguments)
     except Exception:  # noqa: BLE001 - policy lookup uncertainty fails closed below
         return {
@@ -11028,11 +11031,7 @@ def project_rule_for_tool_call(
 
 
 def _project_rule_rejection(
-    session_id: "str | None",
-    name: str,
-    arguments: dict,
-    *,
-    approved: bool,
+    session_id: "str | None", name: str, arguments: dict, *, approved: bool
 ) -> str:
     rule = project_rule_for_tool_call(session_id, name, arguments)
     if rule is None:
@@ -11196,7 +11195,6 @@ def _memory_tool_result(name: str, arguments: dict, session_id: "str | None") ->
             search_memory,
             write_memory_entry,
         )
-
         if name == "memory_search":
             query = arguments.get("query")
             if not isinstance(query, str) or not query.strip():

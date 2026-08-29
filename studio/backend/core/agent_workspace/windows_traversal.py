@@ -704,7 +704,12 @@ class WindowsVerifiedMutation:
         if self._closed:
             raise WindowsTraversalRejected("Windows project mutation is closed.")
 
-    def _assert_guard(self, guard: _MutationGuard, *, root: bool = False) -> None:
+    def _assert_guard(
+        self,
+        guard: _MutationGuard,
+        *,
+        root: bool = False,
+    ) -> None:
         info = self._ops.info(guard.handle)
         _assert_expected_handle(
             info,
@@ -727,9 +732,7 @@ class WindowsVerifiedMutation:
                 self.path,
                 directory = True,
             )
-            if not any(
-                identity in guard.identity_options for identity in current.identity_options
-            ):
+            if not any(identity in guard.identity_options for identity in current.identity_options):
                 message = (
                     "Project root identity changed."
                     if root
@@ -960,7 +963,11 @@ class WindowsVerifiedMutation:
         finally:
             self._ops.close(handle)
 
-    def create(self, payload: bytes, mode: int = 0o666) -> Optional[str]:
+    def create(
+        self,
+        payload: bytes,
+        mode: int = 0o666,
+    ) -> Optional[str]:
         del mode
         data = self._validate_payload(payload)
         guards = self._open_parent(create = True)
@@ -987,12 +994,7 @@ class WindowsVerifiedMutation:
             self._close_guards(guards)
 
     def replace(
-        self,
-        payload: bytes,
-        *,
-        expect: bytes,
-        mode: int,
-        identity: tuple[int, int],
+        self, payload: bytes, *, expect: bytes, mode: int, identity: tuple[int, int]
     ) -> Optional[str]:
         del mode
         data = self._validate_payload(payload)

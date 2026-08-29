@@ -93,8 +93,7 @@ def _budget(**updates) -> dict:
 
 
 def test_child_agents_have_real_lineage_inherited_runtime_and_completion_fence(
-    tmp_path,
-    monkeypatch,
+    tmp_path, monkeypatch
 ):
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -319,16 +318,12 @@ def test_delegation_tools_are_exposed_only_with_remaining_server_policy(tmp_path
             expected_root_identity = None,
             instruction = "Coordinate",
         )
-        names = {
-            tool["function"]["name"] for tool in _agent_tools(context, full_access = False)
-        }
+        names = {tool["function"]["name"] for tool in _agent_tools(context, full_access = False)}
         assert {"delegate_agent", "child_agent_status", "cancel_child_agent"} <= names
         assert "<child_agents>" in _agent_messages(context)[0]["content"]
 
         context.delegation_depth = 1
-        names = {
-            tool["function"]["name"] for tool in _agent_tools(context, full_access = False)
-        }
+        names = {tool["function"]["name"] for tool in _agent_tools(context, full_access = False)}
         assert "delegate_agent" not in names
         update_background_task(parent["id"], "cancelled")
     finally:
