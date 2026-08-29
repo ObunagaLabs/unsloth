@@ -473,6 +473,10 @@ class BackgroundTaskManager:
                 submit_error = exc
         if submit_error is not None:
             update_background_task(task_id, "failed", error = str(submit_error))
+            # Submission can fail after a parent was claimed while delegated
+            # children are already queued or running. Reuse the terminal-parent
+            # cancellation path so every descendant is durably fenced too.
+            self.cancel(task_id)
             raise submit_error
         future.add_done_callback(lambda _future: self._forget(task_id))
         return running
@@ -510,7 +514,16 @@ class BackgroundTaskManager:
                     result = self._cancelled_worktree_result(task, {})
                     update_background_task(task_id, "cancelled", result = result)
                 else:
+                    # A parent that fails while a delegated child is still live
+                    # must not leave that child running without its authority.
+                    # Persist the terminal parent state first, which fences any
+                    # new child admission, then cancel every descendant that was
+                    # already queued or running. Descendant cancellation is best
+                    # effort here, but each child is durably fenced before its
+                    # process event is signalled.
                     update_background_task(task_id, "failed", error = str(exc))
+                    for child in list_active_child_tasks(task_id):
+                        self.cancel(child["id"])
 
     def _run_verification(self, task_id: str, event: threading.Event) -> None:
         task = get_background_task(task_id)
@@ -554,30 +567,37 @@ class BackgroundTaskManager:
 
     def cancel(self, task_id: str) -> dict:
         # Children are independent workers but not independent authority. Stop
-        # descendants before the parent can settle or release its worktree.
-        for child in list_active_child_tasks(task_id):
-            self.cancel(child["id"])
+        # descendants before the parent can settle or release its worktree. Fence
+        # the parent first so a concurrent child admission cannot slip between
+        # the child listing and the cancellation transition.
+        queued_cancelled: Optional[dict] = None
         with self._lock:
             task = get_background_task(task_id)
             if task is None:
                 raise AgentWorkspaceError("Background task not found.")
             if task["status"] == "queued":
-                cancelled = (
+                queued_cancelled = (
                     update_background_task(task_id, "cancelled", cancel_requested = True) or task
                 )
-                if task["kind"] == "agent":
-                    result = self._cancelled_worktree_result(task, {})
-                    cancelled = (
-                        update_background_task(task_id, "cancelled", result = result) or cancelled
-                    )
-                return cancelled
-            if task["status"] not in {"running", "cancelling"}:
-                return task
-            if task["status"] == "running":
-                task = update_background_task(task_id, "cancelling", cancel_requested = True) or task
-            event = self._cancellations.get(task_id)
-            if event is not None:
-                event.set()
+            elif task["status"] in {"running", "cancelling"}:
+                if task["status"] == "running":
+                    task = update_background_task(task_id, "cancelling", cancel_requested = True) or task
+                event = self._cancellations.get(task_id)
+                if event is not None:
+                    event.set()
+
+        for child in list_active_child_tasks(task_id):
+            self.cancel(child["id"])
+
+        if queued_cancelled is not None:
+            if task["kind"] == "agent":
+                result = self._cancelled_worktree_result(task, {})
+                queued_cancelled = (
+                    update_background_task(task_id, "cancelled", result = result)
+                    or queued_cancelled
+                )
+            return queued_cancelled
+
         return task
 
     @staticmethod

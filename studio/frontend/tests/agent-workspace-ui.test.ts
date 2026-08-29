@@ -108,6 +108,15 @@ test("background agent and guarded merge requests match the backend contract", (
       planTaskId: "task-1",
       worktreeId: "worktree/one",
       cleanupWorktreeOnCancel: true,
+      delegationPolicy: {
+        enabled: false,
+        maxChildren: 4,
+        maxParallelChildren: 2,
+        maxDepth: 1,
+        totalChildOutputTokens: 32_768,
+        totalChildToolCalls: 100,
+        totalChildWallSeconds: 3_600,
+      },
       start: false,
     }),
   });

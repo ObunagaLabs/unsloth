@@ -107,6 +107,7 @@ def test_background_relevance_isolates_sibling_instruction_scopes(tmp_path):
 
     def context(instruction: str):
         return SimpleNamespace(
+            task_id = "agent-task-test",
             project_id = "project",
             cwd = workspace,
             instruction = instruction,
@@ -114,6 +115,9 @@ def test_background_relevance_isolates_sibling_instruction_scopes(tmp_path):
             goal_snapshot = "Ship the task",
             goal_status_snapshot = "active",
             plan_snapshot = None,
+            delegation_role = None,
+            delegation_depth = 0,
+            delegation_budget = None,
         )
 
     targeted = background_inference._agent_messages(context("Update src/worker.py"))[0]["content"]
@@ -251,6 +255,8 @@ def test_provider_routing_and_codex_account_bindings_reject_drift(monkeypatch):
                 [],
                 "agent-task-test",
                 threading.Event(),
+                max_tool_calls = 25,
+                tool_timeout = 300,
             )
         )
 
@@ -292,6 +298,8 @@ def test_external_provider_task_rejects_credential_replacement_before_egress(mon
                 [],
                 "agent-task-test",
                 threading.Event(),
+                max_tool_calls = 25,
+                tool_timeout = 300,
             )
         )
 

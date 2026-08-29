@@ -2,6 +2,7 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from core.agent_workspace.background import BackgroundTaskManager
 from core.agent_workspace.common import AgentWorkspaceError
 from core.agent_workspace.inference_executor import _agent_messages, _agent_tools
 from core.agent_workspace.state import (
+    get_background_task,
     get_worktree,
     list_background_task_tree,
     update_background_task,
@@ -145,6 +147,8 @@ def test_child_agents_have_real_lineage_inherited_runtime_and_completion_fence(
         assert retried["delegationBudget"] == child["delegationBudget"]
         update_background_task(retried["id"], "cancelled")
         update_background_task(parent["id"], "completed", result = {"output": "done"})
+        with pytest.raises(AgentWorkspaceError, match = "parent agent is no longer active"):
+            manager.retry(retried["id"], start = False)
 
         tree = list_background_task_tree("project", retried["id"])
         assert tree["rootTaskId"] == parent["id"]
@@ -205,6 +209,85 @@ def test_delegation_budgets_are_reserved_atomically(tmp_path, monkeypatch):
 
     cleanup_worktree("project", blocked_worktree["id"])
     cleanup_worktree("project", first_worktree["id"])
+    cleanup_worktree("project", parent_worktree["id"])
+
+
+def test_cancelling_parent_cannot_admit_a_new_child(tmp_path, monkeypatch):
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _project(repository)
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "worktrees"))
+    parent_worktree = create_worktree("project")
+    child_worktree = create_worktree("project")
+    manager = BackgroundTaskManager(max_workers = 1)
+    try:
+        parent = manager.enqueue_agent(
+            "project",
+            "Coordinate",
+            runtime_selection = _runtime(),
+            worktree_id = parent_worktree["id"],
+            delegation_policy = _policy(),
+            start = False,
+        )
+        update_background_task(parent["id"], "running")
+        update_background_task(parent["id"], "cancelling")
+        with pytest.raises(AgentWorkspaceError, match = "active agent"):
+            manager.enqueue_child_agent(
+                "project",
+                parent["id"],
+                "Late child",
+                role = "explorer",
+                budget = _budget(),
+                worktree_id = child_worktree["id"],
+                start = False,
+            )
+        assert get_worktree(child_worktree["id"])["backgroundTaskId"] is None
+        update_background_task(parent["id"], "cancelled")
+    finally:
+        manager._executor.shutdown(wait = True)
+    cleanup_worktree("project", child_worktree["id"])
+    cleanup_worktree("project", parent_worktree["id"])
+
+
+def test_parent_failure_cancels_active_children(tmp_path, monkeypatch):
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _project(repository)
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "worktrees"))
+    parent_worktree = create_worktree("project")
+    child_worktree = create_worktree("project")
+    manager = BackgroundTaskManager(max_workers = 1)
+    try:
+        parent = manager.enqueue_agent(
+            "project",
+            "Coordinate",
+            runtime_selection = _runtime(),
+            worktree_id = parent_worktree["id"],
+            delegation_policy = _policy(),
+            start = False,
+        )
+        child = manager.enqueue_child_agent(
+            "project",
+            parent["id"],
+            "Inspect",
+            role = "explorer",
+            budget = _budget(),
+            worktree_id = child_worktree["id"],
+            start = False,
+        )
+        update_background_task(parent["id"], "running")
+
+        manager._run_agent(
+            parent["id"],
+            threading.Event(),
+            lambda _context, _event: {},
+        )
+
+        assert get_background_task(parent["id"])["status"] == "failed"
+        assert get_background_task(child["id"])["status"] == "cancelled"
+    finally:
+        manager._executor.shutdown(wait = True)
+    cleanup_worktree("project", child_worktree["id"])
     cleanup_worktree("project", parent_worktree["id"])
 
 

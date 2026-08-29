@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from auth.authentication import authenticated_via_api_key, get_current_subject
+import core.agent_workspace.background as background_module
 from core.agent_workspace.background import BackgroundTaskManager
 from core.agent_workspace.common import AgentWorkspaceError, workspace_fingerprint
 from core.agent_workspace.state import (
@@ -21,6 +22,7 @@ from core.agent_workspace.state import (
     get_plan,
     get_worktree,
     set_verification_config,
+    update_background_task,
     update_plan_task,
 )
 from core.agent_workspace.worktrees import (
@@ -264,6 +266,78 @@ def test_app_exit_marks_uncooperative_active_agent_interrupted(tmp_path):
         "managedCommandsSurvive": False,
         "adapterMustHonorCancellation": True,
     }
+
+
+def test_cancel_fences_parent_before_listing_children(tmp_path, monkeypatch):
+    _folder_project(tmp_path)
+    manager = BackgroundTaskManager(max_workers = 1)
+    task = manager.enqueue_agent("project", "coordinate", start = False)
+    update_background_task(task["id"], "running")
+    observed_statuses = []
+
+    def list_children(task_id):
+        observed_statuses.append(get_background_task(task_id)["status"])
+        return []
+
+    monkeypatch.setattr(background_module, "list_active_child_tasks", list_children)
+    try:
+        cancelled = manager.cancel(task["id"])
+        assert cancelled["status"] == "cancelling"
+        assert observed_statuses == ["cancelling"]
+        update_background_task(task["id"], "cancelled")
+    finally:
+        manager._executor.shutdown(wait = True)
+
+
+def test_start_submission_failure_cancels_queued_descendants(tmp_path, monkeypatch):
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _repository(repository)
+    _folder_project(repository)
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "studio-projects"))
+    parent_worktree = create_worktree("project")
+    child_worktree = create_worktree("project")
+    manager = BackgroundTaskManager(max_workers = 1)
+    manager.register_agent_executor(lambda _context, _cancel: {})
+
+    try:
+        parent = manager.enqueue_agent(
+            "project",
+            "parent",
+            worktree_id = parent_worktree["id"],
+            delegation_policy = {"enabled": True},
+            start = False,
+        )
+        child = manager.enqueue_child_agent(
+            "project",
+            parent["id"],
+            "child",
+            role = "implementer",
+            budget = {
+                "maxOutputTokens": 100,
+                "maxToolCalls": 1,
+                "wallSeconds": 1,
+            },
+            worktree_id = child_worktree["id"],
+            start = False,
+        )
+
+        def fail_submit(*_args, **_kwargs):
+            raise RuntimeError("executor unavailable")
+
+        monkeypatch.setattr(manager._executor, "submit", fail_submit)
+        with pytest.raises(RuntimeError, match = "executor unavailable"):
+            manager.start(parent["id"])
+
+        failed_parent = get_background_task(parent["id"])
+        cancelled_child = get_background_task(child["id"])
+        assert failed_parent["status"] == "failed"
+        assert cancelled_child["status"] == "cancelled"
+        assert cancelled_child["cancelRequested"] is True
+    finally:
+        manager._executor.shutdown(wait = True)
+        cleanup_worktree("project", child_worktree["id"])
+        cleanup_worktree("project", parent_worktree["id"])
 
 
 def test_agent_start_requires_registered_adapter_without_claiming(tmp_path):

@@ -230,6 +230,22 @@ def test_git_operations_do_not_execute_repository_configured_commands(tmp_path, 
     _assert_commands_not_executed(markers)
 
 
+def test_git_process_ignores_caller_path(monkeypatch, tmp_path):
+    attacker = tmp_path / "git"
+    attacker.write_text("#!/bin/sh\nexit 0\n", encoding = "utf-8")
+    attacker.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert git_service_module._trusted_git_executable() != attacker
+    assert Path(git_service_module._base_git_arguments()[0]) != attacker
+
+
+def test_git_processes_fail_closed_on_windows(monkeypatch):
+    fake_os = type("WindowsOnlyOS", (), {"name": "nt"})()
+    monkeypatch.setattr(git_service_module, "os", fake_os)
+    with pytest.raises(AgentWorkspaceError, match = "Windows"):
+        git_service_module._run_git(Path.cwd(), ["status"])
+
+
 def test_verification_fingerprint_neutralizes_repository_executable_config(tmp_path):
     repository = tmp_path / "repo"
     commands = tmp_path / "configured-commands"

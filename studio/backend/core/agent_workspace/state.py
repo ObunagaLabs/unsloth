@@ -246,6 +246,28 @@ def _ensure_state_schema(conn: sqlite3.Connection) -> None:
             """,
             (current, current),
         )
+        # A crash can happen after a parent is durably cancelled but before the
+        # manager enumerates its descendants. Do not leave queued descendants
+        # runnable under a terminal parent on the next process.
+        conn.execute(
+            """
+            WITH RECURSIVE terminal_tree(id) AS (
+                SELECT id
+                FROM agent_background_tasks
+                WHERE status IN ('cancelled', 'completed', 'failed', 'interrupted')
+                UNION
+                SELECT child.id
+                FROM agent_background_tasks AS child
+                JOIN terminal_tree AS parent ON parent.id = child.parent_task_id
+            )
+            UPDATE agent_background_tasks
+            SET status = 'cancelled', updated_at = ?, completed_at = ?,
+                cancel_requested = 1,
+                error = COALESCE(error, 'Parent task stopped before this child could run.')
+            WHERE status = 'queued' AND id IN (SELECT id FROM terminal_tree)
+            """,
+            (current, current),
+        )
         conn.commit()
         _READY_DATABASES.add(key)
 
@@ -1132,7 +1154,7 @@ def create_agent_background_task(
             ).fetchone()
             if parent is None or parent["kind"] != "agent":
                 raise AgentWorkspaceError("Parent agent task not found.")
-            if parent["status"] not in {"queued", "running", "cancelling"}:
+            if parent["status"] not in {"queued", "running"}:
                 raise AgentWorkspaceError("Only an active agent can delegate child work.")
             parent_payload = _loads(parent["payload_json"], {})
             policy = _normalized_delegation_policy(parent_payload.get("delegationPolicy"))
@@ -1412,7 +1434,7 @@ def claim_background_task(task_id: str) -> Optional[dict]:
         conn.execute("BEGIN IMMEDIATE")
         task = conn.execute(
             """
-            SELECT id, project_id, kind, status, worktree_id
+            SELECT id, project_id, kind, status, worktree_id, parent_task_id
             FROM agent_background_tasks WHERE id = ?
             """,
             (task_id,),
@@ -1422,6 +1444,29 @@ def claim_background_task(task_id: str) -> Optional[dict]:
             return None
         if task["status"] != "queued":
             raise AgentWorkspaceError("Only an unclaimed queued background task can be started.")
+        if task["parent_task_id"] is not None:
+            parent = conn.execute(
+                "SELECT kind, status, project_id FROM agent_background_tasks WHERE id = ?",
+                (task["parent_task_id"],),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["kind"] != "agent"
+                or parent["project_id"] != task["project_id"]
+                or parent["status"] not in {"queued", "running"}
+            ):
+                conn.execute(
+                    """
+                    UPDATE agent_background_tasks
+                    SET status = 'cancelled', updated_at = ?, completed_at = ?,
+                        cancel_requested = 1,
+                        error = COALESCE(error, 'Parent task stopped before this child could run.')
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (current, current, task_id),
+                )
+                conn.commit()
+                raise AgentWorkspaceError("The parent agent is no longer active.")
         if task["worktree_id"] is not None:
             worktree = conn.execute(
                 """
@@ -1579,6 +1624,19 @@ def retry_background_task(task_id: str) -> dict:
             raise AgentWorkspaceError("Background task not found.")
         if previous["status"] not in {"failed", "cancelled", "interrupted"}:
             raise AgentWorkspaceError("Only stopped background tasks can be retried.")
+        parent_task_id = previous["parent_task_id"]
+        if parent_task_id is not None:
+            parent = conn.execute(
+                "SELECT kind, status, project_id FROM agent_background_tasks WHERE id = ?",
+                (parent_task_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["kind"] != "agent"
+                or parent["project_id"] != previous["project_id"]
+                or parent["status"] not in {"queued", "running"}
+            ):
+                raise AgentWorkspaceError("The parent agent is no longer active.")
         worktree_id = previous["worktree_id"]
         if worktree_id is not None:
             worktree = conn.execute(

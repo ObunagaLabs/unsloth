@@ -306,6 +306,15 @@ test("real background API sends an explicit credential-free provider runtime", a
           },
           start: true,
           cleanupWorktreeOnCancel: false,
+          delegationPolicy: {
+            enabled: false,
+            maxChildren: 4,
+            maxParallelChildren: 2,
+            maxDepth: 1,
+            totalChildOutputTokens: 32_768,
+            totalChildToolCalls: 100,
+            totalChildWallSeconds: 3_600,
+          },
         },
       },
     ]);

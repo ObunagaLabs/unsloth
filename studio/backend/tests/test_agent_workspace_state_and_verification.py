@@ -26,6 +26,7 @@ from core.agent_workspace.common import (
 )
 from core.agent_workspace.state import (
     begin_verification_run,
+    claim_background_task,
     create_background_task,
     create_plan,
     finish_verification_run,
@@ -904,6 +905,61 @@ def test_restart_recovery_interrupts_running_but_preserves_queued(tmp_path):
 
     assert get_background_task(queued["id"])["status"] == "queued"
     assert get_background_task(running["id"])["status"] == "interrupted"
+
+
+def test_restart_recovery_cancels_queued_descendants_of_terminal_parent(tmp_path):
+    _folder_project(tmp_path)
+    parent = create_background_task("project", "agent", {})
+    child = create_background_task(
+        "project",
+        "agent",
+        {},
+        parent_task_id = parent["id"],
+        root_task_id = parent["id"],
+    )
+    grandchild = create_background_task(
+        "project",
+        "agent",
+        {},
+        parent_task_id = child["id"],
+        root_task_id = parent["id"],
+    )
+    update_background_task(parent["id"], "cancelled")
+
+    conn = state.connection()
+    try:
+        key = state._database_key(conn)
+    finally:
+        conn.close()
+    state._READY_DATABASES.discard(key)
+    conn = state.connection()
+    conn.close()
+
+    for task in (child, grandchild):
+        recovered = get_background_task(task["id"])
+        assert recovered["status"] == "cancelled"
+        assert recovered["cancelRequested"] is True
+        assert recovered["error"] == "Parent task stopped before this child could run."
+
+
+def test_start_rejects_and_cancels_queued_child_of_terminal_parent(tmp_path):
+    _folder_project(tmp_path)
+    parent = create_background_task("project", "agent", {})
+    child = create_background_task(
+        "project",
+        "agent",
+        {},
+        parent_task_id = parent["id"],
+        root_task_id = parent["id"],
+    )
+    update_background_task(parent["id"], "cancelled")
+
+    with pytest.raises(AgentWorkspaceError, match = "parent agent is no longer active"):
+        claim_background_task(child["id"])
+
+    recovered = get_background_task(child["id"])
+    assert recovered["status"] == "cancelled"
+    assert recovered["cancelRequested"] is True
 
 
 def test_terminal_background_state_rejects_late_worker_update(tmp_path):

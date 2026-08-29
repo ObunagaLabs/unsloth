@@ -141,6 +141,25 @@ def _empty_git_config_path() -> Path:
     return config
 
 
+def _trusted_git_executable() -> Path:
+    """Resolve Git from the host default path, never the caller's PATH."""
+    if os.name == "nt":
+        raise AgentWorkspaceError(
+            "Secure Git operations are disabled on Windows until a boundary test passes."
+        )
+    raw = shutil.which("git", path = os.defpath)
+    if not raw:
+        raise AgentWorkspaceError("A trusted system Git executable is unavailable.")
+    try:
+        executable = Path(raw).resolve(strict = True)
+        metadata = executable.stat(follow_symlinks = False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AgentWorkspaceError("A trusted system Git executable is unavailable.") from exc
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(executable, os.X_OK):
+        raise AgentWorkspaceError("A trusted system Git executable is unavailable.")
+    return executable
+
+
 def _safe_git_environment(root: Path, env: Optional[dict] = None) -> dict:
     """Build a Git environment that cannot inherit executable user settings."""
     safe = agent_child_env(root)
@@ -180,7 +199,7 @@ def _safe_git_environment(root: Path, env: Optional[dict] = None) -> dict:
 def _base_git_arguments() -> list[str]:
     hooks = _disabled_hooks_path()
     return [
-        "git",
+        str(_trusted_git_executable()),
         "--no-pager",
         "-c",
         f"core.hooksPath={hooks}",
@@ -220,6 +239,10 @@ def _run_git(
     env: Optional[dict] = None,
     config_overrides: Optional[list[str]] = None,
 ) -> tuple[int, str, bool]:
+    if os.name == "nt":
+        raise AgentWorkspaceError(
+            "Secure Git operations are disabled on Windows until a boundary test passes."
+        )
     command = _base_git_arguments()
     command.extend(config_overrides or [])
     command.extend(args)
