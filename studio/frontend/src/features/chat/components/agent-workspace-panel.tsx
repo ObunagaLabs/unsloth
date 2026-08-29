@@ -117,6 +117,7 @@ import {
   reconcileAgentBackgroundMutation,
   safeAgentWorkspaceError,
 } from "./agent-workspace-state";
+import { AgentGraphsPanel } from "./agent-graphs-panel";
 
 const MAP_PATH_LIMIT = 20_000;
 const MAP_BYTE_LIMIT = 2 * 1024 * 1024;
@@ -2189,6 +2190,10 @@ export function AgentWorkspacePanel({
                 ) : null}
               </div>
             </AgentSection>
+          ) : null}
+
+          {workspace?.capabilities.graphs ? (
+            <AgentGraphsPanel projectId={projectId} />
           ) : null}
 
           {workspace?.capabilities.background ? (

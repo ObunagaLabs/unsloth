@@ -746,8 +746,10 @@ async def lifespan(app: FastAPI):
     init_key_pair()
     from core.agent_workspace.background import register_agent_executor
     from core.agent_workspace.inference_executor import execute_background_agent
+    from core.agent_workspace.graphs import recover_graph_runs
 
     register_agent_executor(execute_background_agent)
+    recover_graph_runs()
     _lifespan_log.info(
         "lifespan pre-auth setup completed in %.1fms",
         (_time.perf_counter() - _lifespan_started) * 1000,
@@ -806,6 +808,11 @@ async def lifespan(app: FastAPI):
     # Stop project-agent work before inference and child-process teardown. Managed
     # CLI adapters receive cancellation and terminate their process trees; any
     # adapter that misses the bounded shutdown window is persisted as interrupted.
+    try:
+        from core.agent_workspace.graphs import manager as graph_manager
+        graph_manager.prepare_for_app_exit(timeout_seconds = 10)
+    except Exception as exc:
+        _lifespan_log.warning("project graph shutdown failed: %s", exc)
     try:
         from core.agent_workspace.background import manager as agent_background_manager
         agent_background_manager.prepare_for_app_exit(timeout_seconds = 10)

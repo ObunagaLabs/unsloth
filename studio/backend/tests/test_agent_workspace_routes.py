@@ -113,6 +113,9 @@ def test_unavailable_workspace_has_stable_false_capabilities(tmp_path):
         "git": False,
         "worktrees": False,
         "review": False,
+        "memory": False,
+        "dreaming": False,
+        "graphs": False,
     }
 
 

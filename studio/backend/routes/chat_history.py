@@ -30,6 +30,7 @@ from pydantic import (
 
 from auth.authentication import get_current_subject
 from core.agent_workspace.background import manager as agent_background_manager
+from core.agent_workspace.graphs import manager as agent_graph_manager
 from core.agent_workspace.common import AgentWorkspaceError, project_workspace
 from core.agent_workspace.project_context import (
     fence_project_context_snapshots_for_deletion,
@@ -1510,14 +1511,21 @@ async def delete_project(
     except AgentWorkspaceError as exc:
         raise HTTPException(status_code = 409, detail = str(exc)) from exc
     try:
+        await run_in_threadpool(agent_graph_manager.begin_project_deletion, project_id)
+    except AgentWorkspaceError as exc:
+        await run_in_threadpool(agent_background_manager.finish_project_deletion, project_id)
+        raise HTTPException(status_code = 409, detail = str(exc)) from exc
+    try:
         await run_in_threadpool(begin_verification_project_deletion, project_id)
     except AgentWorkspaceError as exc:
+        await run_in_threadpool(agent_graph_manager.finish_project_deletion, project_id)
         await run_in_threadpool(agent_background_manager.finish_project_deletion, project_id)
         raise HTTPException(status_code = 409, detail = str(exc)) from exc
     try:
         await run_in_threadpool(begin_checkpoint_project_deletion, project_id)
     except AgentWorkspaceError as exc:
         await run_in_threadpool(finish_verification_project_deletion, project_id)
+        await run_in_threadpool(agent_graph_manager.finish_project_deletion, project_id)
         await run_in_threadpool(agent_background_manager.finish_project_deletion, project_id)
         raise HTTPException(status_code = 409, detail = str(exc)) from exc
     try:
@@ -1525,6 +1533,7 @@ async def delete_project(
     except AgentWorkspaceError as exc:
         await run_in_threadpool(finish_checkpoint_project_deletion, project_id)
         await run_in_threadpool(finish_verification_project_deletion, project_id)
+        await run_in_threadpool(agent_graph_manager.finish_project_deletion, project_id)
         await run_in_threadpool(agent_background_manager.finish_project_deletion, project_id)
         raise HTTPException(status_code = 409, detail = str(exc)) from exc
     try:
@@ -1541,6 +1550,10 @@ async def delete_project(
         stop_results = await asyncio.gather(
             run_in_threadpool(
                 agent_background_manager.cancel_project_tasks_and_wait,
+                project_id,
+            ),
+            run_in_threadpool(
+                agent_graph_manager.cancel_project_runs_and_wait,
                 project_id,
             ),
             run_in_threadpool(cancel_project_verifications_and_wait, project_id),
@@ -1592,6 +1605,7 @@ async def delete_project(
         await run_in_threadpool(finish_worktree_project_deletion, project_id)
         await run_in_threadpool(finish_checkpoint_project_deletion, project_id)
         await run_in_threadpool(finish_verification_project_deletion, project_id)
+        await run_in_threadpool(agent_graph_manager.finish_project_deletion, project_id)
         await run_in_threadpool(agent_background_manager.finish_project_deletion, project_id)
     if project is None:
         raise HTTPException(

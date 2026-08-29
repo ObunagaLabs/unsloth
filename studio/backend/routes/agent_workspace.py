@@ -31,6 +31,22 @@ from core.agent_workspace.github_handoff import (
     prepare_pull_request_handoff,
     pull_request_review_binding_current,
 )
+from core.agent_workspace.graphs import (
+    create_graph,
+    delete_graph,
+    decide_graph_approval,
+    get_graph,
+    get_graph_approval,
+    get_graph_revision,
+    get_graph_run,
+    list_graph_events,
+    list_graph_approvals,
+    list_graph_runs,
+    list_graphs,
+    list_node_executions,
+    manager as graph_manager,
+    update_graph,
+)
 from core.agent_workspace.instructions import (
     resolve_agents_instructions,
     secure_instruction_traversal_supported,
@@ -205,6 +221,51 @@ def _require_execution_boundary() -> None:
         raise AgentWorkspaceError(
             status.reason or "Project command execution is unavailable on this host."
         )
+
+
+def _public_graph_value(value: Any) -> Any:
+    """Apply the same bounded path and secret redaction used by workspace results."""
+    return _redact_background_value(value)
+
+
+def _public_graph_run(run: dict) -> dict:
+    return _public_graph_value(run)
+
+
+def _graph_for_project(project_id: str, graph_id: str) -> dict:
+    graph = get_graph(project_id, graph_id)
+    if graph is None:
+        raise HTTPException(status_code = 404, detail = "Graph not found.")
+    return graph
+
+
+def _run_for_project(project_id: str, run_id: str) -> dict:
+    run = get_graph_run(project_id, run_id)
+    if run is None:
+        raise HTTPException(status_code = 404, detail = "Graph run not found.")
+    return run
+
+
+def _graph_requires_execution(graph: dict, revision: Optional[int] = None) -> bool:
+    document = get_graph_revision(graph["projectId"], graph["id"], revision)
+    if document is None:
+        raise HTTPException(status_code = 404, detail = "Graph revision not found.")
+    return any(node["type"] in {"loop", "model"} for node in document["nodes"])
+
+
+def _require_graph_provider_session(project_id: str, graph_id: str, revision: Optional[int], via_api_key: bool) -> None:
+    document = get_graph_revision(project_id, graph_id, revision)
+    if document is None:
+        raise HTTPException(status_code = 404, detail = "Graph revision not found.")
+    if any(
+        node["type"] == "tool"
+        or (
+            node["type"] in {"loop", "model"}
+            and (node["config"].get("runtime") or {}).get("kind") == "provider"
+        )
+        for node in document["nodes"]
+    ):
+        require_ui_session(via_api_key)
 
 
 async def _github_connector_tools(server_id: str) -> tuple[dict, list[dict]]:
@@ -407,6 +468,39 @@ class BackgroundAgentRequest(BaseModel):
     start: bool = True
 
 
+class GraphCreateRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    name: str = Field(min_length = 1, max_length = 200)
+    description: str = Field(default = "", max_length = 4000)
+    metadata: dict[str, Any] = Field(default_factory = dict)
+    inputSchema: dict[str, Any] = Field(default_factory = lambda: {"type": "object"})
+    outputSchema: dict[str, Any] = Field(default_factory = lambda: {"type": "object"})
+    nodes: list[dict[str, Any]] = Field(min_length = 1, max_length = 100)
+    edges: list[dict[str, Any]] = Field(default_factory = list, max_length = 200)
+    permissions: dict[str, Any] = Field(default_factory = dict)
+    limits: dict[str, Any] = Field(default_factory = dict)
+
+
+class GraphPatchRequest(GraphCreateRequest):
+    expectedRevision: int = Field(ge = 1)
+
+
+class GraphRunRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    input: dict[str, Any] = Field(default_factory = dict)
+    revision: Optional[int] = Field(default = None, ge = 1)
+    idempotencyKey: Optional[str] = Field(default = None, max_length = 256)
+    start: bool = True
+
+
+class GraphApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    decision: Literal["approved", "rejected"]
+
+
 class ChildAgentRequest(BaseModel):
     model_config = ConfigDict(extra = "forbid")
 
@@ -474,6 +568,7 @@ def workspace_capabilities(
         "review": False,
         "memory": False,
         "dreaming": False,
+        "graphs": False,
     }
     try:
         workspace = project_workspace(project_id)
@@ -516,8 +611,224 @@ def workspace_capabilities(
             "review": True,
             "memory": True,
             "dreaming": True,
+            "graphs": True,
         },
     }
+
+
+@router.post("/projects/{project_id}/graphs")
+def save_graph(
+    project_id: str,
+    payload: GraphCreateRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        return _public_graph_value(
+            create_graph(project_id, payload.model_dump(exclude_none = True))
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/graphs")
+def project_graphs(project_id: str, current_subject: str = Depends(get_current_subject)) -> dict:
+    _project(project_id)
+    return {"graphs": _public_graph_value(list_graphs(project_id))}
+
+
+@router.get("/projects/{project_id}/graphs/{graph_id}")
+def project_graph(
+    project_id: str,
+    graph_id: str,
+    revision: Optional[int] = Query(default = None, ge = 1),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    graph = _graph_for_project(project_id, graph_id)
+    document = get_graph_revision(project_id, graph_id, revision)
+    if document is None:
+        raise HTTPException(status_code = 404, detail = "Graph revision not found.")
+    return _public_graph_value({"graph": graph, "revision": document})
+
+
+@router.put("/projects/{project_id}/graphs/{graph_id}")
+def patch_graph(
+    project_id: str,
+    graph_id: str,
+    payload: GraphPatchRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _graph_for_project(project_id, graph_id)
+    try:
+        document = payload.model_dump(exclude = {"expectedRevision"}, exclude_none = True)
+        return _public_graph_value(
+            update_graph(
+                project_id,
+                graph_id,
+                document,
+                expected_revision = payload.expectedRevision,
+            )
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.delete("/projects/{project_id}/graphs/{graph_id}")
+def remove_graph(
+    project_id: str,
+    graph_id: str,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _graph_for_project(project_id, graph_id)
+    try:
+        delete_graph(project_id, graph_id)
+        return {"deleted": True}
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/graphs/{graph_id}/runs")
+def start_graph_run(
+    project_id: str,
+    graph_id: str,
+    payload: GraphRunRequest,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+) -> dict:
+    graph = _graph_for_project(project_id, graph_id)
+    _require_graph_provider_session(project_id, graph_id, payload.revision, via_api_key)
+    try:
+        if _graph_requires_execution(graph, payload.revision):
+            _require_execution_boundary()
+        return _public_graph_run(
+            graph_manager.enqueue(
+                project_id,
+                graph_id,
+                payload.input,
+                revision = payload.revision,
+                idempotency_key = payload.idempotencyKey,
+                start = payload.start,
+            )
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/graphs/{graph_id}/runs")
+def graph_runs(
+    project_id: str,
+    graph_id: str,
+    limit: int = Query(default = 100, ge = 1, le = 500),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _graph_for_project(project_id, graph_id)
+    return {"runs": _public_graph_value(list_graph_runs(project_id, graph_id, limit))}
+
+
+@router.get("/projects/{project_id}/graph-runs/{run_id}")
+def graph_run(
+    project_id: str,
+    run_id: str,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    run = _run_for_project(project_id, run_id)
+    return _public_graph_value(
+        {
+            "run": run,
+            "nodes": list_node_executions(project_id, run_id),
+            "approvals": list_graph_approvals(project_id, run_id),
+        }
+    )
+
+
+@router.get("/projects/{project_id}/graph-runs/{run_id}/events")
+def graph_run_events(
+    project_id: str,
+    run_id: str,
+    after: int = Query(default = 0, ge = 0),
+    limit: int = Query(default = 500, ge = 1, le = 1000),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _run_for_project(project_id, run_id)
+    return {"events": _public_graph_value(list_graph_events(project_id, run_id, after, limit))}
+
+
+@router.post("/projects/{project_id}/graph-runs/{run_id}/pause")
+def pause_graph_run(
+    project_id: str,
+    run_id: str,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _run_for_project(project_id, run_id)
+    try:
+        return _public_graph_run(graph_manager.pause(run_id))
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/graph-runs/{run_id}/resume")
+def resume_graph_run(
+    project_id: str,
+    run_id: str,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+) -> dict:
+    run = _run_for_project(project_id, run_id)
+    _require_graph_provider_session(project_id, run["graphId"], run["revision"], via_api_key)
+    try:
+        if _graph_requires_execution(
+            _graph_for_project(project_id, run["graphId"]), run["revision"]
+        ):
+            _require_execution_boundary()
+        return _public_graph_run(graph_manager.resume(run_id))
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/graph-runs/{run_id}/cancel")
+def cancel_graph_run(
+    project_id: str,
+    run_id: str,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _run_for_project(project_id, run_id)
+    try:
+        return _public_graph_run(graph_manager.cancel(run_id))
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/graph-runs/{run_id}/retry")
+def retry_graph_run(
+    project_id: str,
+    run_id: str,
+    start: bool = Query(default = True),
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+) -> dict:
+    run = _run_for_project(project_id, run_id)
+    _require_graph_provider_session(project_id, run["graphId"], run["revision"], via_api_key)
+    try:
+        return _public_graph_run(graph_manager.retry(project_id, run_id, start = start))
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/graph-runs/{run_id}/approvals/{approval_id}")
+def decide_graph_run_approval(
+    project_id: str,
+    run_id: str,
+    approval_id: str,
+    payload: GraphApprovalRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _run_for_project(project_id, run_id)
+    try:
+        return _public_graph_value(
+            decide_graph_approval(project_id, run_id, approval_id, payload.decision)
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
 
 
 @router.post("/projects/{project_id}/context-snapshots")
