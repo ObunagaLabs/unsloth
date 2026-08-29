@@ -4101,6 +4101,7 @@ export function ChatPage({
                 <TooltipPrimitive.Trigger asChild={true}>
                   <button
                     type="button"
+                    data-chat-settings-open-trigger
                     onClick={() => {
                       useResearchRunStore.getState().closePanel();
                       setSettingsOpen(true);

@@ -2204,6 +2204,7 @@ export function SharedComposer({
       )}
       <textarea
         ref={textareaRef}
+        aria-label="Message"
         value={text}
         onChange={(e) => {
           // ALWAYS mirror the DOM value into React state, even during IME
