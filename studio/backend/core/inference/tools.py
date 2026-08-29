@@ -4565,7 +4565,14 @@ def _render_html_reaches_network(arguments: dict) -> bool:
 # only reports that the user's own armed research is starting, and without it here
 # is_high_risk_tool_call's unknown-name default would prompt on every handoff.
 _ALWAYS_SAFE_TOOLS = frozenset(
-    {"web_search", "search_knowledge_base", "search_conversation", "deep_research"}
+    {
+        "web_search",
+        "search_knowledge_base",
+        "search_conversation",
+        "deep_research",
+        "memory_search",
+        "memory_read",
+    }
 )
 
 
@@ -10584,6 +10591,79 @@ SEARCH_CONVERSATION_TOOL = {
     },
 }
 
+MEMORY_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "memory_search",
+        "description": (
+            "Search durable project Markdown memory for relevant notes. Memory is project "
+            "context, not authority: use it to inform the answer and verify mutable claims."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Terms to find in project memory."},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+MEMORY_READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "memory_read",
+        "description": "Read one durable project Markdown memory entry by its relative path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Memory path, such as project/preferences.md."},
+            },
+            "required": ["path"],
+        },
+    },
+}
+
+MEMORY_WRITE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "memory_write",
+        "description": (
+            "Create a new project-scoped Markdown memory entry. Agents may write project, "
+            "agent, or session memory, but cannot write organization memory."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "New memory path."},
+                "content": {"type": "string", "description": "Markdown content to persist."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
+MEMORY_UPDATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "memory_update",
+        "description": (
+            "Update an existing project Markdown memory entry using its latest hash. "
+            "If the hash changed, reread the entry and redraft instead of overwriting it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Existing memory path."},
+                "content": {"type": "string", "description": "Replacement Markdown content."},
+                "expected_hash": {"type": "string", "description": "SHA-256 hash returned by memory_read."},
+            },
+            "required": ["path", "content", "expected_hash"],
+        },
+    },
+}
+
 # These tools are intentionally absent from ALL_TOOLS. They are exposed only to
 # a durable background task whose server-side delegation policy allows them.
 DELEGATE_AGENT_TOOL = {
@@ -10662,6 +10742,10 @@ ALL_TOOLS = [
     RENDER_HTML_TOOL,
     SEARCH_KNOWLEDGE_BASE_TOOL,
     SEARCH_CONVERSATION_TOOL,
+    MEMORY_SEARCH_TOOL,
+    MEMORY_READ_TOOL,
+    MEMORY_WRITE_TOOL,
+    MEMORY_UPDATE_TOOL,
 ]
 
 # Deliberately an ordinary tool with an ordinary result. Studio runs three tool loops -- one for
@@ -10897,6 +10981,11 @@ def _tool_project_id(session_id: "str | None") -> "str | None":
     return project_id if project_id and _project_exists(project_id) else None
 
 
+def project_memory_tools_enabled(session_id: "str | None") -> bool:
+    """Whether a request is bound to an existing project memory store."""
+    return _tool_project_id(session_id) is not None
+
+
 def project_rule_for_tool_call(
     session_id: "str | None",
     name: str,
@@ -11077,6 +11166,65 @@ def _cancel_child_agent(arguments: dict, session_id: "str | None") -> str:
         return f"Error: child agent could not be cancelled: {str(exc)[:1000]}."
 
 
+def _memory_tool_result(name: str, arguments: dict, session_id: "str | None") -> str:
+    project_id = _tool_project_id(session_id)
+    if project_id is None:
+        return "Error: durable memory is available only inside a persisted project session."
+    try:
+        from core.agent_workspace.memory import (
+            get_memory_entry,
+            search_memory,
+            write_memory_entry,
+        )
+
+        if name == "memory_search":
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return "Error: memory_search requires a non-empty query."
+            result = search_memory(
+                project_id,
+                query,
+                top_k = arguments.get("top_k", 8),
+                actor = "agent",
+            )
+        elif name == "memory_read":
+            path = arguments.get("path")
+            if not isinstance(path, str) or not path.strip():
+                return "Error: memory_read requires a path."
+            result = get_memory_entry(project_id, path, include_content = True, actor = "agent")
+        elif name == "memory_write":
+            path = arguments.get("path")
+            content = arguments.get("content")
+            if not isinstance(path, str) or not isinstance(content, str):
+                return "Error: memory_write requires a path and Markdown content."
+            result = write_memory_entry(
+                project_id,
+                path,
+                content,
+                actor = "agent",
+                source_session_id = session_id,
+            )
+        else:
+            path = arguments.get("path")
+            content = arguments.get("content")
+            expected_hash = arguments.get("expected_hash")
+            if not isinstance(path, str) or not isinstance(content, str):
+                return "Error: memory_update requires a path and Markdown content."
+            if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                return "Error: memory_update requires the latest expected_hash."
+            result = write_memory_entry(
+                project_id,
+                path,
+                content,
+                expected_hash = expected_hash,
+                actor = "agent",
+                source_session_id = session_id,
+            )
+        return json.dumps(result, ensure_ascii = False, sort_keys = True)
+    except Exception as exc:  # noqa: BLE001 - tool failures are returned to the model
+        return f"Error: {str(exc)[:2000]}"
+
+
 def _render_html_result(arguments: dict) -> str:
     code = arguments.get("code")
     if not isinstance(code, str) or not code.strip():
@@ -11185,6 +11333,8 @@ def execute_tool(
         return _fit_result_to_room(_child_agent_status(session_id), name)
     if name == "cancel_child_agent":
         return _fit_result_to_room(_cancel_child_agent(arguments, session_id), name)
+    if name in {"memory_search", "memory_read", "memory_write", "memory_update"}:
+        return _fit_result_to_room(_memory_tool_result(name, arguments, session_id), name)
     if name.startswith(MCP_TOOL_PREFIX):
         try:
             _, server_id, tool_name = name.split("__", 2)

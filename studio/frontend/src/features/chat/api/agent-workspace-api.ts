@@ -32,6 +32,8 @@ export interface AgentWorkspaceCapabilities {
   git: boolean;
   worktrees: boolean;
   review: boolean;
+  memory?: boolean;
+  dreaming?: boolean;
 }
 
 export interface AgentWorkspaceOverview {
@@ -46,6 +48,28 @@ export interface AgentWorkspaceOverview {
 export interface AgentProjectContextSnapshot {
   id: string;
   expiresAt: number;
+}
+
+export interface AgentMemoryEntry {
+  path: string;
+  scope: "organization" | "project" | "agent" | "session" | string;
+  version: number;
+  hash: string;
+  bytes: number;
+  updatedAt: number | null;
+  updatedBy: string | null;
+  sourceSessionId: string | null;
+  sourceTranscriptIds: string[];
+  dreamId: string | null;
+  content?: string;
+  snippet?: string;
+}
+
+export interface AgentMemoryTranscript {
+  id: string;
+  title: string;
+  updatedAt: number;
+  archived: boolean;
 }
 
 export interface AgentInstructionLayer {
@@ -213,7 +237,7 @@ export interface AgentBackgroundRuntimeSnapshot {
 export interface AgentBackgroundTask {
   id: string;
   projectId: string;
-  kind: "verification" | "agent" | string;
+  kind: "verification" | "agent" | "dream" | string;
   payload: {
     selectedNames?: string[] | null;
     instruction?: string;
@@ -355,6 +379,25 @@ export interface AgentPullRequestHandoffResult {
   connectorResultTruncated: boolean;
 }
 
+export interface AgentDreamProposal {
+  id: string;
+  path: string;
+  scope: string;
+  operation: "create" | "replace" | string;
+  content: string;
+  expectedHash: string | null;
+  prevalence: { transcripts: number; selected: number; ratio: number };
+  rationale: string;
+  examples: Array<{
+    threadId: string;
+    messageId: string;
+    excerpt: string;
+  }>;
+  sourceTranscriptIds: string[];
+  decision: "pending" | "accepted" | "rejected" | string;
+  acceptedEntry?: AgentMemoryEntry;
+}
+
 export class AgentWorkspaceRequestError extends Error {
   readonly status: number;
 
@@ -398,6 +441,83 @@ export function createAgentProjectContextSnapshot(
   return request(
     agentWorkspaceRequestPath(projectId, "context-snapshots"),
     agentWorkspaceJsonRequest("POST", { query }),
+  );
+}
+
+export async function listAgentMemoryEntries(
+  projectId: string,
+  options: { query?: string; includeContent?: boolean } = {},
+): Promise<AgentMemoryEntry[]> {
+  const result = await request<{ entries: AgentMemoryEntry[] }>(
+    agentWorkspaceRequestPath(projectId, "memory", {
+      query: options.query,
+      include_content: options.includeContent,
+    }),
+  );
+  return result.entries;
+}
+
+export async function listAgentMemoryTranscripts(
+  projectId: string,
+  limit = 20,
+): Promise<AgentMemoryTranscript[]> {
+  const result = await request<{ transcripts: AgentMemoryTranscript[] }>(
+    agentWorkspaceRequestPath(projectId, "memory/transcripts", { limit }),
+  );
+  return result.transcripts;
+}
+
+export function saveAgentMemoryEntry(
+  projectId: string,
+  payload: { path: string; content: string; expectedHash?: string | null },
+): Promise<AgentMemoryEntry> {
+  return request(
+    agentWorkspaceRequestPath(projectId, "memory/entry"),
+    agentWorkspaceJsonRequest("PUT", {
+      path: payload.path,
+      content: payload.content,
+      expectedHash: payload.expectedHash || undefined,
+    }),
+  );
+}
+
+export async function listAgentDreams(
+  projectId: string,
+  limit = 20,
+): Promise<AgentBackgroundTask[]> {
+  const result = await request<{ dreams: AgentBackgroundTask[] }>(
+    agentWorkspaceRequestPath(projectId, "memory/dreams", { limit }),
+  );
+  return result.dreams;
+}
+
+export function queueAgentDream(
+  projectId: string,
+  threadIds: string[],
+  instructions = "",
+): Promise<AgentBackgroundTask> {
+  return request(
+    agentWorkspaceRequestPath(projectId, "memory/dreams"),
+    agentWorkspaceJsonRequest("POST", { threadIds, instructions, start: true }),
+  );
+}
+
+export function decideAgentDreamProposal(
+  projectId: string,
+  dreamId: string,
+  proposalId: string,
+  decision: "accept" | "reject",
+  expectedHash?: string | null,
+): Promise<{ dream: AgentBackgroundTask; proposal: AgentDreamProposal }> {
+  return request(
+    agentWorkspaceRequestPath(
+      projectId,
+      `memory/dreams/${encodeURIComponent(dreamId)}/proposals/${encodeURIComponent(proposalId)}`,
+    ),
+    agentWorkspaceJsonRequest("POST", {
+      decision,
+      expectedHash: expectedHash || undefined,
+    }),
   );
 }
 

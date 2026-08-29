@@ -4448,6 +4448,7 @@ async def _select_request_tools(
         ALL_TOOLS,
         apply_full_access_tool_descriptions,
         get_enabled_mcp_tools,
+        project_memory_tools_enabled,
     )
 
     if not tools_on:
@@ -4458,6 +4459,18 @@ async def _select_request_tools(
     else:
         # Copy so the shared module-global tool list can't be mutated by callers.
         tools = list(ALL_TOOLS)
+    memory_names = {"memory_search", "memory_read", "memory_write", "memory_update"}
+    if not tools_on or not project_memory_tools_enabled(getattr(payload, "session_id", None)):
+        tools = [tool for tool in tools if tool["function"]["name"] not in memory_names]
+    elif payload.enabled_tools is not None:
+        # Memory is a project capability, not a renderer pill. Keep it available to the
+        # model even when the composer sent an explicit list for the optional tools.
+        tools.extend(
+            tool
+            for tool in ALL_TOOLS
+            if tool["function"]["name"] in memory_names
+            and tool["function"]["name"] not in {item["function"]["name"] for item in tools}
+        )
     # Drop the RAG tool without a scope: nothing to search over.
     if not payload.rag_scope:
         tools = [t for t in tools if t["function"]["name"] != "search_knowledge_base"]

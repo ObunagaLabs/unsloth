@@ -179,6 +179,27 @@ class BackgroundTaskManager:
             )
         return self.start(task["id"]) if start else task
 
+    def enqueue_dream(
+        self,
+        project_id: str,
+        *,
+        thread_ids: list[str],
+        instructions: str = "",
+        start: bool = True,
+    ) -> dict:
+        """Queue an asynchronous, review-only transcript curation pass."""
+        with self._lock:
+            self._require_project_available_locked(project_id)
+            task = create_background_task(
+                project_id,
+                "dream",
+                {
+                    "threadIds": list(thread_ids),
+                    "instructions": instructions,
+                },
+            )
+        return self.start(task["id"]) if start else task
+
     def enqueue_agent(
         self,
         project_id: str,
@@ -448,7 +469,7 @@ class BackgroundTaskManager:
             self._require_project_available_locked(task["projectId"])
             if task["status"] != "queued":
                 raise AgentWorkspaceError("Only queued background tasks can be started.")
-            if task["kind"] not in {"verification", "agent"}:
+            if task["kind"] not in {"verification", "agent", "dream"}:
                 raise AgentWorkspaceError("Unsupported background task kind.")
             executor = self._agent_executor if task["kind"] == "agent" else None
             if task["kind"] == "agent" and executor is None:
@@ -465,6 +486,9 @@ class BackgroundTaskManager:
                 if task["kind"] == "agent":
                     target = self._run_agent
                     args = (task_id, event, executor)
+                elif task["kind"] == "dream":
+                    target = self._run_dream
+                    args = (task_id, event)
                 future = self._executor.submit(target, *args)
                 self._futures[task_id] = future
             except Exception as exc:
@@ -554,6 +578,28 @@ class BackgroundTaskManager:
             if current and current["status"] in {"running", "cancelling"}:
                 status = "cancelled" if event.is_set() else "failed"
                 update_background_task(task_id, status, error = str(exc))
+
+    def _run_dream(self, task_id: str, event: threading.Event) -> None:
+        task = get_background_task(task_id)
+        if task is None:
+            return
+        try:
+            from .memory import run_dream_task
+
+            result = run_dream_task(task["projectId"], task["payload"], event)
+            current = get_background_task(task_id)
+            if current is None or current["status"] not in {"running", "cancelling"}:
+                return
+            status = "cancelled" if event.is_set() else "completed"
+            update_background_task(task_id, status, result = result)
+        except Exception as exc:
+            current = get_background_task(task_id)
+            if current and current["status"] in {"running", "cancelling"}:
+                update_background_task(
+                    task_id,
+                    "cancelled" if event.is_set() else "failed",
+                    error = str(exc),
+                )
 
     def _remember_run(self, task_id: str, run_id: str) -> None:
         with self._lock:

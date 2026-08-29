@@ -40,9 +40,12 @@ import {
   type AgentBackgroundRuntimeKind,
   type AgentBackgroundRuntimeSelection,
   type AgentBackgroundTask,
+  type AgentDreamProposal,
   type AgentGitDiff,
   type AgentGitStatus,
   type AgentInstructions,
+  type AgentMemoryEntry,
+  type AgentMemoryTranscript,
   type AgentPlan,
   type AgentPlanStatus,
   type AgentPlanTaskStatus,
@@ -68,6 +71,9 @@ import {
   getAgentGitDiff,
   getAgentGitStatus,
   getAgentInstructions,
+  listAgentMemoryEntries,
+  listAgentMemoryTranscripts,
+  listAgentDreams,
   getAgentRepositoryMap,
   getAgentReview,
   getAgentVerificationConfig,
@@ -80,6 +86,8 @@ import {
   prepareAgentCommit,
   prepareAgentPullRequestHandoff,
   queueAgentTask,
+  queueAgentDream,
+  decideAgentDreamProposal,
   queueAgentVerification,
   retryAgentBackgroundTask,
   runAgentVerification,
@@ -231,6 +239,15 @@ export function AgentWorkspacePanel({
     AgentVerificationRun[]
   >([]);
   const [plans, setPlans] = useState<AgentPlan[]>([]);
+  const [memoryEntries, setMemoryEntries] = useState<AgentMemoryEntry[]>([]);
+  const [memoryTranscripts, setMemoryTranscripts] = useState<
+    AgentMemoryTranscript[]
+  >([]);
+  const [dreams, setDreams] = useState<AgentBackgroundTask[]>([]);
+  const [dreamInstructions, setDreamInstructions] = useState("");
+  const [selectedDreamTranscripts, setSelectedDreamTranscripts] = useState<
+    Set<string>
+  >(() => new Set());
   const [backgroundTasks, setBackgroundTasks] = useState<AgentBackgroundTask[]>(
     [],
   );
@@ -306,6 +323,10 @@ export function AgentWorkspacePanel({
         setVerificationConfigRevision(0);
         setVerificationRuns([]);
         setPlans([]);
+        setMemoryEntries([]);
+        setMemoryTranscripts([]);
+        setDreams([]);
+        setSelectedDreamTranscripts(new Set());
         setBackgroundTasks([]);
         setWorktrees([]);
         setReview(null);
@@ -325,6 +346,9 @@ export function AgentWorkspacePanel({
           setVerificationChecks([]);
           setVerificationRuns([]);
           setPlans([]);
+          setMemoryEntries([]);
+          setMemoryTranscripts([]);
+          setDreams([]);
           setBackgroundTasks([]);
           setWorktrees([]);
           return;
@@ -354,6 +378,17 @@ export function AgentWorkspacePanel({
             : Promise.resolve([]),
           capabilities.background
             ? listAgentBackgroundTasks(requestProjectId, 50)
+            : Promise.resolve([]),
+          capabilities.memory
+            ? listAgentMemoryEntries(requestProjectId, {
+                includeContent: true,
+              })
+            : Promise.resolve([]),
+          capabilities.dreaming
+            ? listAgentMemoryTranscripts(requestProjectId, 20)
+            : Promise.resolve([]),
+          capabilities.dreaming
+            ? listAgentDreams(requestProjectId, 20)
             : Promise.resolve([]),
           capabilities.worktrees
             ? listAgentWorktrees(requestProjectId)
@@ -385,9 +420,19 @@ export function AgentWorkspacePanel({
         }
         if (results[6].status === "fulfilled") {
           setBackgroundTasks(results[6].value);
+          setDreams(results[6].value.filter((task) => task.kind === "dream"));
         }
         if (results[7].status === "fulfilled") {
-          setWorktrees(results[7].value);
+          setMemoryEntries(results[7].value);
+        }
+        if (results[8].status === "fulfilled") {
+          setMemoryTranscripts(results[8].value);
+        }
+        if (results[9].status === "fulfilled") {
+          setDreams(results[9].value);
+        }
+        if (results[10].status === "fulfilled") {
+          setWorktrees(results[10].value);
         }
 
         const sectionNames = [
@@ -398,6 +443,9 @@ export function AgentWorkspacePanel({
           "Git status",
           "plans",
           "background tasks",
+          "memory",
+          "dream transcripts",
+          "dreams",
           "worktrees",
         ];
         const failures = results.flatMap((result, index) =>
@@ -453,6 +501,7 @@ export function AgentWorkspacePanel({
             return;
           }
           setBackgroundTasks(nextTasks);
+          setDreams(nextTasks.filter((task) => task.kind === "dream"));
           const nextRuns = await listAgentVerificationRuns(
             requestProjectId,
             10,
@@ -533,6 +582,78 @@ export function AgentWorkspacePanel({
           maxTotalBytes: MAP_BYTE_LIMIT,
         }),
       setRepositoryMap,
+    );
+  }
+
+  async function refreshMemory(): Promise<void> {
+    await runAction(
+      "memory-refresh",
+      () => listAgentMemoryEntries(projectId, { includeContent: true }),
+      setMemoryEntries,
+    );
+  }
+
+  async function startDreaming(): Promise<void> {
+    const threadIds = [...selectedDreamTranscripts];
+    if (!threadIds.length) {
+      toast.error("Select at least one transcript for dreaming");
+      return;
+    }
+    await runAction(
+      "dream-start",
+      () => queueAgentDream(projectId, threadIds, dreamInstructions.trim()),
+      (task) => {
+        setBackgroundTasks((current) => [task, ...current]);
+        setDreams((current) => [task, ...current]);
+        setDreamInstructions("");
+      },
+      "Dreaming queued",
+    );
+  }
+
+  function dreamProposals(task: AgentBackgroundTask): AgentDreamProposal[] {
+    if (!task.result || Array.isArray(task.result)) return [];
+    const proposals = (task.result as Record<string, unknown>).proposals;
+    return Array.isArray(proposals) ? (proposals as AgentDreamProposal[]) : [];
+  }
+
+  async function decideDreamProposal(
+    dream: AgentBackgroundTask,
+    proposal: AgentDreamProposal,
+    decision: "accept" | "reject",
+  ): Promise<void> {
+    await runAction(
+      `dream-${proposal.id}`,
+      () =>
+        decideAgentDreamProposal(
+          projectId,
+          dream.id,
+          proposal.id,
+          decision,
+          proposal.expectedHash,
+        ),
+      ({ dream: updatedDream, proposal: updatedProposal }) => {
+        setDreams((current) =>
+          current.map((item) =>
+            item.id === updatedDream.id ? updatedDream : item,
+          ),
+        );
+        setBackgroundTasks((current) =>
+          current.map((item) =>
+            item.id === updatedDream.id ? updatedDream : item,
+          ),
+        );
+        if (updatedProposal.acceptedEntry) {
+          setMemoryEntries((current) => [
+            updatedProposal.acceptedEntry as AgentMemoryEntry,
+            ...current.filter(
+              (entry) =>
+                entry.path !== updatedProposal.acceptedEntry?.path,
+            ),
+          ]);
+        }
+      },
+      decision === "accept" ? "Memory proposal accepted" : "Memory proposal rejected",
     );
   }
 
@@ -1211,6 +1332,196 @@ export function AgentWorkspacePanel({
                   {instructions.issues.length} instruction file issue
                   {instructions.issues.length === 1 ? "" : "s"} excluded.
                 </p>
+              ) : null}
+            </AgentSection>
+          ) : null}
+
+          {workspace?.capabilities.memory ? (
+            <AgentSection
+              icon={<FileText className="size-4" />}
+              title="Project memory"
+              detail={`${memoryEntries.length} persisted Markdown entr${memoryEntries.length === 1 ? "y" : "ies"}`}
+              actions={
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => void refreshMemory()}
+                  disabled={Boolean(busy)}
+                >
+                  <RefreshCw
+                    className={isBusy("memory-refresh") ? "animate-spin" : ""}
+                  />
+                  Refresh
+                </Button>
+              }
+            >
+              {memoryEntries.length ? (
+                <div className="space-y-1.5">
+                  {memoryEntries.slice(0, 20).map((entry) => (
+                    <details key={entry.path} className="rounded-xl bg-muted/35 px-3 py-2">
+                      <summary className="cursor-pointer text-xs font-medium text-foreground">
+                        <span className="font-mono">{entry.path}</span>
+                        <Badge variant="outline" className="ml-2">
+                          v{entry.version}
+                        </Badge>
+                      </summary>
+                      {entry.content ? (
+                        <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-5 text-muted-foreground">
+                          {entry.content}
+                        </pre>
+                      ) : null}
+                    </details>
+                  ))}
+                </div>
+              ) : (
+                <Empty>No durable memory entries yet.</Empty>
+              )}
+              {workspace.capabilities.dreaming ? (
+                <div className="mt-3 rounded-xl border border-border/60 bg-background/45 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-semibold">Dreaming</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        Analyze selected transcripts asynchronously. Nothing enters memory until you accept a proposal.
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      size="xs"
+                      onClick={() => void startDreaming()}
+                      disabled={Boolean(busy) || selectedDreamTranscripts.size === 0}
+                    >
+                      {isBusy("dream-start") ? <Loader2 className="animate-spin" /> : <Play />}
+                      Dream
+                    </Button>
+                  </div>
+                  {memoryTranscripts.length ? (
+                    <div className="mt-2 grid gap-1 sm:grid-cols-2">
+                      {memoryTranscripts.map((transcript) => (
+                        <label
+                          key={transcript.id}
+                          className="flex min-w-0 items-center gap-2 rounded-lg bg-muted/35 px-2.5 py-2 text-[11px]"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedDreamTranscripts.has(transcript.id)}
+                            onChange={(event) =>
+                              setSelectedDreamTranscripts((current) => {
+                                const next = new Set(current);
+                                if (event.target.checked) next.add(transcript.id);
+                                else next.delete(transcript.id);
+                                return next;
+                              })
+                            }
+                          />
+                          <span className="min-w-0 truncate" title={transcript.title}>
+                            {transcript.title || "Untitled conversation"}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-[11px] text-muted-foreground">
+                      No project conversations are available for selection.
+                    </p>
+                  )}
+                  <Textarea
+                    value={dreamInstructions}
+                    onChange={(event) => setDreamInstructions(event.target.value)}
+                    placeholder="Optional steering for this dreaming pass"
+                    aria-label="Dreaming instructions"
+                    className="mt-2 min-h-16 text-xs"
+                  />
+                  {dreams.length ? (
+                    <div className="mt-3 space-y-2">
+                      {dreams.slice(0, 8).map((dream) => (
+                        <div key={dream.id} className="rounded-lg bg-muted/35 px-2.5 py-2">
+                          <div className="flex items-center gap-2">
+                            <Badge variant={statusBadgeVariant(dream.status)}>
+                              {agentStatusLabel(dream.status)}
+                            </Badge>
+                            <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+                              {dreamProposals(dream).length} proposal{dreamProposals(dream).length === 1 ? "" : "s"}
+                            </span>
+                            {dream.status === "running" || dream.status === "queued" ? (
+                              <Button
+                                type="button"
+                                size="icon-xs"
+                                variant="ghost"
+                                aria-label="Cancel dreaming"
+                                onClick={() => void mutateBackgroundTask(dream, "cancel")}
+                                disabled={Boolean(busy)}
+                              >
+                                <Square />
+                              </Button>
+                            ) : null}
+                          </div>
+                          {dreamProposals(dream).map((proposal) => (
+                            <div key={proposal.id} className="mt-2 rounded-lg border border-border/50 bg-background/45 p-2">
+                              <div className="flex items-center gap-2">
+                                <span className="min-w-0 flex-1 truncate font-mono text-[11px]">
+                                  {proposal.path}
+                                </span>
+                                <Badge variant="outline">
+                                  {proposal.prevalence.transcripts}/{proposal.prevalence.selected}
+                                </Badge>
+                              </div>
+                              <p className="mt-1 text-[11px] text-muted-foreground">
+                                {proposal.rationale}
+                              </p>
+                              <details className="mt-2 rounded-lg bg-muted/35 px-2 py-1.5">
+                                <summary className="cursor-pointer text-[11px] font-medium text-foreground">
+                                  Review proposed memory and evidence
+                                </summary>
+                                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-5 text-muted-foreground">
+                                  {proposal.content}
+                                </pre>
+                                {proposal.examples.length ? (
+                                  <div className="mt-2 space-y-1 border-t border-border/50 pt-2">
+                                    {proposal.examples.map((example) => (
+                                      <p
+                                        key={`${example.threadId}-${example.messageId}`}
+                                        className="text-[11px] text-muted-foreground"
+                                      >
+                                        <span className="font-mono">{example.threadId}</span>: {example.excerpt}
+                                      </p>
+                                    ))}
+                                  </div>
+                                ) : null}
+                              </details>
+                              {proposal.decision === "pending" ? (
+                                <div className="mt-2 flex justify-end gap-1.5">
+                                  <Button
+                                    type="button"
+                                    size="xs"
+                                    variant="ghost"
+                                    onClick={() => void decideDreamProposal(dream, proposal, "reject")}
+                                    disabled={Boolean(busy)}
+                                  >
+                                    Reject
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="xs"
+                                    onClick={() => void decideDreamProposal(dream, proposal, "accept")}
+                                    disabled={Boolean(busy)}
+                                  >
+                                    Accept
+                                  </Button>
+                                </div>
+                              ) : (
+                                <p className="mt-2 text-[11px] text-muted-foreground">
+                                  {proposal.decision}
+                                </p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               ) : null}
             </AgentSection>
           ) : null}

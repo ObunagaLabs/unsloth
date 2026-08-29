@@ -217,6 +217,9 @@ def _agent_messages(context: Any) -> list[dict[str, str]]:
         expected_identity = context.expected_root_identity,
         max_instruction_bytes = _MAX_REPOSITORY_INSTRUCTIONS,
     )
+    from .memory import memory_context
+
+    persisted_memory = memory_context(context.project_id, context.instruction)
     sections = [
         "You are an Unsloth Studio background coding agent. Work only inside the "
         "assigned project workspace. Inspect the repository before editing, use the "
@@ -263,6 +266,8 @@ def _agent_messages(context: Any) -> list[dict[str, str]]:
         sections.append("<project_plan>" + escape_project_context(plan) + "</project_plan>")
     if repository.addition:
         sections.append(repository.addition)
+    if persisted_memory:
+        sections.append(persisted_memory)
     return [
         {"role": "system", "content": "\n\n".join(sections)},
         {"role": "user", "content": context.instruction},
@@ -276,7 +281,16 @@ def _agent_tools(context: Any, full_access: bool) -> list[dict[str, Any]]:
         apply_full_access_tool_descriptions,
     )
 
-    allowed = {"edit_file", "python", "terminal", "web_search"}
+    allowed = {
+        "edit_file",
+        "python",
+        "terminal",
+        "web_search",
+        "memory_search",
+        "memory_read",
+        "memory_write",
+        "memory_update",
+    }
     tools = [
         json.loads(json.dumps(tool))
         for tool in ALL_TOOLS

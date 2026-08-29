@@ -33,6 +33,7 @@ PROJECT_SESSION_PREFIX = "project-"
 PROJECT_CONTEXT_MARKER = '<unsloth_project_context version="1">'
 REPOSITORY_INSTRUCTIONS_MARKER = '<unsloth_repository_instructions version="1">'
 REPOSITORY_SELECTION_MARKER = '<unsloth_repository_selection version="1">'
+MEMORY_MARKER = '<unsloth_memory version="1">'
 MAX_PROJECT_INSTRUCTIONS_CHARACTERS = 24_000
 MAX_PROJECT_GOAL_CHARACTERS = 8_000
 MAX_ROOT_AGENTS_BYTES = 32 * 1024
@@ -43,7 +44,7 @@ PROJECT_CONTEXT_SNAPSHOT_TTL_SECONDS = 30 * 60
 MAX_PROJECT_CONTEXT_SNAPSHOTS = 512
 _SERVER_CONTEXT_BLOCK = re.compile(
     r"(?:\r?\n)*<(unsloth_project_context|unsloth_repository_instructions|"
-    r"unsloth_repository_selection) "
+    r"unsloth_repository_selection|unsloth_memory) "
     r'version="1">[\s\S]*?</\1>(?:\r?\n)*'
 )
 
@@ -63,6 +64,7 @@ class ResolvedProjectContext:
     project_context: str
     repository_instructions: str
     repository_selection: str
+    memory: str = ""
 
 
 @dataclass(frozen = True)
@@ -446,18 +448,24 @@ def resolve_project_context(
             query,
             expected_identity,
         )
+        from .memory import memory_context
+
+        memory = memory_context(project_id, query)
     except AgentWorkspaceError as exc:
         raise ProjectContextUnavailable(
             "The project workspace is unavailable. Reconnect or reopen its folder, "
             "then retry this request."
         ) from exc
-    addition = "\n\n".join(block for block in (project_context, repository.addition) if block)
+    addition = "\n\n".join(
+        block for block in (project_context, repository.addition, memory) if block
+    )
     return ResolvedProjectContext(
         project_id = project_id,
         addition = addition,
         project_context = project_context,
         repository_instructions = repository.repository_instructions,
         repository_selection = repository.repository_selection,
+        memory = memory,
     )
 
 
@@ -535,6 +543,7 @@ def resolve_project_context_snapshot(
             project_context = str(context.get("projectContext") or ""),
             repository_instructions = str(context.get("repositoryInstructions") or ""),
             repository_selection = str(context.get("repositorySelection") or ""),
+            memory = str(context.get("memory") or ""),
         )
     raise ProjectContextSnapshotInvalid("The project context snapshot is invalid or expired.")
 
@@ -554,6 +563,7 @@ __all__ = [
     "MAX_REPOSITORY_RELEVANT_PATHS",
     "MAX_REPOSITORY_SELECTION_CHARACTERS",
     "MAX_ROOT_AGENTS_BYTES",
+    "MEMORY_MARKER",
     "PROJECT_CONTEXT_MARKER",
     "PROJECT_SESSION_PREFIX",
     "REPOSITORY_INSTRUCTIONS_MARKER",

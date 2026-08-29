@@ -403,6 +403,7 @@ def _project_context_snapshot_for_thread(
             "projectContext": resolved.project_context,
             "repositoryInstructions": resolved.repository_instructions,
             "repositorySelection": resolved.repository_selection,
+            "memory": resolved.memory,
         },
     }
 

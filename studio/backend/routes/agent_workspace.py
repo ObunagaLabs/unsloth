@@ -35,6 +35,13 @@ from core.agent_workspace.instructions import (
     resolve_agents_instructions,
     secure_instruction_traversal_supported,
 )
+from core.agent_workspace.memory import (
+    delete_memory_entry,
+    get_memory_entry,
+    list_memory_entries,
+    list_memory_transcripts,
+    write_memory_entry,
+)
 from core.agent_workspace.project_context import (
     create_project_context_snapshot,
     project_context_snapshot_response,
@@ -54,6 +61,7 @@ from core.agent_workspace.state import (
     list_plans,
     list_worktrees,
     set_verification_config,
+    update_background_task,
     update_plan_status,
     update_plan_task,
 )
@@ -323,6 +331,36 @@ class BackgroundVerificationRequest(VerificationRunRequest):
     start: bool = True
 
 
+class MemoryWriteRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    path: str = Field(min_length = 1, max_length = 512)
+    content: str = Field(max_length = 128 * 1024)
+    expectedHash: Optional[str] = Field(default = None, min_length = 64, max_length = 64)
+
+
+class MemoryDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    path: str = Field(min_length = 1, max_length = 512)
+    expectedHash: str = Field(min_length = 64, max_length = 64)
+
+
+class DreamRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    threadIds: list[str] = Field(min_length = 1, max_length = 100)
+    instructions: str = Field(default = "", max_length = 4000)
+    start: bool = True
+
+
+class DreamDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    decision: Literal["accept", "reject"]
+    expectedHash: Optional[str] = Field(default = None, min_length = 64, max_length = 64)
+
+
 class BackgroundAgentRuntimeRequest(BaseModel):
     model_config = ConfigDict(extra = "forbid")
 
@@ -434,6 +472,8 @@ def workspace_capabilities(
         "git": False,
         "worktrees": False,
         "review": False,
+        "memory": False,
+        "dreaming": False,
     }
     try:
         workspace = project_workspace(project_id)
@@ -474,6 +514,8 @@ def workspace_capabilities(
             "git": is_git_repository,
             "worktrees": is_git_repository and workspace.kind == "folder",
             "review": True,
+            "memory": True,
+            "dreaming": True,
         },
     }
 
@@ -489,6 +531,197 @@ def project_context_snapshot(
         return project_context_snapshot_response(
             create_project_context_snapshot(project_id, (payload.query if payload else ""))
         )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/memory")
+def project_memory(
+    project_id: str,
+    query: str = Query(default = "", max_length = 256),
+    include_content: bool = Query(default = False),
+    scope: Optional[str] = Query(default = None, max_length = 32),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        scopes = (scope,) if scope else None
+        return {
+            "entries": list_memory_entries(
+                project_id,
+                query = query,
+                include_content = include_content,
+                actor = "user",
+                scopes = scopes,
+            )
+        }
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/memory/entry")
+def project_memory_entry(
+    project_id: str,
+    path: str = Query(..., min_length = 1, max_length = 512),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        return get_memory_entry(project_id, path, include_content = True, actor = "user")
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.put("/projects/{project_id}/memory/entry")
+def save_project_memory_entry(
+    project_id: str,
+    payload: MemoryWriteRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        return write_memory_entry(
+            project_id,
+            payload.path,
+            payload.content,
+            expected_hash = payload.expectedHash,
+            actor = "user",
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.delete("/projects/{project_id}/memory/entry")
+def remove_project_memory_entry(
+    project_id: str,
+    payload: MemoryDeleteRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        return delete_memory_entry(
+            project_id,
+            payload.path,
+            expected_hash = payload.expectedHash,
+            actor = "user",
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/memory/transcripts")
+def project_memory_transcripts(
+    project_id: str,
+    limit: int = Query(default = 20, ge = 1, le = 100),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        return {"transcripts": list_memory_transcripts(project_id, limit = limit)}
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/memory/dreams", status_code = 202)
+def queue_memory_dream(
+    project_id: str,
+    payload: DreamRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        return _public_background_task(
+            background_manager.enqueue_dream(
+                project_id,
+                thread_ids=payload.threadIds,
+                instructions=payload.instructions,
+                start=payload.start,
+            )
+        )
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+def _dream_for_project(project_id: str, dream_id: str) -> dict:
+    task = _background_for_project(project_id, dream_id)
+    if task.get("kind") != "dream":
+        raise HTTPException(status_code = 404, detail = "Dream not found.")
+    return task
+
+
+@router.get("/projects/{project_id}/memory/dreams")
+def memory_dreams(
+    project_id: str,
+    limit: int = Query(default = 20, ge = 1, le = 100),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    return {
+        "dreams": [
+            _public_background_task(task)
+            for task in list_background_tasks(project_id, limit = min(500, limit * 4))
+            if task.get("kind") == "dream"
+        ][:limit]
+    }
+
+
+@router.get("/projects/{project_id}/memory/dreams/{dream_id}")
+def memory_dream(
+    project_id: str,
+    dream_id: str,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    return _public_background_task(_dream_for_project(project_id, dream_id))
+
+
+@router.post("/projects/{project_id}/memory/dreams/{dream_id}/cancel")
+def cancel_memory_dream(
+    project_id: str,
+    dream_id: str,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    dream = _dream_for_project(project_id, dream_id)
+    try:
+        return _public_background_task(background_manager.cancel(dream_id))
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/memory/dreams/{dream_id}/proposals/{proposal_id}")
+def decide_memory_dream_proposal(
+    project_id: str,
+    dream_id: str,
+    proposal_id: str,
+    payload: DreamDecisionRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    dream = _dream_for_project(project_id, dream_id)
+    if dream.get("status") != "completed":
+        raise HTTPException(status_code = 409, detail = "Dream proposals are not ready yet.")
+    result = dict(dream.get("result") or {})
+    proposals = list(result.get("proposals") or [])
+    proposal = next((item for item in proposals if item.get("id") == proposal_id), None)
+    if proposal is None:
+        raise HTTPException(status_code = 404, detail = "Dream proposal not found.")
+    if proposal.get("decision") != "pending":
+        return {"dream": _public_background_task(dream), "proposal": proposal}
+    try:
+        if payload.decision == "accept":
+            entry = write_memory_entry(
+                project_id,
+                str(proposal["path"]),
+                str(proposal.get("content") or ""),
+                expected_hash = payload.expectedHash or proposal.get("expectedHash"),
+                actor = "user",
+                source_transcript_ids = proposal.get("sourceTranscriptIds"),
+                dream_id = dream_id,
+            )
+            proposal["acceptedEntry"] = entry
+        proposal["decision"] = "accepted" if payload.decision == "accept" else "rejected"
+        updated = _public_background_task(
+            update_background_task(dream_id, "completed", result = result) or dream
+        )
+        return {"dream": updated, "proposal": proposal}
     except AgentWorkspaceError as exc:
         raise _workspace_error(exc) from exc
 
