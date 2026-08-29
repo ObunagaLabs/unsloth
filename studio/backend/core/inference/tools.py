@@ -10049,16 +10049,31 @@ def _edit_file(
     # documented way to create __init__.py or .gitkeep, and read as "identical,
     # nothing to change" it was refused, leaving no way to write a zero-byte
     # file.
-    if not old:
+    if not edits[0][0]:
+        if len(edits) > 1:
+            return (
+                "Error: an empty 'old_string' creates the file, so it cannot be "
+                f"combined with the other {len(edits) - 1} edit(s). Create the file "
+                "in one call, then edit it in the next."
+            )
         return _edit_file_create(
             target,
-            new,
+            edits[0][1],
             name,
             "\n",
             workdir = None if effective_disable_sandbox else _get_workdir(session_id),
         )
-    if old == new:
-        return "Error: 'old_string' and 'new_string' are identical; nothing to change."
+    for index, (old, new, _) in enumerate(edits, 1):
+        if not old:
+            return (
+                f"Error: edit {index} has an empty 'old_string'. Only a single edit "
+                "may be empty, and only to create the file."
+            )
+        if old == new:
+            return (
+                f"Error: edit {index} has identical 'old_string' and 'new_string'; "
+                "nothing to change."
+            )
     try:
         st = os.stat(target)
     except FileNotFoundError:
@@ -10085,20 +10100,9 @@ def _edit_file(
     before, newline, bom, error = _edit_file_decode(data, target)
     if error:
         return error
-    count = before.count(old)
-    if count == 0:
-        return (
-            f"Error: 'old_string' was not found in {name}. It must match the "
-            "file byte for byte, including indentation. Read the file and copy "
-            "the text to replace out of it."
-        )
-    if count > 1 and not replace_all:
-        return (
-            f"Error: 'old_string' matches {count} places in {name}. Include "
-            "surrounding lines to make it unique, or pass replace_all=true to "
-            f"change all {count}."
-        )
-    after = before.replace(old, new) if replace_all else before.replace(old, new, 1)
+    after, total, first_old, first_new, change_at, error = _edit_file_apply_all(before, edits, name)
+    if error:
+        return error
     error = _edit_file_write(
         target,
         after,
@@ -10112,11 +10116,11 @@ def _edit_file(
     # Windowed around the first replacement, rather than diffing the whole file.
     return _edit_file_receipt(
         before,
-        old,
-        new,
+        first_old,
+        first_new,
         name,
-        count if replace_all else 1,
-        change_at = max(before.find(old), 0),
+        total,
+        change_at = change_at,
     )
 
 
@@ -10449,14 +10453,16 @@ EDIT_FILE_TOOL = {
         # The description does the steering: given the tool but no preference,
         # a model keeps writing heredocs because that is what it was trained on.
         "description": (
-            "Change a file by replacing an exact string in it. Prefer this over "
-            "rewriting a file with python or a shell heredoc: it sends only the "
-            "lines that change, so editing a large file costs a fraction of the "
-            "tokens and cannot drop the parts you did not retype. Read the file "
-            "first and copy old_string out of it verbatim, including indentation. "
-            "old_string must match exactly one place unless replace_all is true; "
-            "if it matches none or several you get an error and nothing is "
-            "written. Paths are relative to the working directory."
+            "Change a file by replacing exact strings. Prefer this over rewriting a "
+            "file with python or a shell heredoc: it sends only what changes. Copy each "
+            "old_string verbatim from the file, indentation included. Batch every change "
+            "to one file into edits rather than calling repeatedly, since each call "
+            "replays the whole conversation. Every old_string matches the file as it was "
+            "BEFORE this call, not the result of earlier edits, and no two may overlap. "
+            "Each must match exactly one place unless it sets replace_all; if any matches "
+            "none or several, nothing is written. Paths are relative to the working "
+            "directory. A successful call means the file holds what you sent, so do not "
+            "read it back."
         ),
         "parameters": {
             "type": "object",
@@ -10465,26 +10471,40 @@ EDIT_FILE_TOOL = {
                     "type": "string",
                     "description": "File to edit, relative to the working directory.",
                 },
-                "old_string": {
-                    "type": "string",
+                "edits": {
+                    "type": "array",
                     "description": (
-                        "Exact text to replace, copied from the file. Pass an "
-                        "empty string to create a new file."
+                        "One or more replacements to apply together. A single "
+                        "entry whose old_string is empty creates a new file."
                     ),
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "Text to put in its place.",
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": (
-                        "Replace every occurrence instead of requiring a unique "
-                        "match. Defaults to false."
-                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {
+                                "type": "string",
+                                "description": (
+                                    "Exact text to replace, copied from the file. "
+                                    "Empty creates a new file."
+                                ),
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "Text to put in its place.",
+                            },
+                            "replace_all": {
+                                "type": "boolean",
+                                "description": (
+                                    "Replace every occurrence of this entry's "
+                                    "old_string instead of requiring a unique "
+                                    "match. Defaults to false."
+                                ),
+                            },
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
                 },
             },
-            "required": ["path", "old_string", "new_string"],
+            "required": ["path", "edits"],
         },
     },
 }

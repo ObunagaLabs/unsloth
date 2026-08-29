@@ -4838,7 +4838,6 @@ def fork_chat_thread(
         if src is None:
             conn.rollback()
             return None
-        # Verify branch msg belongs to source thread.
         branch_row = conn.execute(
             "SELECT * FROM chat_messages WHERE thread_id = ? AND id = ?",
             (source_thread_id, branch_message_id),
@@ -4846,7 +4845,6 @@ def fork_chat_thread(
         if branch_row is None:
             conn.rollback()
             return None
-        # Walk ancestry from branch msg back to root via parent_id chain.
         ancestry: list[sqlite3.Row] = []
         cursor_row = branch_row
         seen: set[str] = set()
@@ -4861,7 +4859,6 @@ def fork_chat_thread(
                 (source_thread_id, parent),
             ).fetchone()
         ancestry.reverse()  # root .. branch msg
-        # Map old msg id -> new msg id for parent_id rewriting.
         id_map: dict[str, str] = {row["id"]: id_factory() for row in ancestry}
         src_dict = dict(src)
         conn.execute(
@@ -5393,10 +5390,11 @@ def compare_and_set_app_setting(key: str, expected: Any, value: Any) -> bool:
         conn.close()
 
 
-def upsert_app_settings(settings: dict[str, Any]) -> dict[str, Any]:
+def upsert_app_settings(settings: dict[str, Any], *, read_back: bool = True) -> dict[str, Any]:
     if not settings:
         return {}
     conn = get_connection()
+    committed = False
     try:
         now = datetime.now(timezone.utc).isoformat()
         conn.executemany(
@@ -5410,10 +5408,17 @@ def upsert_app_settings(settings: dict[str, Any]) -> dict[str, Any]:
             [(key, json.dumps(value), now) for key, value in settings.items()],
         )
         conn.commit()
+        committed = True
+        if not read_back:
+            return settings
         rows = conn.execute("SELECT key, value_json FROM app_settings ORDER BY key").fetchall()
         return {row["key"]: _json_loads(row["value_json"], None) for row in rows}
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            if not committed or read_back:
+                raise
 
 
 def upsert_app_setting_map_entry(

@@ -512,7 +512,15 @@ class ChatPresetLoadConfig(BaseModel):
     # preset carrying a loadConfig, including one that only pinned nParallel.
     nBatch: NotABoolean = Field(default = None, ge = BATCH_MIN, le = BATCH_MAX)
     nUbatch: NotABoolean = Field(default = None, ge = BATCH_MIN, le = BATCH_MAX)
+    # Same forbid trap as nBatch/nUbatch: normalizePresetLoadConfig always emits these
+    # keys (null included). Without them, saving a named system-prompt preset that
+    # carries any loadConfig 400s the whole customPresets write (#9879).
+    loadMode: Optional[Literal["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"]] = None
+    specDraftCacheDtype: Optional[str] = None
+    ctxCheckpoints: NotABoolean = Field(default = None, ge = 0, le = CTX_CHECKPOINTS_MAX)
+    cacheRam: NotABoolean = Field(default = None, ge = -1, le = CACHE_RAM_MAX_MIB)
     tensorParallel: Optional[bool] = None
+    disableVision: Optional[bool] = None
     gpuMemoryMode: Optional[Literal["manual"]] = None
     gpuLayers: Optional[int] = None
     nCpuMoe: Optional[int] = Field(default = None, ge = 0)
@@ -601,6 +609,13 @@ class ChatSettingsPayload(BaseModel):
     expandQuantizations: Optional[bool] = None
     showAllQuantizations: Optional[bool] = None
     fitOnDeviceOnly: Optional[bool] = None
+    # Local GGUF auto-compaction. Off omits context_overflow so a full window
+    # errors instead of silently dropping history. contextPolicy/headroom are
+    # the per-request overrides for UNSLOTH_CONTEXT_POLICY and
+    # ROLLING_COMPACTION_HEADROOM_RATIO.
+    autoCompactEnabled: Optional[bool] = None
+    contextPolicy: Optional[Literal["inherit", "checkpoint", "rolling"]] = None
+    compactionHeadroomRatio: Optional[float] = Field(default = None, ge = 0.0, le = 0.9)
 
     @field_validator("researchModelTimeoutSeconds", mode = "before")
     @classmethod

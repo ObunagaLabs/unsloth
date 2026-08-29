@@ -52,6 +52,7 @@ import { isVideoFile } from "@/lib/video-utils";
 import { isDownloadCancelled } from "@/lib/native-files";
 import { isMultimodalResponse } from "./types/api";
 import { getImageInputUnavailableReason } from "./utils/image-input-support";
+import { modelIdsMatch } from "@/features/hub/lib/model-identity";
 import { CONVERSATION_MARKDOWN_LABEL } from "./utils/conversation-markdown";
 import { pasteClipboardFiles } from "./utils/clipboard-files";
 import { confirmStopRunningChatsIfNeeded } from "./utils/confirm-stop-running-chats";
@@ -203,6 +204,7 @@ export interface CompareHandle {
   startRun: () => void;
   cancel: () => void;
   isRunning: () => boolean;
+  threadIds: () => string[];
   /** Returns a promise that resolves when the current or next run finishes. */
   waitForRunEnd: () => Promise<void>;
 }
@@ -400,6 +402,16 @@ export function RegisterCompareHandle({
       return;
     }
     const currentHandles = handlesRef.current;
+    const getThreadIds = () => {
+      const itemState = aui.threadListItem().getState();
+      return Array.from(
+        new Set(
+          [itemState.id, itemState.remoteId].filter(
+            (id): id is string => Boolean(id),
+          ),
+        ),
+      );
+    };
     currentHandles[name] = {
       // fixes occasional reorder on reload.
       append: (content) =>
@@ -431,18 +443,12 @@ export function RegisterCompareHandle({
       },
       cancel: () => aui.thread().cancelRun(),
       isRunning: () => aui.thread().getState().isRunning,
+      threadIds: getThreadIds,
       waitForRunEnd: () =>
         new Promise<void>((resolve, reject) => {
           const runtime =
             aui.threads().__internal_getAssistantRuntime?.();
-          const itemState = aui.threadListItem().getState();
-          const threadIds = Array.from(
-            new Set(
-              [itemState.id, itemState.remoteId].filter(
-                (id): id is string => Boolean(id),
-              ),
-            ),
-          );
+          const threadIds = getThreadIds();
           let thread = null;
           for (const threadId of threadIds) {
             try {
@@ -560,6 +566,8 @@ export function SharedComposer({
   projectId,
   model1ThreadId,
   model2ThreadId,
+  sendUnavailableReason,
+  requireStableCheckpoint = false,
 }: {
   handlesRef: CompareHandles;
   model1?: CompareModelSelection;
@@ -569,6 +577,8 @@ export function SharedComposer({
   projectId?: string | null;
   model1ThreadId?: string;
   model2ThreadId?: string;
+  sendUnavailableReason?: string;
+  requireStableCheckpoint?: boolean;
 }): ReactElement {
   const navigate = useNavigate();
   // Exit compare: parent's restore handler, or fresh chat if opened by URL.
@@ -1102,12 +1112,22 @@ export function SharedComposer({
       resetPromptQueue();
       return;
     }
+    if (sendUnavailableReason) {
+      resetPromptQueue();
+      toast.error("Compare unavailable", {
+        description: sendUnavailableReason,
+      });
+      return;
+    }
 
     const hasCompareHandles = Boolean(
       handlesRef.current["model1"] || handlesRef.current["model2"],
     );
     const isGeneralizedCompare =
       hasCompareHandles && Boolean(model1?.id && model2?.id);
+    const submittedCompareCheckpoint = requireStableCheckpoint
+      ? useChatRuntimeStore.getState().params.checkpoint
+      : undefined;
 
     const content: CompareMessagePart[] = [];
     for (const { file } of submittedImages) {
@@ -1715,16 +1735,13 @@ export function SharedComposer({
         store.setModelRequiresTrustRemoteCode(
           resp.requires_trust_remote_code ?? false,
         );
-        // Keep an explicit Manual+Auto context pin the load just applied (so a
-        // later Apply/Reset doesn't silently revert the model to auto-fit
-        // sizing), mirroring the interactive path's keepCustomCtx. Non-GGUF
-        // compare loads don't send the pin, so their baseline clears.
+        // This pane's own saved Context Length, not compareMaxSeqLength: the wire
+        // value is Auto-resolved for a same-model reload, so pinning it would
+        // convert Auto into a number the user never set (see resolveExplicitCtxPin).
+        // Non-GGUF compare loads send a sequence length rather than an n_ctx, so
+        // their baseline clears.
         const keepCustomCtx = targetIsGguf
-          ? resolveManualAutoCtxPin(
-              effectiveGpuMemoryMode,
-              effectiveGpuLayers,
-              effectiveCustomContextLength,
-            )
+          ? resolveExplicitCtxPin(effectiveCustomContextLength)
           : null;
         // Slots this compare load committed. Diffusion ignores --parallel, so a
         // count there would mint a phantom override a preset carries onto a GGUF.
@@ -1794,12 +1811,10 @@ export function SharedComposer({
           loadedVisionDisabledByUser: resp.vision_disabled_by_user ?? false,
           mmprojFallbackReason: resp.mmproj_fallback_reason ?? null,
           activeModelIsLocal: resp.is_local_model ?? false,
-          // Record the context this pane loaded with (like the single-model path)
-          // so when it becomes the active model, the UI and later reload/save use
-          // its context, not the previous/default one.
-          customContextLength: targetIsGguf
-            ? (ownConfig.customContextLength ?? keepCustomCtx)
-            : null,
+          // Same value as the baseline above, so that when this pane becomes the
+          // active model the UI and later reload/save use the context it actually
+          // loaded with, not the previous/default one.
+          customContextLength: keepCustomCtx,
           ggufContextLength: resp.is_gguf ? (resp.context_length ?? null) : null,
           ggufNativeContextLength: resp.is_gguf
             ? (resp.native_context_length ?? null)
@@ -2026,7 +2041,8 @@ export function SharedComposer({
       pendingAudio !== null) &&
     !busy &&
     !isComposing &&
-    !isDictating;
+    !isDictating &&
+    !sendUnavailableReason;
 
   // Compare mode swaps this composer in for the single-chat one, and only one
   // of the two is ever on screen, so the chords register in both. Both gate on
@@ -2929,7 +2945,7 @@ export function SharedComposer({
             </Button>
           ) : (
             <TooltipIconButton
-              tooltip="Send message"
+              tooltip={sendUnavailableReason ?? "Send message"}
               side="bottom"
               variant="default"
               size="icon"
