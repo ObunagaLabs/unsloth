@@ -539,16 +539,66 @@ function modelMatchesDeleted(
   );
 }
 
-/**
- * True when the loaded checkpoint is a LoRA, meaning a base-vs-fine-tuned
- * compare that uses the fast simultaneous adapter-toggle path.
- */
-function useIsLoraCompare(): boolean {
-  return useChatRuntimeStore((s) => {
+type CompareVariant = "general" | "lora";
+
+function useCompareVariant(pairId: string): CompareVariant | null {
+  const modelsError = useChatRuntimeStore((s) => s.modelsError);
+  const runtimeVariant = useChatRuntimeStore((s): CompareVariant | null => {
+    if (s.residentCheckpoint === undefined) return null;
     const cp = s.params.checkpoint;
-    const selected = cp ? s.loras.find((l) => l.id === cp) : undefined;
-    return selected?.exportType === "lora";
+    const isLora = cp
+      ? s.loras.some((l) => l.id === cp && l.exportType === "lora") ||
+        s.models.some((model) => model.id === cp && model.isLora)
+      : false;
+    return isLora ? "lora" : "general";
   });
+  const [resolution, setResolution] = useState<{
+    pairId: string;
+    variant: CompareVariant | null;
+  } | null>(null);
+
+  useEffect(() => {
+    if (
+      resolution?.pairId === pairId &&
+      (resolution.variant !== null || runtimeVariant === null)
+    )
+      return;
+    let isActive = true;
+    void (async () => {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const threads = await listStoredChatThreads({ pairId });
+          if (!isActive) return;
+          const hasGeneralThread = threads.some(
+            (thread) =>
+              thread.modelType === "model1" || thread.modelType === "model2",
+          );
+          const hasLoraThread = threads.some(
+            (thread) =>
+              thread.modelType === "base" || thread.modelType === "lora",
+          );
+          setResolution({
+            pairId,
+            variant: hasGeneralThread
+              ? "general"
+              : hasLoraThread
+                ? "lora"
+                : runtimeVariant,
+          });
+          return;
+        } catch (error) {
+          if (!isActive) return;
+          if (!isExpectedBackgroundChatStorageError(error)) throw error;
+        }
+      }
+    })();
+    return () => {
+      isActive = false;
+    };
+  }, [modelsError, pairId, resolution?.pairId, resolution?.variant, runtimeVariant]);
+
+  if (resolution?.pairId !== pairId) return null;
+  return resolution.variant ?? (modelsError ? "general" : null);
 }
 
 const CompareContent = memo(function CompareContent({
@@ -574,9 +624,11 @@ const CompareContent = memo(function CompareContent({
   deleteDisabled?: boolean;
   onExitCompare?: () => void;
 }): ReactElement {
-  const isLoraCompare = useIsLoraCompare();
+  const compareVariant = useCompareVariant(pairId);
 
-  return isLoraCompare ? (
+  if (compareVariant === null) return <></>;
+
+  return compareVariant === "lora" ? (
     <LoraCompareContent
       pairId={pairId}
       onExitCompare={onExitCompare}
@@ -994,14 +1046,10 @@ const GeneralCompareContent = memo(function GeneralCompareContent({
       .then((threads) => {
         if (!isActive) return;
         setModel1ThreadId(
-          threads.find(
-            (t) => t.modelType === "model1" || t.modelType === "base",
-          )?.id,
+          threads.find((t) => t.modelType === "model1")?.id,
         );
         setModel2ThreadId(
-          threads.find(
-            (t) => t.modelType === "model2" || t.modelType === "lora",
-          )?.id,
+          threads.find((t) => t.modelType === "model2")?.id,
         );
       })
       .catch((error) => {

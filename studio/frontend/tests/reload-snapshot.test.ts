@@ -880,6 +880,37 @@ test("mirrors Temporary Chat privacy and lets history completion retire chat she
   );
   assert.match(
     chatPageSource,
+    /function useCompareVariant\(pairId: string\)[\s\S]*?residentCheckpoint === undefined\) return null;[\s\S]*?s\.loras\.some[\s\S]*?s\.models\.some\(\(model\) => model\.id === cp && model\.isLora\)[\s\S]*?variant: CompareVariant \| null;[\s\S]*?thread\.modelType === "model1" \|\| thread\.modelType === "model2"[\s\S]*?thread\.modelType === "base" \|\| thread\.modelType === "lora"/,
+  );
+  assert.match(
+    chatPageSource,
+    /const compareVariant = useCompareVariant\(pairId\);\s*if \(compareVariant === null\) return <><\/>;\s*return compareVariant === "lora" \?/,
+  );
+  assert.match(
+    chatPageSource,
+    /for \(let attempt = 0; attempt < 2; attempt \+= 1\)[\s\S]*?catch \(error\) \{\s*if \(!isActive\) return;\s*if \(!isExpectedBackgroundChatStorageError\(error\)\) throw error;/,
+  );
+  const compareVariantSource = chatPageSource.slice(
+    chatPageSource.indexOf("function useCompareVariant"),
+    chatPageSource.indexOf("const CompareContent"),
+  );
+  assert.doesNotMatch(compareVariantSource, /catch \(error\)[\s\S]*?setResolution/);
+  assert.match(
+    compareVariantSource,
+    /if \(resolution\?\.pairId !== pairId\) return null;\s*return resolution\.variant \?\? \(modelsError \? "general" : null\);/,
+  );
+  const loraCompareSource = chatPageSource.slice(
+    chatPageSource.indexOf("const LoraCompareContent"),
+    chatPageSource.indexOf("function GeneralCompareHeader"),
+  );
+  assert.doesNotMatch(loraCompareSource, /modelType === "model[12]"/);
+  const generalCompareSource = chatPageSource.slice(
+    chatPageSource.indexOf("const GeneralCompareContent"),
+    chatPageSource.indexOf("const PROJECT_CHAT_EXPORT_OPTIONS"),
+  );
+  assert.doesNotMatch(generalCompareSource, /modelType === "(?:base|lora)"/);
+  assert.match(
+    chatPageSource,
     /const previewsReady = items\.every[\s\S]*?!dataLoaded \|\|[\s\S]*?!runtimeReady \|\|[\s\S]*?!previewsReady \|\|[\s\S]*?unsloth:app-shell-ready/,
   );
   assert.match(
