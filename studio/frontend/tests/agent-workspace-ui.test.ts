@@ -31,6 +31,8 @@ import {
   safeAgentWorkspaceError,
 } from "../src/features/chat/components/agent-workspace-state.ts";
 import {
+  agentGraphProjectSubmitIsAllowed,
+  agentGraphRouteNavigationShouldBlock,
   authorizeAgentGraphDraftRouteNavigation,
   connectGraphEdge,
   confirmAgentGraphDraftNavigation,
@@ -341,6 +343,7 @@ test("Sloth Graphs exposes visual editing, validation, history, and test runs", 
   assert.match(panel, /Discard the unsaved graph changes and editor drafts/);
   assert.match(panel, /useBlocker\(\{/);
   assert.match(panel, /shouldBlockFn: shouldBlockRouteNavigation/);
+  assert.match(panel, /agentGraphRouteNavigationShouldBlock\(/);
   assert.match(
     panel,
     /This graph was deleted elsewhere\. Your unsaved draft is still open/,
@@ -353,7 +356,7 @@ test("Sloth Graphs exposes visual editing, validation, history, and test runs", 
     panel.indexOf("async function applyJsonDocument"),
   );
   assert.doesNotMatch(validateHandler, /updateEditorDocument/);
-  assert.match(chatPage, /confirmAgentGraphDraftNavigation\(\)/);
+  assert.match(chatPage, /agentGraphProjectSubmitIsAllowed\(/);
   assert.match(chatPage, /authorizeAgentGraphDraftRouteNavigation\(\)/);
   assert.match(chatPage, /permitNextAgentGraphDraftRouteNavigation\(\)/);
   assert.match(chatPage, /beforeSubmit=\{\(\) =>/);
@@ -616,11 +619,36 @@ test("Sloth Graphs fences stale responses, drafts, and pinned run overlays", () 
   });
   assert.equal(authorizeAgentGraphDraftRouteNavigation(), true);
   assert.equal(confirmations, 1);
-  assert.equal(consumeAgentGraphDraftRouteAuthorization(), true);
+  let routeDiscardConfirmations = 0;
+  assert.equal(
+    agentGraphRouteNavigationShouldBlock(
+      { pathname: "/projects", search: {} },
+      "project-a",
+      () => {
+        routeDiscardConfirmations += 1;
+        return false;
+      },
+    ),
+    false,
+  );
+  assert.equal(routeDiscardConfirmations, 0);
   assert.equal(consumeAgentGraphDraftRouteAuthorization(), false);
   permitNextAgentGraphDraftRouteNavigation();
   assert.equal(consumeAgentGraphDraftRouteAuthorization(), true);
   releaseAllowingGuard();
+
+  let submitConfirmations = 0;
+  const submitAnswers = [true, false];
+  const releaseSubmitGuard = registerAgentGraphDraftNavigationGuard(() => {
+    const answer = submitAnswers[submitConfirmations] ?? false;
+    submitConfirmations += 1;
+    return answer;
+  });
+  assert.equal(agentGraphProjectSubmitIsAllowed(true), true);
+  assert.equal(agentGraphProjectSubmitIsAllowed(true), false);
+  assert.equal(agentGraphProjectSubmitIsAllowed(false), true);
+  assert.equal(submitConfirmations, 2);
+  releaseSubmitGuard();
 });
 
 test("Sloth Graphs renders live run state and editor errors accessibly", () => {

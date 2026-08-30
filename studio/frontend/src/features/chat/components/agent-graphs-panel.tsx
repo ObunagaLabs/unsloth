@@ -48,13 +48,12 @@ import {
 import { AgentGraphEditor } from "./agent-graph-editor";
 import { AgentGraphDraftStatus, AgentGraphLiveStatus } from "./agent-graph-ui";
 import {
-  consumeAgentGraphDraftRouteAuthorization,
+  agentGraphRouteNavigationShouldBlock,
   graphDraftIsPending,
   graphEditorIsReady,
   graphLoadCanApply,
   graphMutationIsCurrent,
   graphResponseIsCurrent,
-  graphRouteRetainsProjectEditor,
   graphRunActions,
   graphRunMatchesEditor,
   graphRunResponseIsCurrent,
@@ -211,15 +210,12 @@ export function AgentGraphsPanel({ projectId }: { projectId: string }) {
     [],
   );
   const shouldBlockRouteNavigation = useCallback(
-    ({ next }: { next: { pathname: string; search: unknown } }) => {
-      if (consumeAgentGraphDraftRouteAuthorization()) {
-        return false;
-      }
-      if (graphRouteRetainsProjectEditor(next, projectId)) {
-        return false;
-      }
-      return !confirmDraftDiscard();
-    },
+    ({ next }: { next: { pathname: string; search: unknown } }) =>
+      agentGraphRouteNavigationShouldBlock(
+        next,
+        projectId,
+        confirmDraftDiscard,
+      ),
     [confirmDraftDiscard, projectId],
   );
 

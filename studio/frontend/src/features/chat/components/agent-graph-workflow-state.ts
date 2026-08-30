@@ -326,6 +326,20 @@ export function graphRouteRetainsProjectEditor(
   );
 }
 
+export function agentGraphRouteNavigationShouldBlock(
+  next: { pathname: string; search: unknown },
+  projectId: string,
+  confirmDraftDiscard: () => boolean,
+): boolean {
+  if (consumeAgentGraphDraftRouteAuthorization()) {
+    return false;
+  }
+  if (graphRouteRetainsProjectEditor(next, projectId)) {
+    return false;
+  }
+  return !confirmDraftDiscard();
+}
+
 export function registerAgentGraphDraftNavigationGuard(
   guard: () => boolean,
 ): () => void {
@@ -339,6 +353,12 @@ export function registerAgentGraphDraftNavigationGuard(
 
 export function confirmAgentGraphDraftNavigation(): boolean {
   return activeDraftNavigationGuard?.() ?? true;
+}
+
+export function agentGraphProjectSubmitIsAllowed(
+  graphEditorActive: boolean,
+): boolean {
+  return !graphEditorActive || confirmAgentGraphDraftNavigation();
 }
 
 export function authorizeAgentGraphDraftRouteNavigation(): boolean {

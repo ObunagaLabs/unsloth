@@ -138,6 +138,7 @@ import type { ChatArtifact, ChatArtifactSurface } from "./artifacts/types";
 import { BypassPermissionsConfirmDialog } from "./bypass-permissions-menu-item";
 import { ChatSettingsPanel } from "./chat-settings-sheet";
 import {
+  agentGraphProjectSubmitIsAllowed,
   authorizeAgentGraphDraftRouteNavigation,
   confirmAgentGraphDraftNavigation,
   graphRouteRetainsProjectEditor,
@@ -1890,7 +1891,7 @@ function ProjectLanding({
             <ProjectComposer
               disabled={Boolean(pendingNewThreadId) || folderUnavailable}
               beforeSubmit={() =>
-                projectTab !== "agent" || confirmAgentGraphDraftNavigation()
+                agentGraphProjectSubmitIsAllowed(projectTab === "agent")
               }
               placeholder={
                 folderUnavailable
