@@ -595,7 +595,7 @@ def test_studio_mcp_surface_refuses_stdio_recipes(monkeypatch):
     fastmcp = ModuleType("fastmcp")
     fastmcp.FastMCP = FakeFastMCP
     monkeypatch.setitem(sys.modules, "fastmcp", fastmcp)
-    sys.modules.pop("mcp_server", None)
+    monkeypatch.delitem(sys.modules, "mcp_server", raising = False)
 
     mcp_server = importlib.import_module("mcp_server")
     server = mcp_server.create_studio_mcp()
