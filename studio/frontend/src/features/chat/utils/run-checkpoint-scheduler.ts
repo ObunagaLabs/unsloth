@@ -6,10 +6,24 @@
 /** Quiet time after a checkpoint settles before the next one is taken. */
 export const RUN_CHECKPOINT_INTERVAL_MS = 8_000;
 
+/**
+ * How long one thread may be checkpointed before the schedule gives up on it. A run that
+ * never reaches a terminal status would otherwise checkpoint for the life of the page.
+ *
+ * Measured from the start and never rearmed, unlike the follow deadline in
+ * chat-generation-api.ts, which rearms on progress. That difference is deliberate: this
+ * cap applies only to durable runs (see `isBounded`), and a durable run is persisted by
+ * the server, so stopping the client's periodic saves costs nothing but the saves. A
+ * subscriber-owned stream, whose only persistence IS these saves, is never capped.
+ */
+export const RUN_CHECKPOINT_MAX_DURATION_MS = 30 * 60_000;
+
 /** Injectable so a test can drive the schedule without real time passing. */
 export type RunCheckpointTimers = {
   setTimeout: (callback: () => void, ms: number) => number;
   clearTimeout: (handle: number) => void;
+  /** Omit to read the wall clock. Only the staleness bound consults it. */
+  now?: () => number;
 };
 
 export type RunCheckpointScheduler = {
@@ -29,6 +43,7 @@ export type RunCheckpointScheduler = {
 type ThreadState = {
   handle: number | null;
   stopped: boolean;
+  startedAt: number;
 };
 
 const noop = (): void => {};
@@ -51,11 +66,25 @@ export function createRunCheckpointScheduler(
      * checkpoint for the life of the page. Omit it to treat every thread as active.
      */
     isActive?: (threadId: string) => boolean;
+    /**
+     * Wall-clock cap on one thread's schedule. `isActive` cannot serve as one: it reports
+     * the runtime's own `isRunning`, which a run that never terminalises holds true.
+     */
+    maxDurationMs?: number;
+    /**
+     * Whether `maxDurationMs` applies to this thread. A subscriber-owned stream persists
+     * ONLY through these checkpoints, so capping one would lose everything it streamed
+     * after the cap if the page went away before `runEnd`. Omit to cap every thread.
+     */
+    isBounded?: (threadId: string) => boolean;
   } = {},
 ): RunCheckpointScheduler {
   const intervalMs = options.intervalMs ?? RUN_CHECKPOINT_INTERVAL_MS;
   const timers = options.timers ?? defaultTimers;
   const isActive = options.isActive;
+  const maxDurationMs = options.maxDurationMs ?? RUN_CHECKPOINT_MAX_DURATION_MS;
+  const isBounded = options.isBounded;
+  const now = timers.now ?? (() => Date.now());
   const threads = new Map<string, ThreadState>();
 
   /** Never let a caller's throw escape the timer: that would strand the Map entry. */
@@ -64,6 +93,15 @@ export function createRunCheckpointScheduler(
       return Promise.resolve(save(threadId));
     } catch (error) {
       return Promise.reject(error);
+    }
+  };
+
+  /** Only durable runs are capped; see `isBounded`. Throwing means "not durable". */
+  const isBoundedRun = (threadId: string): boolean => {
+    try {
+      return isBounded?.(threadId) ?? true;
+    } catch {
+      return false;
     }
   };
 
@@ -88,8 +126,11 @@ export function createRunCheckpointScheduler(
           schedule(threadId, state);
         }
       };
-      if (!isRunning(threadId)) {
-        // A missed runEnd also lost the final save, so take one on the way out.
+      // Both exits take a final save: a schedule that ends without one has lost
+      // whatever the last interval produced, exactly as a missed runEnd would.
+      const capped =
+        now() - state.startedAt >= maxDurationMs && isBoundedRun(threadId);
+      if (!isRunning(threadId) || capped) {
         stop(threadId);
         void runSave(threadId).then(noop, noop);
         return;
@@ -118,7 +159,11 @@ export function createRunCheckpointScheduler(
       if (threads.has(threadId)) {
         return;
       }
-      const state: ThreadState = { handle: null, stopped: false };
+      const state: ThreadState = {
+        handle: null,
+        stopped: false,
+        startedAt: now(),
+      };
       threads.set(threadId, state);
       schedule(threadId, state);
     },
