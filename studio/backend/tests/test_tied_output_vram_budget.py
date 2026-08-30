@@ -140,6 +140,15 @@ def test_a_model_shipping_its_own_output_is_charged_nothing(backend, untied_gguf
     assert backend._tied_output_bytes(str(untied_gguf)) == 0
 
 
+def test_a_separate_tied_drafter_charges_its_duplicated_output(backend, tied_gguf):
+    instance = backend()
+    embedding = 8 * 64 * 4
+    raw_size = instance._get_gguf_size_bytes(str(tied_gguf))
+
+    assert instance._separate_drafter_weight_vram_bytes(str(tied_gguf), embedding) == raw_size
+    assert instance._separate_drafter_weight_vram_bytes(str(tied_gguf), 0) == raw_size + embedding
+
+
 def test_the_charge_is_the_embedding_size_not_a_constant(backend, tmp_path):
     """Two tied models of different vocabulary sizes must differ.
 
@@ -150,6 +159,67 @@ def test_the_charge_is_the_embedding_size_not_a_constant(backend, tmp_path):
     small = _write_gguf(tmp_path / "small.gguf", [("token_embd.weight", (8, 16))])
     large = _write_gguf(tmp_path / "large.gguf", [("token_embd.weight", (8, 64))])
     assert backend._tied_output_bytes(str(large)) == 4 * backend._tied_output_bytes(str(small))
+
+
+def test_a_split_gguf_is_read_across_every_shard(backend, tmp_path):
+    """The probe must inspect every shard before inferring a tie or discount."""
+    one = tmp_path / "m-00001-of-00002.gguf"
+    two = tmp_path / "m-00002-of-00002.gguf"
+    _write_gguf(one, [("token_embd.weight", (8, 64))])
+    _write_gguf(two, [("output.weight", (8, 64)), ("blk.0.ffn_up.weight", (8, 8))])
+    # output.weight in shard 2 makes this model untied.
+    assert backend._tied_output_bytes(str(one)) == 0
+
+    # Without output.weight in any shard, the embedding is tied and charged.
+    three = tmp_path / "n-00001-of-00002.gguf"
+    four = tmp_path / "n-00002-of-00002.gguf"
+    _write_gguf(three, [("token_embd.weight", (8, 64))])
+    _write_gguf(four, [("blk.0.ffn_up.weight", (8, 8))])
+    assert backend._tied_output_bytes(str(three)) == 8 * 64 * 4
+
+    # Ignore stale files outside the declared 1..N launch set.
+    stale = tmp_path / "n-00003-of-00002.gguf"
+    _write_gguf(stale, [("output.weight", (1, 1))])
+    assert [p.name for p in backend._gguf_shard_paths(str(three))] == [three.name, four.name]
+    assert backend._tied_output_bytes(str(three)) == 8 * 64 * 4
+
+    # A partial split cannot answer either correction safely.
+    partial = tmp_path / "q-00001-of-00002.gguf"
+    _write_gguf(partial, [("token_embd.weight", (8, 64))])
+    assert backend._tied_output_bytes(str(partial)) == 0
+    assert backend._host_pinned_weight_bytes(str(partial)) == 0
+
+
+def test_the_per_layer_embedding_is_counted_from_a_later_shard(backend, tmp_path):
+    """The largest host-pinned tensor is not required to be in shard 1."""
+    one = tmp_path / "p-00001-of-00002.gguf"
+    two = tmp_path / "p-00002-of-00002.gguf"
+    _write_gguf(one, [("token_embd.weight", (8, 64))])
+    _write_gguf(two, [("per_layer_token_embd.weight", (16, 64)), ("output.weight", (8, 64))])
+    assert backend._host_pinned_weight_bytes(str(one)) == (8 * 64 * 4) + (16 * 64 * 4)
+
+
+def test_host_pinned_covers_both_embedding_families(backend, tied_gguf, tmp_path):
+    # token_embd alone on a model without per-layer embeddings.
+    assert backend._host_pinned_weight_bytes(str(tied_gguf)) == 8 * 64 * 4
+
+    ple = tmp_path / "ple.gguf"
+    _write_gguf(
+        ple,
+        [
+            ("token_embd.weight", (8, 64)),
+            ("per_layer_token_embd.weight", (32, 64)),
+            ("blk.0.ffn_up.weight", (8, 8)),
+        ],
+    )
+    assert backend._host_pinned_weight_bytes(str(ple)) == (8 * 64 * 4) + (32 * 64 * 4)
+
+
+def test_host_pinned_is_zero_for_an_unreadable_file(backend, tmp_path):
+    junk = tmp_path / "junk2.gguf"
+    junk.write_bytes(b"nope")
+    assert backend._host_pinned_weight_bytes(str(junk)) == 0
+    assert backend._host_pinned_weight_bytes(str(tmp_path / "gone.gguf")) == 0
 
 
 def test_a_quantised_embedding_is_charged_its_blocks_not_its_elements(backend, tmp_path):
@@ -327,21 +397,338 @@ def test_the_probe_cache_is_keyed_on_the_inode_not_the_path_size_and_mtime(backe
     assert backend._tied_output_bytes(str(path)) == 8 * 64 * 4
 
 
-def test_every_site_that_prices_the_weights_carries_the_duplicate(backend):
-    """The charge must survive the vision path, not just the first assignment.
+def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
+    """The pure budget seam keeps discrete and shared-memory arithmetic distinct."""
+    import inspect
+
+    expected = 8 * 64 * 4
+    assert (
+        backend._host_pinned_vram_discount(str(tied_gguf), [], env = {}, shared_memory = False)
+        == expected
+    )
+    assert backend._host_pinned_vram_discount(str(tied_gguf), [], env = {}, shared_memory = True) == 0
+    assert (
+        backend._host_pinned_vram_discount(
+            str(tied_gguf),
+            [],
+            env = {"LLAMA_ARG_OVERRIDE_TENSOR": "token_embd.weight=CUDA0"},
+            shared_memory = False,
+        )
+        == 0
+    )
+
+    src = inspect.getsource(backend)
+    assert (
+        "+ self._tied_output_bytes(model_path)" in src
+    ), "the context budget no longer charges the tied-embedding duplicate"
+    assert "- _host_pinned" in src, "the context budget no longer discounts host-pinned embeddings"
+    assert "_host_pinned_vram_discount(" in src
+    assert "env = os.environ" in src
+    assert "shared_memory = False" in src
+    assert "_host_pinned = 0 if _shared_memory else _host_pinned_candidate" in src
+    assert "_candidate_targets_proved_discrete" in src
+    assert "_shared_gpu_ids | _unclassified_gpu_ids" in src
+
+
+def test_a_draft_override_owns_only_the_drafter_discount(backend, tied_gguf):
+    expected = 8 * 64 * 4
+    draft_args = ["-otd", "token_embd.weight=CUDA0"]
+    main_args = ["-ot", "token_embd.weight=CUDA0"]
+
+    assert (
+        backend._host_pinned_vram_discount(
+            str(tied_gguf),
+            draft_args,
+            env = {},
+            shared_memory = False,
+            draft_model = True,
+        )
+        == 0
+    )
+    assert (
+        backend._host_pinned_vram_discount(
+            str(tied_gguf),
+            main_args,
+            env = {},
+            shared_memory = False,
+            draft_model = True,
+        )
+        == expected
+    )
+    assert backend._override_moves_host_pinned(draft_args, env = {}) is False
+
+
+def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monkeypatch):
+    monkeypatch.setattr(
+        backend,
+        "_run_vulkan_probe",
+        staticmethod(
+            lambda _binary = None: [
+                {"index": 0, "is_igpu": True},
+                {"index": 1, "is_igpu": False},
+            ]
+        ),
+    )
+    assert backend._vulkan_targets_are_igpus("server", [0]) is True
+    assert backend._vulkan_targets_are_igpus("server", [1]) is False
+    assert backend._vulkan_targets_are_igpus("server", [2], conservative_on_unknown = True) is True
+    assert backend._vulkan_targets_are_igpus("server", [1, 2]) is False
+    assert backend._vulkan_targets_are_igpus("server", [1, 2], conservative_on_unknown = True) is True
+
+    monkeypatch.setattr(backend, "_run_vulkan_probe", staticmethod(lambda _binary = None: []))
+    assert backend._vulkan_targets_are_igpus("server", conservative_on_unknown = True) is True
+
+
+def test_one_vulkan_snapshot_drives_memory_and_shared_classification(backend, monkeypatch):
+    rows = [
+        {"index": 0, "free_mib": 8192, "total_mib": 16384, "is_igpu": False},
+        {"index": 1, "free_mib": 4096, "total_mib": 8192, "is_igpu": True},
+    ]
+    monkeypatch.setattr(
+        backend,
+        "_run_vulkan_probe",
+        staticmethod(lambda *_a, **_kw: pytest.fail("snapshot was probed twice")),
+    )
+    assert backend._vulkan_rows_target_igpus(rows, [0]) is False
+    assert backend._vulkan_rows_target_igpus(rows, [1]) is True
+    memory = backend._get_gpu_free_memory_vulkan("server", rows = rows)
+    assert memory[0] == (0, 8192, 16384)
+    assert memory[1][0] == 1
+    assert memory[1][2] == 0
+
+
+def test_unreadable_cuda_properties_are_not_proved_discrete(backend, monkeypatch):
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 1
+
+        @staticmethod
+        def get_device_properties(_ordinal):
+            raise OSError("property probe failed")
+
+    class _Version:
+        hip = None
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0"
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+    assert backend._torch_unified_memory_classification_known([0]) is False
+
+
+def test_a_classified_discrete_cuda_device_is_known(backend, monkeypatch):
+    class _Props:
+        is_integrated = False
+
+    class _Cuda:
+        is_available = staticmethod(lambda: True)
+        device_count = staticmethod(lambda: 1)
+        get_device_properties = staticmethod(lambda _ordinal: _Props())
+
+    class _Version:
+        hip = None
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0"
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+    assert backend._torch_unified_memory_classification_known([0]) is True
+
+
+@pytest.mark.parametrize("arch", ["gfx90c", "gfx1103"])
+def test_an_unclassified_rocm_arch_is_not_proved_discrete(backend, monkeypatch, arch):
+    class _Props:
+        gcnArchName = arch
+        is_integrated = 0
+
+    class _Cuda:
+        is_available = staticmethod(lambda: True)
+        device_count = staticmethod(lambda: 1)
+        get_device_properties = staticmethod(lambda _ordinal: _Props())
+
+    class _Version:
+        hip = "6.2.0"
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0+rocm"
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+    assert backend._torch_unified_memory_classification_known([0]) is False
+
+
+@pytest.mark.parametrize(
+    "arch",
+    [
+        "gfx803",
+        "gfx900",
+        "gfx906",
+        "gfx908",
+        "gfx90a",
+        "gfx942",
+        "gfx950",
+        "gfx1010",
+        "gfx1011",
+        "gfx1012",
+        "gfx1031",
+        "gfx1100",
+    ],
+)
+def test_a_known_discrete_rocm_arch_is_proved_discrete(backend, monkeypatch, arch):
+    class _Props:
+        gcnArchName = arch
+        is_integrated = 0
+
+    class _Cuda:
+        is_available = staticmethod(lambda: True)
+        device_count = staticmethod(lambda: 1)
+        get_device_properties = staticmethod(lambda _ordinal: _Props())
+
+    class _Version:
+        hip = "6.2.0"
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0+rocm"
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+    assert backend._torch_unified_memory_classification_known([0]) is True
+
+
+def test_an_hsa_override_cannot_spoof_an_apu_into_a_discrete_discount(backend, monkeypatch):
+    """The runtime arch is valid for kernel selection under the override, but it is
+    not evidence about the underlying memory topology used by the VRAM budget."""
+
+    class _Props:
+        gcnArchName = "gfx1030"
+        # Older ROCm wheels omit/zero this even for the gfx1035 laptop APU that is
+        # commonly presented as gfx1030 through HSA_OVERRIDE_GFX_VERSION.
+        is_integrated = 0
+
+    class _Cuda:
+        is_available = staticmethod(lambda: True)
+        device_count = staticmethod(lambda: 1)
+        get_device_properties = staticmethod(lambda _ordinal: _Props())
+
+    class _Version:
+        hip = "6.4"
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0"
+
+    monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+
+    assert backend._torch_unified_memory_classification_known([0]) is False
+    # The override invalidates arch-only DISCRETE proof, not a positive unified-memory
+    # signal from the device properties.
+    _Props.is_integrated = 1
+    assert backend._torch_unified_memory_classification_known([0]) is True
+
+
+def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
+    """An explicit device override outranks llama.cpp's host fallback."""
+    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"], env = {}) is True
+    assert (
+        backend._override_moves_host_pinned(
+            ["-ot", r"^per_layer_token_embd\.weight$=CUDA0"], env = {}
+        )
+        is True
+    )
+    assert (
+        backend._override_moves_host_pinned(
+            ["--override_tensor", "token_embd.weight=CUDA0"], env = {}
+        )
+        is True
+    )
+    assert (
+        backend._override_moves_host_pinned(["--override-tensor=token_embd.weight=CUDA0"], env = {})
+        is True
+    )
+    assert backend._override_moves_host_pinned(["-ot=token_embd.weight=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", r".*embd.*=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", "token_embd=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", "embd=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", r"per_.*47$=CUDA0"], env = {}) is True
+    # The family is open-ended, so even apparently unrelated device mappings
+    # fail closed instead of relying on incomplete regex representatives.
+    assert backend._override_moves_host_pinned(["-ot", r"^blk\.0=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", r".*=CUDA0"], env = {}) is True
+    assert (
+        backend._override_moves_host_pinned(
+            ["-ot", "token_embd.weight=CUDA0,blk.0.ffn_down.weight=CPU"], env = {}
+        )
+        is True
+    )
+    assert (
+        backend._override_moves_host_pinned(
+            [], env = {"LLAMA_ARG_OVERRIDE_TENSOR": "token_embd.weight=CUDA0"}
+        )
+        is True
+    )
+    assert (
+        backend._override_moves_host_pinned([], env = {"LLAMA_ARG_OVERRIDE_TENSOR": "embd=CUDA0"})
+        is True
+    )
+
+
+def test_cpu_only_or_absent_overrides_keep_the_discount(backend):
+    # Sending them to CPU is where llama.cpp puts them anyway.
+    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CPU"], env = {}) is False
+    assert (
+        backend._override_moves_host_pinned(["--override_tensor=token_embd.weight=CPU"], env = {})
+        is False
+    )
+    # Our own planner's patterns move FFN tensors, never the embeddings.
+    assert (
+        backend._override_moves_host_pinned(["-ot", r"^blk\.(1|2)\.ffn_down\.weight$=CPU"], env = {})
+        is False
+    )
+    assert (
+        backend._override_moves_host_pinned(
+            ["-ot", "token_embd.weight=CPU,blk.0.ffn_down.weight=CUDA0"], env = {}
+        )
+        is True
+    )
+    assert backend._override_moves_host_pinned([], env = {}) is False
+    assert backend._override_moves_host_pinned(None, env = {}) is False
+    # A bare flag with no value must not crash the budget.
+    assert backend._override_moves_host_pinned(["-ot"], env = {}) is False
+
+
+def test_every_site_that_prices_the_weights_carries_both_corrections(backend):
+    """The tied charge and host discount must survive the vision path.
 
     Driving this through a real load needs a GPU and a binary, and the projector
     pin is a closure with no seam, so the placement behaviour is covered in
     test_mmproj_placement_policy.py and what is checked here is that no site
-    re-derives the footprint from the bare file size again. `weights_size` is the
-    one name that carries the correction; `gguf_size` is the file.
+    re-derives the footprint from the bare file size again.
     """
     import inspect
 
     src = inspect.getsource(backend.load_model)
     assert "weights_size = gguf_size + self._tied_output_bytes(model_path)" in src
-    assert "model_size = weights_size + mmproj_size" in src
-    # The projector CPU pin removes the projector, not the duplicate.
+    assert "_model_weight_vram_bytes = max(0, weights_size - _host_pinned)" in src
+    assert "model_size = _model_weight_vram_bytes + mmproj_size" in src
+    # The projector CPU pin removes only the projector, not either correction.
     assert "model_size = gguf_size" not in src
     # And the probe that decides that pin prices what the placement prices.
-    assert "_mm_need = (\n                            weights_size" in src
+    assert "_mm_base_need = (\n                            _model_weight_vram_bytes" in src

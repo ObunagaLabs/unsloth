@@ -102,7 +102,15 @@ def _backend(
     # resolution has to come back empty or MTP engages behind the scenes.
     backend._resolve_launch_mtp_path = lambda **_kw: str(drafter) if drafter_bytes else None
     backend._apu_ram_shortfall_message = lambda *_a, **_kw: None
-    backend._amd_apu_wants_unified_memory = lambda *_a, **_kw: False
+    shared_ids = {idx for idx, _free, total in memory if total <= 0}
+    known_ids = {idx for idx, _free, total in memory if total > 0}
+    backend._amd_apu_wants_unified_memory = lambda ids = None: (
+        bool(shared_ids) if ids is None else bool(set(ids) & shared_ids)
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: (
+        bool(known_ids) if ids is None else bool(ids) and set(ids).issubset(known_ids)
+    )
     backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
     backend._is_vulkan_backend = lambda _binary = None: False
     backend._wait_for_health = lambda timeout, **_kw: True
