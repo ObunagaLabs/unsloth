@@ -270,6 +270,114 @@ def _normalized_call(call: dict[str, Any], fallback_id: str = "") -> dict[str, A
     return normalized
 
 
+def _split_top_level_json_documents(text: str) -> tuple[list[str], str]:
+    unsplit = ([], text)
+    complete: list[str] = []
+    closing: list[str] = []
+    start = -1
+    in_string = False
+    escaped = False
+
+    for index, character in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if not closing:
+            if character in "{[":
+                start = index
+                closing.append("}" if character == "{" else "]")
+                continue
+            if character.isspace():
+                continue
+            return unsplit
+        if character == '"':
+            in_string = True
+            continue
+        if character in "{[":
+            closing.append("}" if character == "{" else "]")
+            continue
+        if character not in "}]":
+            continue
+        if closing.pop() != character:
+            return unsplit
+        if closing:
+            continue
+        document = text[start : index + 1]
+        try:
+            json.loads(document)
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            return unsplit
+        complete.append(document)
+        start = -1
+
+    return complete, "" if start == -1 else text[start:]
+
+
+def _mint_streamed_tool_call_id(taken: set[str]) -> str:
+    index = 0
+    while f"tool_call_{index}" in taken:
+        index += 1
+    return f"tool_call_{index}"
+
+
+def _argument_fragment(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii = False, separators = (",", ":"))
+        except (TypeError, ValueError, RecursionError):
+            pass
+    return ""
+
+
+def _same_json_document(left: str, right: str) -> bool:
+    try:
+        return _same_json_value(json.loads(left), json.loads(right))
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        return False
+
+
+def _same_json_value(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        return (
+            isinstance(left, (int, float))
+            and not isinstance(left, bool)
+            and isinstance(right, (int, float))
+            and not isinstance(right, bool)
+            and left == right
+        )
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _same_json_value(left_item, right_item) for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_json_value(left[key], right[key]) for key in left
+        )
+    return left == right
+
+
+def _is_repeated_json_snapshot(existing: str, fragment: str) -> bool:
+    if not fragment.strip():
+        return False
+    if "{" not in fragment and "[" not in fragment:
+        return False
+    complete, tail = _split_top_level_json_documents(fragment)
+    if len(complete) != 1 or tail:
+        return False
+    return existing == fragment or _same_json_document(existing, fragment)
+
+
 def _delta_text(content: Any) -> str:
     """Text of a content delta, whether it is a plain string or content parts.
 
@@ -361,7 +469,10 @@ class _Turn:
     # call key each delta index maps to: the index itself until a second call
     # forks off it, then (index, call_id).
     open_key_by_index: dict[int, Any] = field(default_factory = dict)
+    key_by_call_id: dict[str, Any] = field(default_factory = dict)
     last_index: int | None = None
+    split_seq: int = 0
+    incomplete_split_keys: set[Any] = field(default_factory = set)
     round: int = 0
     healed: list[dict[str, Any]] = field(default_factory = list)
     text: list[str] = field(default_factory = list)
@@ -463,6 +574,25 @@ class _Turn:
             blocks.append(f"{header}\n{body}")
         return "\n\n".join(blocks)
 
+    def _new_split_key(self, index: int) -> tuple[int, str, int]:
+        self.split_seq += 1
+        return (index, "split", self.split_seq)
+
+    def _new_call(self, key: Any, index: int) -> dict[str, Any]:
+        call = {
+            "id": "",
+            "type": "function",
+            "function": {"name": "", "arguments": ""},
+            "_delta_index": index,
+        }
+        self.by_index[key] = call
+        self.order.append(key)
+        return call
+
+    @staticmethod
+    def _merge_name(current: str, fragment: str) -> str:
+        return fragment if fragment.startswith(current) else current + fragment
+
     def merge_structured(self, raw_calls: list[Any]) -> None:
         for raw_call in raw_calls:
             if not isinstance(raw_call, dict):
@@ -475,13 +605,43 @@ class _Turn:
                 # continue the call that is already open instead.
                 index = self.last_index if self.last_index is not None else len(self.order)
             call_id = raw_call.get("id")
+            function = raw_call.get("function")
+            function = function if isinstance(function, dict) else {}
+            name_fragment = function.get("name")
+            name_fragment = name_fragment if isinstance(name_fragment, str) else ""
+            args_fragment = _argument_fragment(function.get("arguments"))
             # continue whichever call owns this index now: index restarts at 0
             # for every tool round, so after a fork the bare argument fragments
             # belong to the newer call.
             key: Any = self.open_key_by_index.get(index, index)
-            if isinstance(call_id, str) and call_id:
+            stable_id = call_id if isinstance(call_id, str) and call_id else ""
+            adopted_stable_id = False
+            repeated_snapshot = False
+            if stable_id in self.key_by_call_id:
+                key = self.key_by_call_id[stable_id]
+            elif stable_id:
+                for candidate in self.order:
+                    candidate_call = self.by_index[candidate]
+                    candidate_function = candidate_call["function"]
+                    if (
+                        candidate_call.get("_delta_index") != index
+                        or candidate_call.get("id")
+                        or (
+                            name_fragment
+                            and candidate_function["name"]
+                            and candidate_function["name"] != name_fragment
+                        )
+                    ):
+                        continue
+                    if not args_fragment.strip() or _same_json_document(
+                        candidate_function["arguments"], args_fragment
+                    ):
+                        key = candidate
+                        adopted_stable_id = True
+                        repeated_snapshot = bool(args_fragment.strip())
+                        break
                 open_id = self.by_index.get(key, {}).get("id")
-                if open_id and open_id != call_id:
+                if not adopted_stable_id and open_id and open_id != stable_id:
                     # Two distinct calls reported at the same index. Merging them
                     # concatenates their argument JSON into one unparseable blob
                     # and loses an intent, so key the second on its own id.
@@ -489,29 +649,79 @@ class _Turn:
                     # back to it: an id beats the latest-index mapping, which only
                     # exists to place the fragments that carry no id.
                     first_id = self.by_index.get(index, {}).get("id")
-                    key = index if first_id == call_id else (index, call_id)
+                    key = index if first_id == stable_id else (index, stable_id)
             self.last_index = index
             self.open_key_by_index[index] = key
             if key not in self.by_index:
-                self.by_index[key] = {
-                    "id": "",
-                    "type": "function",
-                    "function": {"name": "", "arguments": ""},
-                }
+                self._new_call(key, index)
                 # First-seen order, so a negative or out-of-order index cannot
                 # reorder parallel calls against what the model actually sent.
-                self.order.append(key)
             current = self.by_index[key]
-            if isinstance(call_id, str) and call_id:
-                current["id"] = call_id
+            exact_stable_id = bool(stable_id and current.get("id") == stable_id)
+            if exact_stable_id and _is_repeated_json_snapshot(
+                current["function"]["arguments"], args_fragment
+            ):
+                repeated_snapshot = True
+            same_stable_call = exact_stable_id or adopted_stable_id
+            current_complete: list[str] = []
+            current_tail = current["function"]["arguments"]
+            if name_fragment and (not args_fragment.strip() or not current["function"]["name"]):
+                current_complete, current_tail = _split_top_level_json_documents(current_tail)
+            if (
+                current_complete
+                and not current_tail
+                and not same_stable_call
+                and name_fragment
+                and not args_fragment.strip()
+                and current["function"]["name"]
+            ):
+                key = self._new_split_key(index)
+                current = self._new_call(key, index)
+                self.open_key_by_index[index] = key
+            if stable_id:
+                current["id"] = stable_id
+                self.key_by_call_id[stable_id] = key
             extra = raw_call.get("extra_content")
+            had_existing_arguments = bool(current["function"]["arguments"])
+            combined = current["function"]["arguments"] + (
+                "" if repeated_snapshot else args_fragment
+            )
+            if "{" in args_fragment or "[" in args_fragment:
+                complete, tail = _split_top_level_json_documents(combined)
+            else:
+                complete, tail = [], combined
+            segments = [*complete, *([tail] if tail else [])]
+            if not repeated_snapshot and len(segments) > 1:
+                if not current["function"]["name"] and not (current_complete and not current_tail):
+                    current["function"]["name"] = name_fragment
+                current["function"]["arguments"] = segments[0]
+                self.incomplete_split_keys.discard(key)
+                for segment_index, segment in enumerate(segments[1:]):
+                    split_key = self._new_split_key(index)
+                    split_call = self._new_call(split_key, index)
+                    split_call["function"]["name"] = name_fragment or current["function"]["name"]
+                    split_call["function"]["arguments"] = segment
+                    if segment_index == 0 and stable_id and had_existing_arguments:
+                        current["id"] = ""
+                        split_call["id"] = stable_id
+                        self.key_by_call_id[stable_id] = split_key
+                    if segment_index == 0 and isinstance(extra, dict) and extra:
+                        metadata_call = (
+                            current if stable_id and not had_existing_arguments else split_call
+                        )
+                        metadata_call["extra_content"] = dict(extra)
+                    split_complete, split_tail = _split_top_level_json_documents(segment)
+                    if not split_complete or split_tail:
+                        self.incomplete_split_keys.add(split_key)
+                    key = split_key
+                    current = split_call
+                self.open_key_by_index[index] = key
+                continue
             if isinstance(extra, dict) and extra:
-                # Gemini 3 stows this call's thoughtSignature here, and the
+                # gemini 3 stows this call's thoughtSignature here, and the
                 # native translator rejects a replayed functionCall without it.
-                # Per call, so it cannot ride along on the delta-level slot.
                 current["extra_content"] = {**current.get("extra_content", {}), **extra}
-            function = raw_call.get("function")
-            if isinstance(function, dict):
+            if function:
                 # Two provider dialects, and picking either one alone breaks the
                 # other. llama-server re-sends the whole name as it grows ("web"
                 # then "web_search"), so appending yields "webweb_search".
@@ -520,17 +730,22 @@ class _Turn:
                 # check and the call silently never runs. A fragment that already
                 # starts with what we have is the whole name resent; anything
                 # else continues it.
-                fragment = function.get("name")
-                if isinstance(fragment, str) and fragment:
+                if name_fragment:
                     accumulated = current["function"]["name"]
-                    if fragment.startswith(accumulated):
-                        current["function"]["name"] = fragment
-                    else:
-                        current["function"]["name"] = accumulated + fragment
-                if isinstance(function.get("arguments"), str):
-                    current["function"]["arguments"] += function["arguments"]
+                    current["function"]["name"] = self._merge_name(accumulated, name_fragment)
+                current["function"]["arguments"] = combined
+                if key in self.incomplete_split_keys and (
+                    "}" in args_fragment or "]" in args_fragment
+                ):
+                    complete, tail = _split_top_level_json_documents(combined)
+                    if complete and not tail:
+                        self.incomplete_split_keys.discard(key)
 
-    def calls(self, taken: set[str] | None = None) -> list[dict[str, Any]]:
+    def calls(
+        self,
+        taken: set[str] | None = None,
+        streamed_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Every call this turn produced, with ids unique across the whole run.
 
         ``taken`` carries the ids already used by earlier turns. A provider that
@@ -539,19 +754,37 @@ class _Turn:
         the conversation replayed upstream.
         """
         seen: set[str] = taken if taken is not None else set()
+        streamed = streamed_ids if streamed_ids is not None else set()
         out: list[dict[str, Any]] = []
-        for position, call in enumerate(
-            [self.by_index[key] for key in self.order] + list(self.healed)
-        ):
-            normalized = _normalized_call(call, fallback_id = f"call_{self.round}_{position}")
+        ordered_calls = [(key, self.by_index[key]) for key in self.order] + [
+            (None, call) for call in self.healed
+        ]
+        for position, (key, call) in enumerate(ordered_calls):
+            fallback_id = _mint_streamed_tool_call_id(streamed)
+            raw_call_id = call.get("id")
+            stream_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else fallback_id
+            if key is not None:
+                if stream_id in streamed:
+                    stream_id = _mint_streamed_tool_call_id(streamed)
+                streamed.add(stream_id)
+                if key in self.incomplete_split_keys:
+                    continue
+            normalized = _normalized_call(call, fallback_id = fallback_id)
             if normalized is None:
                 continue
+            if key is None:
+                stream_id = normalized["id"]
+                if stream_id in streamed:
+                    stream_id = _mint_streamed_tool_call_id(streamed)
+                streamed.add(stream_id)
+            if stream_id != normalized["id"]:
+                normalized["stream_id"] = stream_id
             if normalized["id"] in seen:
                 # The client keyed the card it painted on the id the provider
                 # streamed, so keep that one for the events aimed at the card.
                 # Never replayed upstream: the conversation carries the
                 # de-duplicated id, which is the whole point of the rename.
-                normalized["stream_id"] = normalized["id"]
+                normalized["stream_id"] = stream_id
                 # The renamed id is itself stored and replayed, so a single-shot
                 # rename collides again on the next request. Counting up over a
                 # finite ledger terminates and leaves the first attempt as is.
@@ -819,6 +1052,7 @@ async def stream_with_studio_tools(
     last_reprompt_text = ""
     provider_turns = 0
     used_call_ids: set[str] = _replayed_call_ids(conversation)
+    streamed_call_ids: set[str] = set()
     spent_budget_passes = 0
     fruitless_turns = 0
     # One provider call per possible execution, plus headroom for the no-op,
@@ -1042,7 +1276,11 @@ async def stream_with_studio_tools(
         # so the scraped web text in its prompts cannot reach python or terminal,
         # so a naive or compromised endpoint echoing a call back must not be able
         # to execute it here.
-        calls = [] if (truncated or tool_choice == "none") else turn.calls(used_call_ids)
+        calls = (
+            []
+            if (truncated or tool_choice == "none")
+            else turn.calls(used_call_ids, streamed_call_ids)
+        )
         if not calls:
             # No tool this turn. A model that only said what it was about to do
             # gets one nudge to actually do it, the same recovery the local loops
@@ -1129,13 +1367,14 @@ async def stream_with_studio_tools(
         for call in calls:
             if cancel_event.is_set():
                 break
+            decision = controller.prepare_call(call)
             if not unlimited and remaining <= 0:
                 # Budget spent. Answer the model so it stops asking, but never
                 # execute: the cap is a safety limit, not a hint to the provider.
                 for card_line in _unrun_call_card(
                     tool_name = call["function"]["name"],
                     tool_call_id = call.get("stream_id") or call["id"],
-                    arguments = call.get("arguments"),
+                    arguments = decision.tool_start_payload()["arguments"],
                     result = _TOOL_BUDGET_EXHAUSTED,
                     provenance = _unrun_provenance(call["function"]["name"], round_id),
                 ):
@@ -1145,13 +1384,7 @@ async def stream_with_studio_tools(
                 # further down, so this one would arrive as an orphan
                 # role="tool" message and OpenAI, Anthropic and Gemini all
                 # reject that history instead of answering.
-                exhausted_call: dict[str, Any] = {
-                    "id": call["id"],
-                    "type": "function",
-                    # Copied: the normalized call also carries a parsed
-                    # arguments dict that must not reach the provider.
-                    "function": dict(call["function"]),
-                }
+                exhausted_call = decision.as_assistant_tool_call()
                 exhausted_extra = call.get("extra_content")
                 if isinstance(exhausted_extra, dict) and exhausted_extra:
                     exhausted_call["extra_content"] = exhausted_extra
@@ -1165,7 +1398,6 @@ async def stream_with_studio_tools(
                     }
                 )
                 continue
-            decision = controller.prepare_call(call)
             # The frontend groups a round's reasoning by this id
             # (codexLocalToolRoundId), so every tool card the loop emits has to
             # carry it, not just the budget-exhausted one built by hand above.
@@ -1207,6 +1439,7 @@ async def stream_with_studio_tools(
             name = decision.tool_name
             arguments = decision.arguments
             call_id = decision.tool_call_id
+            frontend_call_id = call.get("stream_id") or call_id
             needs_confirmation = (
                 confirm_tool_calls and not bypass_permissions and permission_mode != "off"
             )
@@ -1218,6 +1451,7 @@ async def stream_with_studio_tools(
             )
 
             start_event = decision.tool_start_event()
+            start_event["tool_call_id"] = frontend_call_id
             start_event["approval_id"] = approval_id
             start_event["awaiting_confirmation"] = needs_confirmation
             denied = False
@@ -1266,7 +1500,7 @@ async def stream_with_studio_tools(
                     {
                         "type": "tool_end",
                         "tool_name": name,
-                        "tool_call_id": call_id,
+                        "tool_call_id": frontend_call_id,
                         "result": TOOL_REJECTED_MESSAGE,
                         "provenance": decision.provenance,
                     }
@@ -1325,7 +1559,7 @@ async def stream_with_studio_tools(
             tool_stream = stream_tool_execution(
                 _invoke,
                 tool_name = name,
-                tool_call_id = call_id,
+                tool_call_id = frontend_call_id,
                 cancel_event = cancel_event,
             )
             outcome: dict[str, Any] = {}
@@ -1382,7 +1616,9 @@ async def stream_with_studio_tools(
             executed_any = True
             # Opens the post-tool phase; carried-over stall text would eat its nudge.
             last_reprompt_text = ""
-            yield _sse(completion.tool_end_event())
+            end_event = completion.tool_end_event()
+            end_event["tool_call_id"] = frontend_call_id
+            yield _sse(end_event)
             tool_messages.append(completion.tool_message())
 
         # An empty status clears the badge between iterations.

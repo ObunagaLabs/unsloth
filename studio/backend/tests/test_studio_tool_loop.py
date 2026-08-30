@@ -57,6 +57,7 @@ def _tool(name: str, description: str = "") -> dict:
 
 
 WEB = _tool("web_search")
+FETCH = _tool("web_fetch")
 PY = _tool("python")
 
 
@@ -218,6 +219,137 @@ def test_structured_call_executes_and_continues(executed):
     follow_up = transport.requests[1]["messages"]
     assert [message["role"] for message in follow_up[-2:]] == ["assistant", "tool"]
     assert follow_up[-1]["content"] == "RESULT<web_search>"
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 8])
+def test_idless_parallel_calls_reusing_index_zero_execute_separately(executed, count):
+    calls = [
+        {
+            "index": 0,
+            "function": {
+                "name": "web_fetch" if position % 2 == 0 else "web_search",
+                "arguments": json.dumps({"query": f"request-{position}"}),
+            },
+        }
+        for position in range(count)
+    ]
+    transport = FakeTransport(
+        [
+            [*[_sse({"tool_calls": [call]}) for call in calls], _sse(finish = "tool_calls"), _DONE],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport, tools = [WEB, FETCH])
+
+    assert [call["arguments"] for call in executed] == [
+        {"query": f"request-{position}"} for position in range(count)
+    ]
+    starts = _events(lines, "tool_start")
+    ends = _events(lines, "tool_end")
+    assert len(starts) == len(ends) == count
+    assert [event["tool_call_id"] for event in starts] == [
+        f"tool_call_{position}" for position in range(count)
+    ]
+    replayed = transport.requests[1]["messages"]
+    replayed_calls = [
+        call
+        for message in replayed
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    assert len(replayed_calls) == count
+    assert len({call["id"] for call in replayed_calls}) == count
+    assert [json.loads(call["function"]["arguments"]) for call in replayed_calls] == [
+        {"query": f"request-{position}"} for position in range(count)
+    ]
+
+
+def test_delayed_id_distinguishes_json_boolean_from_number(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": '{"query":1}',
+                                },
+                            }
+                        ]
+                    }
+                ),
+                _sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_boolean",
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": '{"query":true}',
+                                },
+                            }
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    _run(transport)
+
+    assert len(executed) == 2
+    assert executed[0]["arguments"]["query"] == 1
+    assert type(executed[0]["arguments"]["query"]) is int
+    assert executed[1]["arguments"]["query"] is True
+
+
+def test_name_arriving_after_arguments_attaches_to_the_call(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": '{"query":"late-name"}'},
+                            }
+                        ]
+                    }
+                ),
+                _sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"name": "web_search", "arguments": ""},
+                            }
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    _run(transport)
+
+    assert [(call["name"], call["arguments"]) for call in executed] == [
+        ("web_search", {"query": "late-name"})
+    ]
 
 
 def test_a_conversation_search_here_gets_the_active_branch(executed):
@@ -1285,8 +1417,8 @@ def test_a_skipped_duplicate_closes_the_card_the_provider_already_painted(execut
     card for every call. A repeat is answered with a nudge and never executed,
     which used to leave that card running for the rest of the answer.
 
-    The event has to carry the id the provider streamed: a repeated call is
-    exactly the one the loop renames to keep the replayed history unambiguous.
+    Event ids must also be unique when the provider reuses an id in a later
+    round, or the second result resolves to the first card.
     """
     repeat = [
         _sse({"tool_calls": [_call_delta(0, "call_a", "web_search", '{"query":"a"}')]}),
@@ -1306,7 +1438,7 @@ def test_a_skipped_duplicate_closes_the_card_the_provider_already_painted(execut
     assert len(executed) == 1
     ends = _events(lines, "tool_end")
     assert len(ends) == 2
-    assert [end["tool_call_id"] for end in ends] == ["call_a", "call_a"]
+    assert [end["tool_call_id"] for end in ends] == ["call_a", "tool_call_0"]
     assert ends[1]["result"].startswith("Unsloth did not run this call")
     # Opened as well as closed. The client retires a card id when it closes it,
     # so a second tool_end on the same id resolves to no card and the adapter
@@ -1314,7 +1446,7 @@ def test_a_skipped_duplicate_closes_the_card_the_provider_already_painted(execut
     # the card the second event closes, and keeps the loop's invariant that
     # every tool_end has a matching tool_start.
     starts = _events(lines, "tool_start")
-    assert [start["tool_call_id"] for start in starts] == ["call_a", "call_a"]
+    assert [start["tool_call_id"] for start in starts] == ["call_a", "tool_call_0"]
 
 
 def test_a_second_call_at_one_index_keeps_its_own_argument_fragments(executed):
@@ -1383,3 +1515,357 @@ def test_a_fragment_naming_its_call_goes_back_to_that_call(executed):
     _run(transport)
 
     assert [call["arguments"] for call in executed] == [{"query": "first"}, {"query": "second"}]
+
+
+def test_whitespace_arguments_keep_a_name_only_opening_separate(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [_call_delta(0, None, "web_search", "{}")]}),
+                _sse({"tool_calls": [_call_delta(0, None, "web_fetch", " ")]}),
+                _sse({"tool_calls": [{"index": 0, "function": {"arguments": '{"query":"b"}'}}]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    _run(transport, tools = [WEB, FETCH])
+
+    assert [(call["name"], call["arguments"]) for call in executed] == [
+        ("web_search", {}),
+        ("web_fetch", {"query": "b"}),
+    ]
+
+
+@pytest.mark.parametrize("late_arguments", ["", '{"query":"first"}'])
+def test_a_delayed_id_adopts_the_idless_call(executed, late_arguments):
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [_call_delta(0, None, "web_search", '{"query":"first"}')]}),
+                _sse({"tool_calls": [_call_delta(0, "call_a", "web_search", late_arguments)]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport)
+
+    assert [call["arguments"] for call in executed] == [{"query": "first"}]
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == ["call_a"]
+
+
+def test_a_delayed_id_adopts_a_semantically_equal_snapshot(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            _call_delta(
+                                0,
+                                None,
+                                "web_search",
+                                '{ "query": "first", "nested": {"x": 2} }',
+                            )
+                        ]
+                    }
+                ),
+                _sse(
+                    {
+                        "tool_calls": [
+                            _call_delta(
+                                0,
+                                "call_a",
+                                "web_search",
+                                {"nested": {"x": 2}, "query": "first"},
+                            )
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport)
+
+    assert len(executed) == 1
+    assert executed[0]["arguments"] == {"query": "first", "nested": {"x": 2}}
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == ["call_a"]
+
+
+def test_a_stable_id_repeated_snapshot_executes_once(executed):
+    call = _call_delta(0, "call_a", "web_search", '{"query":"first"}')
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [call]}),
+                _sse({"tool_calls": [call]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    _run(transport)
+
+    assert [item["arguments"] for item in executed] == [{"query": "first"}]
+    replayed_calls = [
+        replayed_call
+        for message in transport.requests[1]["messages"]
+        if message.get("role") == "assistant"
+        for replayed_call in message.get("tool_calls") or []
+    ]
+    assert len(replayed_calls) == 1
+
+
+def test_delayed_named_ids_adopt_parallel_calls_in_order(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            _call_delta(0, None, "web_search", '{"query":"first"}'),
+                            _call_delta(0, None, "web_fetch", '{"query":"second"}'),
+                        ]
+                    }
+                ),
+                _sse({"tool_calls": [_call_delta(0, "call_a", "web_search", "")]}),
+                _sse({"tool_calls": [_call_delta(0, "call_b", "web_fetch", "")]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport, tools = [WEB, FETCH])
+
+    assert [call["arguments"] for call in executed] == [{"query": "first"}, {"query": "second"}]
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == [
+        "call_a",
+        "call_b",
+    ]
+
+
+def test_a_fresh_stable_multi_document_delta_keeps_id_on_first_call(executed):
+    delta = _call_delta(
+        0,
+        "call_a",
+        "web_search",
+        '{"query":"first"}{"query":"second"}',
+    )
+    delta["extra_content"] = {"google": {"thought_signature": "SIG-A"}}
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [delta]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport)
+
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == [
+        "call_a",
+        "tool_call_0",
+    ]
+    assert [call["arguments"] for call in executed] == [{"query": "first"}, {"query": "second"}]
+    replayed_calls = [
+        call
+        for message in transport.requests[1]["messages"]
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    assert replayed_calls[0]["extra_content"] == {"google": {"thought_signature": "SIG-A"}}
+    assert "extra_content" not in replayed_calls[1]
+
+
+def test_stream_and_replay_ids_stay_unique_when_provider_ids_collide(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            _call_delta(0, None, "web_search", '{"query":"first"}'),
+                            _call_delta(1, "tool_call_0", "web_search", '{"query":"second"}'),
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport)
+
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == [
+        "tool_call_0",
+        "tool_call_1",
+    ]
+    replayed_calls = [
+        call
+        for message in transport.requests[1]["messages"]
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    assert len({call["id"] for call in replayed_calls}) == 2
+
+
+def test_reloaded_ids_do_not_rename_frontend_events(executed):
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_call_delta(0, "tool_call_0", "web_search", '{"query":"old"}')],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "tool_call_0",
+            "name": "web_search",
+            "content": "old result",
+        },
+        {"role": "user", "content": "again"},
+    ]
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [_call_delta(0, None, "web_search", '{"query":"new"}')]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport, messages = history)
+
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == ["tool_call_0"]
+    replayed = transport.requests[1]["messages"]
+    new_call = [
+        call
+        for message in replayed
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if json.loads(call["function"]["arguments"]) == {"query": "new"}
+    ][0]
+    assert new_call["id"] != "tool_call_0"
+
+
+def test_decoded_object_arguments_execute_unchanged(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [_call_delta(0, None, "web_search", {"query": "decoded"})]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    _run(transport)
+
+    assert executed[0]["arguments"] == {"query": "decoded"}
+
+
+def test_budget_exhaustion_replays_malformed_arguments_as_valid_json(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            _call_delta(0, None, "web_search", '{"query":"first"}'),
+                            _call_delta(1, None, "web_search", '{"query":'),
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    _run(transport, max_calls = 1)
+
+    replayed_calls = [
+        call
+        for message in transport.requests[1]["messages"]
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    assert len(replayed_calls) == 2
+    assert all(json.loads(call["function"]["arguments"]) for call in replayed_calls)
+
+
+def test_incomplete_split_calls_still_reserve_their_stream_ids(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [_call_delta(0, None, "web_search", '{"query":"a"}')]}),
+                _sse({"tool_calls": [_call_delta(0, None, "web_search", '{"query":')]}),
+                _sse({"tool_calls": [_call_delta(1, None, "web_search", '{"query":"c"}')]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport)
+
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == [
+        "tool_call_0",
+        "tool_call_2",
+    ]
+    assert [call["arguments"] for call in executed] == [{"query": "a"}, {"query": "c"}]
+
+
+def test_a_later_name_does_not_activate_a_completed_unnamed_call(executed):
+    transport = FakeTransport(
+        [
+            [
+                _sse({"tool_calls": [{"index": 0, "function": {"arguments": '{"bad":1}'}}]}),
+                _sse({"tool_calls": [_call_delta(0, None, "web_search", '{"query":"ok"}')]}),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "done"}), _sse(finish = "stop"), _DONE],
+        ],
+        heals = False,
+    )
+
+    lines = _run(transport)
+
+    assert [(call["name"], call["arguments"]) for call in executed] == [
+        ("web_search", {"query": "ok"})
+    ]
+    assert [event["tool_call_id"] for event in _events(lines, "tool_start")] == ["tool_call_1"]

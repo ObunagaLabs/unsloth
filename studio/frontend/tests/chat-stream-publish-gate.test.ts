@@ -506,8 +506,8 @@ test("streaming tool-call argument deltas are paced like the text path", () => {
 
   // Both branches of the OpenAI delta.tool_calls accumulator feed the counter,
   // so a turn that only streams a call's arguments is still capped.
-  const count = loop.indexOf(
-    "streamedChars +=\n                    argsFragment.length",
+  const count = loop.search(
+    /streamedChars\s*\+=\s*rawArgsFragment\.length\s*\+\s*nameFragment\.length/,
   );
   assert.notEqual(count, -1, "tool-call argument deltas are not counted");
 
@@ -522,6 +522,26 @@ test("streaming tool-call argument deltas are paced like the text path", () => {
   assert.ok(
     loop.includes("addedToolCall = true;"),
     "a newly created tool call no longer forces a publish",
+  );
+});
+
+test("plain tool argument fragments do not rescan the accumulated JSON", () => {
+  const loop = regionOf(
+    "for await (const chunk of stream) {",
+    "} catch (streamError) {",
+  );
+
+  assert.match(
+    loop,
+    /\(argsFragment\.includes\("\{"\) \|\| argsFragment\.includes\("\["\)\)[\s\S]{0,120}?combinedDocuments = splitTopLevelJsonDocuments/,
+  );
+  assert.match(
+    loop,
+    /_split_tail &&[\s\S]{0,120}?\(argsFragment\.includes\("\}"\) \|\| argsFragment\.includes\("\]"\)\)[\s\S]{0,80}?\? splitTopLevelJsonDocuments/,
+  );
+  assert.ok(
+    loop.includes("const matchedClosed = checkCompletedSlot"),
+    "completed-slot detection scans every argument fragment",
   );
 });
 
