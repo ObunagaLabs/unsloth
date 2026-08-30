@@ -27124,6 +27124,7 @@ class LlamaCppBackend:
             has_text_only_provisional_card,
             is_always_safe_tool,
             is_high_risk_tool_call,
+            project_rule_for_tool_call,
         )
 
         # "full" and bypass_permissions are the same switch, whichever arrives
@@ -29193,6 +29194,13 @@ class LlamaCppBackend:
                             decision.as_assistant_tool_call()
                         )
 
+                    project_rule = project_rule_for_tool_call(
+                        session_id,
+                        decision.tool_name,
+                        decision.arguments,
+                    )
+                    project_effect = str((project_rule or {}).get("effect") or "")
+
                     # Bypass wins here too, so a direct internal caller with both
                     # flags never prompts. "auto" pauses only high-risk calls;
                     # "off" never prompts (sandbox stays on).
@@ -29205,6 +29213,10 @@ class LlamaCppBackend:
                         needs_confirm = is_high_risk_tool_call(
                             decision.tool_name, decision.arguments
                         )
+                    if project_effect == "allow":
+                        needs_confirm = False
+                    elif project_effect == "prompt" and confirm_tool_calls:
+                        needs_confirm = True
                     approval_id = new_approval_id() if needs_confirm else ""
                     decision_slot = (
                         begin_tool_decision(session_id, approval_id) if needs_confirm else None
@@ -29290,237 +29302,10 @@ class LlamaCppBackend:
                         if decision_slot is not None:
                             abort_tool_decision(decision_slot, approval_id)
 
-                    # Can the turn this call is part of still be SERVED once it returns?
-                    # Everything below prices what a result may add; nothing asked whether
-                    # the prompt fits with no result at all. It can already not fit: the
-                    # model's own arguments are in `conversation` by now (appended above),
-                    # and a whole-file `edit_file` puts the file itself there. The budget
-                    # clamps to zero, the result is cut to its notice, the tool runs, and
-                    # llama-server rejects the next request anyway -- with the write on
-                    # disk. Nothing downstream recovers it: the fit protects the newest
-                    # turn, and ctx_shift is off for any mmproj load, so there is no
-                    # sliding window underneath this either.
-                    #
-                    # Two levers, both only once the turn is actually spilling. History
-                    # first, via the arguments of calls that already returned -- pure
-                    # replay, since the tool got them in full and the file is on disk --
-                    # and only then a refusal, which is worth saying precisely because it
-                    # is the one outcome on this path that leaves nothing written.
-                    _unservable_text: Optional[str] = None
-                    # Set when the gate chose to RUN an oversized call rather than
-                    # refuse it, on the strength of what compacting it will reclaim.
-                    _compact_after_execution = False
-                    # The exact count of the prompt that compaction WILL produce, kept so
-                    # the result budget below is priced against it.
-                    _compacted_turn_tokens: Optional[int] = None
-                    if self._effective_context_length:
-                        # This iteration's cap, like every other sizing decision in it.
-                        _room_target = prompt_budget(
-                            self._effective_context_length, _iteration_max_tokens
-                        )
-                        # Cheap gate first. The exact count is a template render plus a
-                        # tokenizer pass over the whole conversation, and this runs per
-                        # call; a thread with room to spare must not pay for it. The
-                        # estimate only decides whether to ASK, never whether to refuse.
-                        # Conservative, not the flat dense estimate. That one still
-                        # charges ASCII four characters a token, and base64 tokenises
-                        # near one, so a ~6 KB encoded `edit_file` payload prices at a
-                        # quarter of its real cost and slips under this threshold at a
-                        # 4096 window -- the exact check is skipped, the tool runs, and
-                        # the write lands before the next request is rejected. Erring
-                        # high here only costs an extra count; erring low costs the
-                        # whole gate.
-                        if (
-                            estimate_messages_tokens_conservative(
-                                messages_without_unpriced_media(conversation)
-                            )
-                            > 0.7 * _room_target
-                        ):
-                            # Priced with a STAND-IN tool message for the call about to
-                            # run, not on the conversation as it stands. A chat template
-                            # renders an assistant turn's `tool_calls` only once a `tool`
-                            # message answers them -- until then the arguments cost the
-                            # prompt nothing, so counting the conversation as-is misses
-                            # exactly the tokens this gate exists to catch. Measured on
-                            # Qwen3.8-27B: the same messages price at 1,063 tokens without
-                            # the stand-in and 2,172 with it, and the request the loop goes
-                            # on to send is the second number.
-                            #
-                            # Empty content, because that is the best case: a result can be
-                            # cut to its notice but the call itself cannot be unsent. If
-                            # even this does not fit, nothing the tool returns will.
-                            _probe_message: dict = {
-                                "role": "tool",
-                                "name": decision.tool_name,
-                                "content": "",
-                            }
-                            if decision.tool_call_id:
-                                _probe_message["tool_call_id"] = decision.tool_call_id
-                            _compacted_calls = 0
-                            for _attempt in range(2):
-                                try:
-                                    _turn_tokens = self.count_chat_tokens(
-                                        neutralize_control_markup_in_messages(
-                                            messages_without_unpriced_media(
-                                                [*conversation, _probe_message]
-                                            ),
-                                            _markup_cache,
-                                            self.markup_profile,
-                                        ),
-                                        None,
-                                        safe_tools,
-                                        strict = True,
-                                        chat_template_kwargs = _reasoning_kw,
-                                    )
-                                except Exception:
-                                    # No count, no refusal: the old behaviour (run it and
-                                    # let llama-server decide) beats declining a call on a
-                                    # number that could not be taken.
-                                    logger.debug(
-                                        "pre-execution fit: prompt count failed",
-                                        exc_info = True,
-                                    )
-                                    break
-                                if turn_is_servable(
-                                    self._effective_context_length, max_tokens, _turn_tokens
-                                ):
-                                    break
-                                if _attempt == 0:
-                                    # Spend history, then re-price against the real
-                                    # tokenizer rather than trusting the saving.
-                                    _compacted, _n = compact_completed_tool_arguments(
-                                        conversation, protect_last = 1
-                                    )
-                                    if _n:
-                                        conversation[:] = _compacted
-                                        _compacted_calls = _n
-                                        logger.info(
-                                            "Compacted arguments of %d completed tool call(s) "
-                                            "to fit the context window",
-                                            _n,
-                                        )
-                                        continue
-                                # Last resort before refusing: run it anyway, and compact
-                                # ITS arguments the moment it returns.
-                                #
-                                # Running a tool needs no context -- only the next prompt
-                                # does, and by then the arguments describe a file on disk.
-                                # Refusing does not avoid their cost either, because the
-                                # refusal is itself the `tool` message that renders them;
-                                # it just spends the same tokens with nothing written, and
-                                # the model retries with a fresh oversized call. Measured
-                                # over three rounds of one thread, each retry reclaimed
-                                # less (50%, 34%, 15%) and the turn ended in a
-                                # one-character reply.
-                                if decision.tool_call_id:
-                                    _as_if_run = compact_executed_call_arguments(
-                                        [*conversation, _probe_message],
-                                        decision.tool_call_id,
-                                    )
-                                    try:
-                                        _after_tokens = self.count_chat_tokens(
-                                            neutralize_control_markup_in_messages(
-                                                messages_without_unpriced_media(_as_if_run),
-                                                _markup_cache,
-                                                self.markup_profile,
-                                            ),
-                                            None,
-                                            safe_tools,
-                                            strict = True,
-                                            chat_template_kwargs = _reasoning_kw,
-                                        )
-                                    except Exception:
-                                        _after_tokens = None
-                                    if _after_tokens is not None and turn_is_servable(
-                                        self._effective_context_length,
-                                        max_tokens,
-                                        _after_tokens,
-                                    ):
-                                        _compact_after_execution = True
-                                        _compacted_turn_tokens = _after_tokens
-                                        logger.info(
-                                            "Running %s despite a %d-token turn: compacting "
-                                            "its own arguments afterwards brings the next "
-                                            "prompt to %d, so the file gets written",
-                                            decision.tool_name,
-                                            _turn_tokens,
-                                            _after_tokens,
-                                        )
-                                        break
-                                from core.inference import context_refusal  # noqa: PLC0415
-
-                                _unservable_text = context_refusal.describe_unservable_tool_call(
-                                    decision.tool_name,
-                                    _turn_tokens,
-                                    self._effective_context_length,
-                                    compacted_calls = _compacted_calls,
-                                )
-                                logger.warning(
-                                    "Refused %s before execution: prompt would be %d tokens "
-                                    "against a %d-token window",
-                                    decision.tool_name,
-                                    _turn_tokens,
-                                    self._effective_context_length,
-                                )
-                                break
-
-                    if _unservable_text is not None:
-                        # Same shape as the user-denied path above, so the frontend needs
-                        # no new case and the model gets a tool result it can read rather
-                        # than a stream that stops mid-turn.
-                        resolved_provisional_tool_call_ids.add(decision.tool_call_id)
-                        yield {
-                            "type": "tool_end",
-                            "tool_name": decision.tool_name,
-                            "tool_call_id": decision.tool_call_id,
-                            "result": _unservable_text,
-                            "provenance": decision.provenance,
-                        }
-                        _refused_message = {
-                            "role": "tool",
-                            "name": decision.tool_name,
-                            "content": _unservable_text,
-                        }
-                        if decision.tool_call_id:
-                            _refused_message["tool_call_id"] = decision.tool_call_id
-                        conversation.append(_refused_message)
-                        # The refusal is itself the `tool` message that makes this call's
-                        # arguments start rendering, so declining without this leaves the
-                        # next generation over the window anyway: observed as an accurate
-                        # refusal followed four seconds later by the 400 it was issued to
-                        # prevent. Nothing ran, so nothing on disk reflects them.
-                        _before_refused_compaction = len(json.dumps(conversation, default = str))
-                        conversation[:] = compact_refused_tool_arguments(
-                            conversation, decision.tool_call_id
-                        )
-                        _after_refused_compaction = len(json.dumps(conversation, default = str))
-                        if _after_refused_compaction < _before_refused_compaction:
-                            logger.info(
-                                "Compacted refused %s arguments: %d -> %d chars",
-                                decision.tool_name,
-                                _before_refused_compaction,
-                                _after_refused_compaction,
-                            )
-                        if _forced_tool_call_pending:
-                            _forced_tool_call_pending = False
-                        # The forced choice is spent by this refusal, as it is by a user
-                        # denial. Left unresolved, the next iteration advertises the same
-                        # tool as required and the model is pushed into calling it again
-                        # for the same refusal, instead of being free to say what went
-                        # wrong or finish the turn another way.
-                        _forced_choice_resolved = True
-                        # This assistant turn was rebuilt by the compaction above, so the
-                        # handle the batch is appending to no longer belongs to it.
-                        for _rmsg in reversed(conversation):
-                            if _rmsg.get("role") != "assistant":
-                                continue
-                            if any(
-                                (_tc or {}).get("id") == decision.tool_call_id
-                                for _tc in (_rmsg.get("tool_calls") or [])
-                            ):
-                                assistant_msg = _rmsg
-                                break
-                        continue
+                    project_rule_approved = project_effect != "prompt" or _decision not in {
+                        None,
+                        "deny",
+                    }
 
                     _effective_timeout = None if tool_call_timeout >= 9999 else tool_call_timeout
                     # RAG: cap paraphrased KB re-searches that slip past the dup guard.
@@ -29816,6 +29601,8 @@ class LlamaCppBackend:
                                     )
                             if accepts_output_callback(execute_tool):
                                 kwargs["output_callback"] = _output_callback
+                            if accepts_kwarg(execute_tool, "project_rule_approved"):
+                                kwargs["project_rule_approved"] = project_rule_approved
                             kwargs.update(search_images_kwargs(execute_tool, _decision.tool_name))
                             return execute_tool(
                                 _decision.tool_name,

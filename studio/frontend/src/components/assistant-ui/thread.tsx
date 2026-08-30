@@ -112,6 +112,7 @@ import {
 import { useChatPreferencesStore } from "@/features/chat/stores/chat-preferences-store";
 import { useChatProjects } from "@/features/chat/hooks/use-chat-projects";
 import { NewProjectDialog } from "@/features/chat/components/new-project-dialog";
+import { ProjectGoalBar } from "@/features/chat/components/project-goal-bar";
 import { ResearchMessage } from "@/features/chat/components/research-message";
 import {
   DeepResearchComposerButton,
@@ -2178,7 +2179,8 @@ const ThreadWelcome: FC<{
 export const ProjectComposer: FC<{
   disabled?: boolean;
   placeholder?: string;
-}> = ({ disabled, placeholder }) => {
+  beforeSubmit?: () => boolean;
+}> = ({ disabled, placeholder, beforeSubmit }) => {
   return (
     <GeneratedImageOverlayProvider>
       {/* New chat in a project: queuing follow-ups here misbinds the thread,
@@ -2187,6 +2189,7 @@ export const ProjectComposer: FC<{
         disabled={disabled}
         placeholder={placeholder}
         disableQueue
+        beforeSubmit={beforeSubmit}
       />
     </GeneratedImageOverlayProvider>
   );
@@ -2198,7 +2201,8 @@ const ComposerAnimated: FC<{
   threadId?: string | null;
   menuSide?: "top" | "bottom";
   disableQueue?: boolean;
-}> = ({ disabled, threadId, menuSide, disableQueue }) => {
+  beforeSubmit?: () => boolean;
+}> = ({ disabled, threadId, menuSide, disableQueue, beforeSubmit }) => {
   return (
     <div className="relative mx-auto min-w-0 w-full max-w-[46rem]">
       <div className="relative z-10 w-full">
@@ -2207,6 +2211,7 @@ const ComposerAnimated: FC<{
           threadId={threadId}
           menuSide={menuSide}
           disableQueue={disableQueue}
+          beforeSubmit={beforeSubmit}
         />
       </div>
     </div>
@@ -2253,7 +2258,8 @@ const Composer: FC<{
   threadId?: string | null;
   menuSide?: "top" | "bottom";
   disableQueue?: boolean;
-}> = ({ disabled, threadId, menuSide, disableQueue }) => {
+  beforeSubmit?: () => boolean;
+}> = ({ disabled, threadId, menuSide, disableQueue, beforeSubmit }) => {
   const aui = useAui();
   const isDictating = useAuiState((s) => s.composer.dictation != null);
   const pageDragging = useContext(PageDragContext);
@@ -4185,6 +4191,11 @@ const Composer: FC<{
     ],
   );
 
+  const allowSubmit = useCallback(
+    () => !beforeSubmit || beforeSubmit(),
+    [beforeSubmit],
+  );
+
   // Fire the parked send once indexing clears, unless the user emptied the
   // composer while waiting (then drop it quietly). An image dropped after the
   // send was parked has to land first, or indexing finishing early sends the
@@ -4238,13 +4249,15 @@ const Composer: FC<{
         // queueComposerText clears the draft from its onStarted callback, so a
         // queue that never starts leaves the text recoverable.
         if (canQueueCurrentPrompt) {
+          if (!allowSubmit()) return;
           queueComposerText(true);
           return;
         }
         // A long paste lives in an attachment, so queueing the text alone
         // queues nothing when that is all there is.
-        if (canQueuePastedTextPrompt && queuePastedTextPrompt(true)) {
-          return;
+        if (canQueuePastedTextPrompt) {
+          if (!allowSubmit()) return;
+          if (queuePastedTextPrompt(true)) return;
         }
         // Nothing queueable while a run is live: keep it and say why. Sending
         // would push the attachment into the running thread.
@@ -4259,13 +4272,16 @@ const Composer: FC<{
       // Nothing running: the chord still queues up front, as it does live.
       if (forceQueue && !disableQueue) {
         if (canQueueCurrentPrompt) {
+          if (!allowSubmit()) return;
           queueComposerText(false);
           return;
         }
-        if (canQueuePastedTextPrompt && queuePastedTextPrompt(false)) {
-          return;
+        if (canQueuePastedTextPrompt) {
+          if (!allowSubmit()) return;
+          if (queuePastedTextPrompt(false)) return;
         }
       }
+      if (!allowSubmit()) return;
       clearStoredDraft();
       sendReservedComposer();
     }
@@ -4290,6 +4306,7 @@ const Composer: FC<{
     overlay,
     hasAttachments,
     hasPendingAudio,
+    allowSubmit,
   ]);
 
   // Drop any queued send + toast on unmount (e.g. thread switch).
@@ -4530,11 +4547,15 @@ const Composer: FC<{
           return;
         }
         if (!canQueueCurrentPrompt) {
-          if (
-            canQueuePastedTextPrompt &&
-            queuePastedTextPrompt(liveThreadIsRunning || livePreStreamRunActive)
-          ) {
-            return;
+          if (canQueuePastedTextPrompt) {
+            if (!allowSubmit()) return;
+            if (
+              queuePastedTextPrompt(
+                liveThreadIsRunning || livePreStreamRunActive,
+              )
+            ) {
+              return;
+            }
           }
           if (overlay || hasAttachments || hasPendingAudio) {
             toast.error(
@@ -4549,6 +4570,7 @@ const Composer: FC<{
           }
           return;
         }
+        if (!allowSubmit()) return;
         queueComposerText(liveThreadIsRunning || livePreStreamRunActive);
         return;
       }
@@ -4559,11 +4581,13 @@ const Composer: FC<{
       if (forceQueue && !disableQueue) {
         if (canQueueCurrentPrompt) {
           event.preventDefault();
+          if (!allowSubmit()) return;
           queueComposerText(false);
           return;
         }
         if (canQueuePastedTextPrompt) {
           event.preventDefault();
+          if (!allowSubmit()) return;
           if (queuePastedTextPrompt(false)) {
             return;
           }
@@ -4595,6 +4619,10 @@ const Composer: FC<{
           closeOverlay();
           return;
         }
+        if (!allowSubmit()) {
+          event.preventDefault();
+          return;
+        }
         clearStoredDraft();
         setImageToolsEnabled(true);
         setPendingImageEditReference({
@@ -4624,16 +4652,19 @@ const Composer: FC<{
 
       if (hasAttachments || hasPendingAudio) {
         event.preventDefault();
+        if (!allowSubmit()) return;
         clearStoredDraft();
         sendReservedComposer();
         return;
       }
       event.preventDefault();
+      if (!allowSubmit()) return;
       clearStoredDraft();
       sendReservedComposer();
     },
     [
       aui,
+      allowSubmit,
       canQueueCurrentPrompt,
       canQueuePastedTextPrompt,
       queueComposerText,
@@ -4859,6 +4890,7 @@ const Composer: FC<{
           onClose={() => setYoutubeLink(null)}
         />
       ) : null}
+      <ProjectGoalBar />
       {isTauri ? (
         // Phase 1 native model owns Tauri local-path drops. Restore browser
         // attachment drops in Tauri once Phase 1d adds token bridging.
