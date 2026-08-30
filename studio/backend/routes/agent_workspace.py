@@ -1080,7 +1080,9 @@ def decide_memory_dream_proposal(
             expected_hash = payload.expectedHash or proposal.get("expectedHash")
             if proposal.get("operation") == "delete":
                 if not isinstance(expected_hash, str) or len(expected_hash) != 64:
-                    raise AgentWorkspaceError("A deletion proposal requires its current memory hash.")
+                    raise AgentWorkspaceError(
+                        "A deletion proposal requires its current memory hash."
+                    )
                 proposal["deletedEntry"] = delete_memory_entry(
                     project_id,
                     str(proposal["path"]),

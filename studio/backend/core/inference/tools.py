@@ -11209,10 +11209,7 @@ def _cancel_child_agent(arguments: dict, session_id: "str | None") -> str:
 
 
 def _memory_tool_result(
-    name: str,
-    arguments: dict,
-    session_id: "str | None",
-    owner_session_id: "str | None",
+    name: str, arguments: dict, session_id: "str | None", owner_session_id: "str | None"
 ) -> str:
     project_id = _tool_project_id(session_id)
     if project_id is None:

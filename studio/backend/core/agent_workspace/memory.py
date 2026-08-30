@@ -568,9 +568,7 @@ def _transcript(thread_id: str, project_id: str) -> Optional[dict[str, Any]]:
     }
 
 
-def _tool_call_finding(
-    value: Any, transcript_id: str, message_id: str
-) -> Optional[dict[str, Any]]:
+def _tool_call_finding(value: Any, transcript_id: str, message_id: str) -> Optional[dict[str, Any]]:
     if not isinstance(value, dict):
         return None
     name = _safe_text(
@@ -653,6 +651,7 @@ def _finding_matches_steering(finding: dict[str, Any], steering: dict[str, Any])
     text = " ".join(
         str(finding.get(key) or "") for key in ("kind", "statement", "excerpt")
     ).casefold()
+
     def matches(term: str) -> bool:
         if term in text:
             return True

@@ -61,7 +61,14 @@ def _thread(thread_id, project_id = "project"):
     )
 
 
-def _message(message_id, thread_id, content, *, role = "user", metadata = None):
+def _message(
+    message_id,
+    thread_id,
+    content,
+    *,
+    role = "user",
+    metadata = None,
+):
     return studio_db.upsert_chat_message(
         {
             "id": message_id,
@@ -180,16 +187,15 @@ def test_agents_cannot_read_or_modify_other_sessions_private_memory(tmp_path):
         actor = "agent",
         source_session_id = "project-project",
     )
-    assert get_memory_entry(
-        "project", "agent/scratch.md", actor = "agent", session_id = "project-project"
-    )["hash"] == private["hash"]
-    with pytest.raises(AgentWorkspaceError, match = "private"):
+    assert (
         get_memory_entry(
-            "project", "agent/scratch.md", actor = "agent", session_id = "project-other"
-        )
-    assert search_memory(
-        "project", "session one", actor = "agent", session_id = "project-other"
-    ) == []
+            "project", "agent/scratch.md", actor = "agent", session_id = "project-project"
+        )["hash"]
+        == private["hash"]
+    )
+    with pytest.raises(AgentWorkspaceError, match = "private"):
+        get_memory_entry("project", "agent/scratch.md", actor = "agent", session_id = "project-other")
+    assert search_memory("project", "session one", actor = "agent", session_id = "project-other") == []
     with pytest.raises(AgentWorkspaceError, match = "private"):
         write_memory_entry(
             "project",
@@ -390,9 +396,7 @@ def test_dream_cleanup_deletion_requires_and_records_user_acceptance(tmp_path):
             break
         time.sleep(0.01)
     assert dream is not None and dream["status"] == "completed"
-    proposal = next(
-        item for item in dream["result"]["proposals"] if item["path"] == stale["path"]
-    )
+    proposal = next(item for item in dream["result"]["proposals"] if item["path"] == stale["path"])
     assert proposal["operation"] == "delete"
     decision = client.post(
         f"/api/agent-workspace/projects/project/memory/dreams/{dream_id}/proposals/{proposal['id']}",
