@@ -66,6 +66,7 @@ import {
 } from "../lib/gguf-filename";
 import {
   ggufVariantDisplayLabel,
+  ggufVariantTransferBytes,
   ggufVariantTransferLabel,
   sortDownloadableGgufVariants,
 } from "../lib/gguf-variant-sort";
@@ -96,6 +97,7 @@ import { DeleteImpactSummary, useDeleteImpact } from "./delete-impact";
 import { useDeleteConfirmAction } from "./use-delete-confirm-action";
 import { useDownloadCardState } from "./use-download-card-state";
 import { useGgufVariantFetchState } from "./use-gguf-variant-fetch-state";
+import { useInferenceGpuInfo } from "@/hooks/use-gpu-info";
 
 interface FitBadgeMeta {
   label: string;
@@ -127,9 +129,23 @@ const FIT_BADGE: Record<GgufFitClass, FitBadgeMeta> = {
       "No GPU VRAM detected. This GGUF may run with system RAM and CPU offload. Inference will be slower.",
     iconClassName: "text-sky-600 dark:text-sky-400",
   },
+  disk: {
+    label: "Runs from disk",
+    tooltip:
+      "Larger than your VRAM and system RAM combined. It still loads: the weights are "
+      + "memory-mapped and paged from the file, so expect a few tokens per second.",
+    iconClassName: "text-amber-600 dark:text-amber-400",
+  },
+  nospace: {
+    label: "No disk space",
+    tooltip:
+      "Larger than the free space on this machine, so it cannot be downloaded. "
+      + "Free up space or take a smaller quant.",
+    iconClassName: "text-rose-600 dark:text-rose-400",
+  },
   oom: {
     label: "Won't fit",
-    tooltip: "Exceeds combined VRAM and system RAM budget.",
+    tooltip: "No memory budget was detected for this machine.",
     iconClassName: "text-rose-600 dark:text-rose-400",
   },
 };
@@ -250,7 +266,12 @@ interface GgufVariantMenuItem {
 
 function createGgufVariantMenuItems(
   variants: readonly GgufVariantDetail[] | null,
-  resources: { gpuGb?: number; systemRamGb?: number; budgetFraction?: number },
+  resources: {
+    gpuGb?: number;
+    systemRamGb?: number;
+    budgetFraction?: number;
+    diskFreeGb?: number;
+  },
 ): GgufVariantMenuItem[] {
   if (!variants) return [];
   return variants.map((variant) => ({
@@ -258,7 +279,11 @@ function createGgufVariantMenuItems(
     key: normalizeGgufVariantIdentity(variant.quant),
     quant: variant.quant,
     label: ggufVariantDisplayLabel(variant),
-    fit: classifyGgufFit(variant.size_bytes, resources),
+    fit: classifyGgufFit(variant.size_bytes, {
+      ...resources,
+      onDisk: Boolean(variant.downloaded),
+      downloadBytes: ggufVariantTransferBytes(variant),
+    }),
     downloaded: Boolean(variant.downloaded),
     partial: Boolean(variant.partial),
     downloadSizeLabel: ggufVariantTransferLabel(variant),
@@ -630,6 +655,10 @@ export function GgufDownloadCard({
   // loader will actually admit at. The memory bar on this same row already reads
   // it; without this the two disagreed for every saved fraction below the default.
   const budgetFraction = useVramBudgetFraction() ?? undefined;
+  // Free space on the cache volume, for the floor under every fit verdict: a
+  // quant larger than it cannot be downloaded at all. 0 reads as unread and the
+  // check abstains.
+  const diskFreeGb = useInferenceGpuInfo().diskFreeGb || undefined;
 
   const rawSortedVariants = useMemo(() => {
     if (!variants) return null;
@@ -637,8 +666,9 @@ export function GgufDownloadCard({
       gpuGb,
       systemRamGb,
       budgetFraction,
+      diskFreeGb,
     });
-  }, [variants, gpuGb, systemRamGb, budgetFraction]);
+  }, [variants, gpuGb, systemRamGb, budgetFraction, diskFreeGb]);
   const selectLiveGgufVariantStates = useMemo(
     () => createLiveGgufVariantStatesSelector(repoId),
     [repoId],
@@ -665,8 +695,9 @@ export function GgufDownloadCard({
         gpuGb,
         systemRamGb,
         budgetFraction,
+        diskFreeGb,
       }),
-    [gpuGb, sortedVariants, systemRamGb, budgetFraction],
+    [gpuGb, sortedVariants, systemRamGb, budgetFraction, diskFreeGb],
   );
 
   const selectedQuant =
@@ -766,9 +797,12 @@ export function GgufDownloadCard({
             gpuGb,
             systemRamGb,
             budgetFraction,
+            diskFreeGb,
+            onDisk: Boolean(selected.downloaded),
+            downloadBytes: ggufVariantTransferBytes(selected),
           })
         : null,
-    [gpuGb, selected?.size_bytes, systemRamGb, budgetFraction],
+    [gpuGb, selected, systemRamGb, budgetFraction, diskFreeGb],
   );
   const selectedDownloadSizeLabel = selected
     ? ggufVariantTransferLabel(selected)

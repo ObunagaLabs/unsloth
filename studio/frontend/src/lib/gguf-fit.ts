@@ -8,11 +8,30 @@
  * chat picker can't disagree.
  */
 
-export type GgufFitClass = "fits" | "marginal" | "partial" | "ram" | "oom";
+export type GgufFitClass =
+  | "fits"
+  | "marginal"
+  | "partial"
+  | "ram"
+  | "disk"
+  | "nospace"
+  | "oom";
 
 export interface GgufFitInput {
   gpuGb?: number;
   systemRamGb?: number;
+  /** Free space on the cache volume. Absent or 0 means unread, and the floor
+   *  abstains rather than refusing every row. DECIMAL GB, matching the backend
+   *  (`main.py` divides disk by 1e9, unlike memory); the comparison converts
+   *  the file to the same base. */
+  diskFreeGb?: number;
+  /** True when this file is already on the machine. The floor is about landing
+   *  the download, and a landed file needs no space it does not already hold. */
+  onDisk?: boolean;
+  /** Bytes the download would actually transfer: full footprint with companions
+   *  for a fresh fetch, the measured remainder for a resumable partial. Defaults
+   *  to the checkpoint size. */
+  downloadBytes?: number;
   /** The user's saved VRAM Budget, when it is known.
    *
    *  Absent means "not loaded yet, or a backend too old to serve the route", and
@@ -61,12 +80,25 @@ export function requiredGgufMemoryGb(
 
 export function classifyGgufFit(
   sizeBytes: number,
-  { gpuGb, systemRamGb, budgetFraction }: GgufFitInput,
+  { gpuGb, systemRamGb, budgetFraction, diskFreeGb, onDisk, downloadBytes }: GgufFitInput,
 ): GgufFitClass {
+  // Before any memory question: every tier below is a claim about where the
+  // weights sit, and all of them, `disk` loudest, assume the file is on the
+  // machine. Raw file size against the raw free figure, no activations added
+  // (disk holds the file, not the runtime) and no share taken out (a floor,
+  // not a budget).
+  if (!onDisk && typeof diskFreeGb === "number" && diskFreeGb > 0) {
+    if ((downloadBytes ?? sizeBytes) / 1e9 > diskFreeGb) return "nospace";
+  }
   const required = requiredGgufMemoryGb(sizeBytes);
   if (!gpuGb || gpuGb <= 0) {
     const ramBudget = (systemRamGb ?? 0) * RAM_OFFLOAD_USABLE_RATIO;
-    return required <= ramBudget ? "ram" : "oom";
+    if (required <= ramBudget) return "ram";
+    // Reasoned, not measured, unlike the discrete case below. mmap does not care
+    // about pool topology: a CPU-only or unified-memory host still pages weights
+    // from the file. Nobody has handed us a Mac run past its whole pool, so this
+    // says "slow" rather than "impossible" on the mechanism alone.
+    return ramBudget > 0 ? "disk" : "oom";
   }
   // Guarded rather than trusted: this arrives from a settings route, and a 0 or a
   // non-finite value would score every quant as an overage.
@@ -94,5 +126,9 @@ export function classifyGgufFit(
   // when the budget leaves them no way to load.
   const combined = budget + (systemRamGb ?? 0) * RAM_OFFLOAD_USABLE_RATIO;
   if (required <= combined) return "partial";
-  return "oom";
+  // Past every volatile byte and still not a refusal. llama.cpp maps the weights,
+  // so the OS pages the remainder from the file. Reported on the Qwen3.8-Flash-Next
+  // thread: a 90 GB quant on 16 GB of VRAM and 64 GB of RAM, running at about
+  // 12 tok/s while this function called it "Won't fit".
+  return "disk";
 }

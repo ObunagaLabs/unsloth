@@ -7,6 +7,7 @@ import { classifyGgufFit } from "@/lib/gguf-fit";
 import { ggufVariantsMatch } from "@/features/hub/lib/model-identity";
 
 type GgufVariantResources = {
+  diskFreeGb?: number;
   gpuGb?: number;
   systemRamGb?: number;
   /** The saved VRAM Budget, so the sort ranks against the line the loader will
@@ -53,7 +54,13 @@ export function ggufVariantFitRank(
   variant: GgufVariantDetail,
   resources: GgufVariantResources,
 ): number {
-  switch (classifyGgufFit(variant.size_bytes, resources)) {
+  switch (
+    classifyGgufFit(variant.size_bytes, {
+      ...resources,
+      onDisk: Boolean(variant.downloaded),
+      downloadBytes: ggufVariantTransferBytes(variant),
+    })
+  ) {
     case "fits":
       return 0;
     case "marginal":
@@ -61,8 +68,12 @@ export function ggufVariantFitRank(
     case "partial":
     case "ram":
       return 2;
-    default:
+    // Below anything that fits in memory, above a load that cannot happen.
+    case "disk":
       return 3;
+    // nospace and oom: both refusals, both last.
+    default:
+      return 4;
   }
 }
 
@@ -74,7 +85,11 @@ export function compareGgufVariantFitAndSize(
   const aFit = ggufVariantFitRank(a, resources);
   const bFit = ggufVariantFitRank(b, resources);
   if (aFit !== bFit) return aFit - bFit;
-  return aFit === 3 ? a.size_bytes - b.size_bytes : b.size_bytes - a.size_bytes;
+  // Fitting tiers largest-first (best quality that fits); disk and the refusals
+  // smallest-first (closest to viable). `=== 3` here silently flipped the
+  // refusal tier to largest-first when it moved to rank 4, and a host with no
+  // measured budget defaulted its download card to the biggest quant.
+  return aFit >= 3 ? a.size_bytes - b.size_bytes : b.size_bytes - a.size_bytes;
 }
 
 export function ggufVariantDownloadStatusRank(
