@@ -15,11 +15,14 @@ import {
   Cancel01Icon,
   CheckmarkCircle02Icon,
   Download01Icon,
+  PlayIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useRouterState } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
+import { RESUMABLE_STATES } from "./download-manager-config";
 import {
+  type DownloadRequest,
   type ManagedDownload,
   downloadManager,
   hydrateDownloadManager,
@@ -60,6 +63,16 @@ function selectActiveJobCount(state: {
   return count;
 }
 
+function selectResumableJobCount(state: {
+  jobs: Record<string, ManagedDownload>;
+}): number {
+  let count = 0;
+  for (const job of Object.values(state.jobs)) {
+    if (RESUMABLE_STATES.has(job.state)) count += 1;
+  }
+  return count;
+}
+
 function canUseDownloadManager(pathname: string): boolean {
   if (isTauri) return true;
   if (
@@ -84,6 +97,23 @@ function variantSuffix(job: ManagedDownload): string {
     return ` · ${isModelFile ? "Model file" : "Required assets"}`;
   }
   return job.variant ? ` · ${job.variant}` : "";
+}
+
+function resumeRequestFromJob(job: ManagedDownload): DownloadRequest {
+  const scopeId = job.variant?.startsWith("@")
+    ? job.variant.slice(1)
+    : undefined;
+  return {
+    kind: job.kind,
+    repoId: job.repoId,
+    variant: job.variant,
+    expectedBytes: job.expectedBytes,
+    ...(scopeId ? { scopeId } : {}),
+    ...(job.scopedFiles && job.scopedFiles.length > 0
+      ? { files: job.scopedFiles }
+      : {}),
+    ...(job.checkpoint !== undefined ? { checkpoint: job.checkpoint } : {}),
+  };
 }
 
 function StatusLine({ job }: { job: ManagedDownload }) {
@@ -111,10 +141,12 @@ function DownloadRow({ jobKey }: { jobKey: string }) {
   const job = useDownloadManagerStore((state) => state.jobs[jobKey]);
   if (!job) return null;
   const active = job.state === "running" || job.state === "cancelling";
+  const resumable = RESUMABLE_STATES.has(job.state);
   const terminal =
     job.state === "complete" ||
     job.state === "cancelled" ||
     job.state === "error";
+  const showProgress = active || resumable;
   return (
     <li className="flex flex-col gap-1.5 py-2.5 pl-4 pr-3">
       <div className="flex items-center gap-2">
@@ -135,6 +167,32 @@ function DownloadRow({ jobKey }: { jobKey: string }) {
             strokeWidth={2}
             className="size-4 shrink-0 text-destructive"
           />
+        )}
+        {resumable && (
+          <Tooltip>
+            <TooltipTrigger asChild={true}>
+              <button
+                type="button"
+                aria-label="Resume download"
+                onClick={() =>
+                  void downloadManager.requestStart(resumeRequestFromJob(job))
+                }
+                className={cn(
+                  "inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-full text-muted-foreground transition-colors",
+                  "hover:bg-foreground/[0.06] hover:text-foreground dark:hover:bg-white/[0.06]",
+                )}
+              >
+                <HugeiconsIcon
+                  icon={PlayIcon}
+                  strokeWidth={1.75}
+                  className="size-3.5"
+                />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" sideOffset={4}>
+              Resume download
+            </TooltipContent>
+          </Tooltip>
         )}
         <Tooltip>
           <TooltipTrigger asChild={true}>
@@ -164,7 +222,7 @@ function DownloadRow({ jobKey }: { jobKey: string }) {
           </TooltipContent>
         </Tooltip>
       </div>
-      {active ? (
+      {showProgress ? (
         <DownloadProgressBar
           progress={{
             expectedBytes: job.expectedBytes,
@@ -199,13 +257,17 @@ export function DownloadManagerPanel({
   const selectOrderedJobKeys = useMemo(createOrderedJobKeysSelector, []);
   const jobKeys = useDownloadManagerStore(selectOrderedJobKeys);
   const activeCount = useDownloadManagerStore(selectActiveJobCount);
+  const resumableCount = useDownloadManagerStore(selectResumableJobCount);
 
   if (!enabled || jobKeys.length === 0) return null;
 
+  const attentionCount = activeCount + resumableCount;
   const headerLabel =
     activeCount > 0
       ? `Downloading ${activeCount} ${activeCount === 1 ? "item" : "items"}`
-      : "Downloads";
+      : resumableCount > 0
+        ? `${resumableCount} ${resumableCount === 1 ? "download" : "downloads"} to resume`
+        : "Downloads";
 
   return (
     <div
@@ -232,8 +294,8 @@ export function DownloadManagerPanel({
                 strokeWidth={1.75}
                 className="size-[18px]"
               />
-              {activeCount > 0 && (
-                <span className="hub-download-fab-badge">{activeCount}</span>
+              {attentionCount > 0 && (
+                <span className="hub-download-fab-badge">{attentionCount}</span>
               )}
             </button>
           </TooltipTrigger>
