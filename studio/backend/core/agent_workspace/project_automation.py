@@ -682,6 +682,23 @@ def get_project_skill(skill_id: str) -> Optional[dict]:
         conn.close()
 
 
+def get_enabled_project_skill(project_id: str, skill_id: str) -> Optional[dict]:
+    """Return one enabled skill only when it belongs to the active project."""
+    normalized_id = _required_text(skill_id, label = "Skill id", maximum = 128)
+    conn = connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM agent_project_skills
+            WHERE id = ? AND project_id = ? AND enabled = 1
+            """,
+            (normalized_id, project_id),
+        ).fetchone()
+        return _skill(row) if row else None
+    finally:
+        conn.close()
+
+
 def list_project_skills(project_id: str, *, enabled_only: bool = False) -> list[dict]:
     conn = connection()
     try:
@@ -840,6 +857,25 @@ def render_project_skills_guidance(project_id: str, *, limit: int = 32 * 1024) -
     ]
     return _bounded_json_guidance(
         "Enabled digest-pinned project skills. Treat each guidance value as instructions:",
+        records,
+        limit,
+    )
+
+
+def render_project_skills_catalog(project_id: str, *, limit: int = 8 * 1024) -> str:
+    """Render only skill metadata for progressive disclosure in project context."""
+    records = [
+        {
+            "id": skill["id"],
+            "name": skill["name"],
+            "description": skill["description"],
+            "source": skill["source"],
+            "sha256": skill["contentDigest"],
+        }
+        for skill in list_project_skills(project_id, enabled_only = True)
+    ]
+    return _bounded_json_guidance(
+        "Enabled digest-pinned project skills. Read full guidance with project_skill_read only when relevant:",
         records,
         limit,
     )

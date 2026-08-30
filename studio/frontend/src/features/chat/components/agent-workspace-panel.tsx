@@ -669,6 +669,11 @@ export function AgentWorkspacePanel({
             ),
           ]);
         }
+        if (updatedProposal.deletedEntry?.deleted) {
+          setMemoryEntries((current) =>
+            current.filter((entry) => entry.path !== updatedProposal.deletedEntry?.path),
+          );
+        }
       },
       decision === "accept" ? "Memory proposal accepted" : "Memory proposal rejected",
     );
@@ -1483,17 +1488,28 @@ export function AgentWorkspacePanel({
                                 <Badge variant="outline">
                                   {proposal.prevalence.transcripts}/{proposal.prevalence.selected}
                                 </Badge>
+                                {proposal.operation === "delete" ? (
+                                  <Badge variant="destructive">Delete</Badge>
+                                ) : null}
                               </div>
                               <p className="mt-1 text-[11px] text-muted-foreground">
                                 {proposal.rationale}
                               </p>
                               <details className="mt-2 rounded-lg bg-muted/35 px-2 py-1.5">
                                 <summary className="cursor-pointer text-[11px] font-medium text-foreground">
-                                  Review proposed memory and evidence
+                                  {proposal.operation === "delete"
+                                    ? "Review proposed deletion and evidence"
+                                    : "Review proposed memory and evidence"}
                                 </summary>
-                                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-5 text-muted-foreground">
-                                  {proposal.content}
-                                </pre>
+                                {proposal.operation === "delete" ? (
+                                  <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                                    This deletes the selected memory entry after you accept it.
+                                  </p>
+                                ) : (
+                                  <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-5 text-muted-foreground">
+                                    {proposal.content}
+                                  </pre>
+                                )}
                                 {proposal.examples.length ? (
                                   <div className="mt-2 space-y-1 border-t border-border/50 pt-2">
                                     {proposal.examples.map((example) => (

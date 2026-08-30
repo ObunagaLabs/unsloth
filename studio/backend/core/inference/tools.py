@@ -4572,6 +4572,7 @@ _ALWAYS_SAFE_TOOLS = frozenset(
         "deep_research",
         "memory_search",
         "memory_read",
+        "project_skill_read",
     }
 )
 
@@ -10690,6 +10691,27 @@ MEMORY_UPDATE_TOOL = {
     },
 }
 
+PROJECT_SKILL_READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "project_skill_read",
+        "description": (
+            "Read the full guidance for one enabled project skill. Project context lists "
+            "only skill metadata, so call this when a skill is relevant to the task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "ID of an enabled project skill from the context catalog.",
+                },
+            },
+            "required": ["skill_id"],
+        },
+    },
+}
+
 # These tools are intentionally absent from ALL_TOOLS. They are exposed only to
 # a durable background task whose server-side delegation policy allows them.
 DELEGATE_AGENT_TOOL = {
@@ -10772,6 +10794,7 @@ ALL_TOOLS = [
     MEMORY_READ_TOOL,
     MEMORY_WRITE_TOOL,
     MEMORY_UPDATE_TOOL,
+    PROJECT_SKILL_READ_TOOL,
 ]
 
 # Deliberately an ordinary tool with an ordinary result. Studio runs three tool loops -- one for
@@ -11185,7 +11208,12 @@ def _cancel_child_agent(arguments: dict, session_id: "str | None") -> str:
         return f"Error: child agent could not be cancelled: {str(exc)[:1000]}."
 
 
-def _memory_tool_result(name: str, arguments: dict, session_id: "str | None") -> str:
+def _memory_tool_result(
+    name: str,
+    arguments: dict,
+    session_id: "str | None",
+    owner_session_id: "str | None",
+) -> str:
     project_id = _tool_project_id(session_id)
     if project_id is None:
         return "Error: durable memory is available only inside a persisted project session."
@@ -11204,12 +11232,19 @@ def _memory_tool_result(name: str, arguments: dict, session_id: "str | None") ->
                 query,
                 top_k = arguments.get("top_k", 8),
                 actor = "agent",
+                session_id = owner_session_id,
             )
         elif name == "memory_read":
             path = arguments.get("path")
             if not isinstance(path, str) or not path.strip():
                 return "Error: memory_read requires a path."
-            result = get_memory_entry(project_id, path, include_content = True, actor = "agent")
+            result = get_memory_entry(
+                project_id,
+                path,
+                include_content = True,
+                actor = "agent",
+                session_id = owner_session_id,
+            )
         elif name == "memory_write":
             path = arguments.get("path")
             content = arguments.get("content")
@@ -11220,7 +11255,7 @@ def _memory_tool_result(name: str, arguments: dict, session_id: "str | None") ->
                 path,
                 content,
                 actor = "agent",
-                source_session_id = session_id,
+                source_session_id = owner_session_id,
             )
         else:
             path = arguments.get("path")
@@ -11236,9 +11271,38 @@ def _memory_tool_result(name: str, arguments: dict, session_id: "str | None") ->
                 content,
                 expected_hash = expected_hash,
                 actor = "agent",
-                source_session_id = session_id,
+                source_session_id = owner_session_id,
             )
         return json.dumps(result, ensure_ascii = False, sort_keys = True)
+    except Exception as exc:  # noqa: BLE001 - tool failures are returned to the model
+        return f"Error: {str(exc)[:2000]}"
+
+
+def _project_skill_tool_result(arguments: dict, session_id: "str | None") -> str:
+    project_id = _tool_project_id(session_id)
+    if project_id is None:
+        return "Error: project skills are available only inside a persisted project session."
+    skill_id = arguments.get("skill_id")
+    if not isinstance(skill_id, str) or not skill_id.strip():
+        return "Error: project_skill_read requires a skill_id."
+    try:
+        from core.agent_workspace.project_automation import get_enabled_project_skill
+
+        skill = get_enabled_project_skill(project_id, skill_id.strip())
+        if skill is None:
+            return "Error: the requested project skill is not enabled for this project."
+        return json.dumps(
+            {
+                "id": skill["id"],
+                "name": skill["name"],
+                "description": skill["description"],
+                "source": skill["source"],
+                "sha256": skill["contentDigest"],
+                "guidance": skill["guidance"],
+            },
+            ensure_ascii = False,
+            sort_keys = True,
+        )
     except Exception as exc:  # noqa: BLE001 - tool failures are returned to the model
         return f"Error: {str(exc)[:2000]}"
 
@@ -11352,7 +11416,11 @@ def execute_tool(
     if name == "cancel_child_agent":
         return _fit_result_to_room(_cancel_child_agent(arguments, session_id), name)
     if name in {"memory_search", "memory_read", "memory_write", "memory_update"}:
-        return _fit_result_to_room(_memory_tool_result(name, arguments, session_id), name)
+        return _fit_result_to_room(
+            _memory_tool_result(name, arguments, session_id, thread_id or session_id), name
+        )
+    if name == "project_skill_read":
+        return _fit_result_to_room(_project_skill_tool_result(arguments, session_id), name)
     if name.startswith(MCP_TOOL_PREFIX):
         try:
             _, server_id, tool_name = name.split("__", 2)

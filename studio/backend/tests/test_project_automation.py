@@ -25,6 +25,7 @@ from core.agent_workspace.project_automation import (
     list_project_rules,
     list_schedule_runs,
     next_schedule_time,
+    render_project_skills_catalog,
     reconcile_schedule_run,
     render_project_rules_guidance,
     render_project_skills_guidance,
@@ -149,6 +150,17 @@ def test_skills_require_a_matching_digest_and_only_enabled_guidance_renders(tmp_
     ]
     with pytest.raises(AgentWorkspaceError, match = "requires a new pinned digest"):
         update_project_skill(enabled["id"], expected_revision = 1, guidance = "changed")
+    catalog = _rendered_json(render_project_skills_catalog("project", limit = 4096))
+    assert catalog == [
+        {
+            "description": "Maps architectural truth sources.",
+            "id": enabled["id"],
+            "name": "Repository mapper",
+            "sha256": skill_digest(guidance),
+            "source": "project:skills/repository-mapper/SKILL.md",
+        }
+    ]
+    assert guidance not in render_project_skills_catalog("project")
 
 
 def test_lifecycle_hooks_use_the_project_boundary_and_persist_each_result(

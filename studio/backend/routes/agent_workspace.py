@@ -1077,16 +1077,27 @@ def decide_memory_dream_proposal(
         return {"dream": _public_background_task(dream), "proposal": proposal}
     try:
         if payload.decision == "accept":
-            entry = write_memory_entry(
-                project_id,
-                str(proposal["path"]),
-                str(proposal.get("content") or ""),
-                expected_hash = payload.expectedHash or proposal.get("expectedHash"),
-                actor = "user",
-                source_transcript_ids = proposal.get("sourceTranscriptIds"),
-                dream_id = dream_id,
-            )
-            proposal["acceptedEntry"] = entry
+            expected_hash = payload.expectedHash or proposal.get("expectedHash")
+            if proposal.get("operation") == "delete":
+                if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                    raise AgentWorkspaceError("A deletion proposal requires its current memory hash.")
+                proposal["deletedEntry"] = delete_memory_entry(
+                    project_id,
+                    str(proposal["path"]),
+                    expected_hash = expected_hash,
+                    actor = "user",
+                )
+            else:
+                entry = write_memory_entry(
+                    project_id,
+                    str(proposal["path"]),
+                    str(proposal.get("content") or ""),
+                    expected_hash = expected_hash,
+                    actor = "user",
+                    source_transcript_ids = proposal.get("sourceTranscriptIds"),
+                    dream_id = dream_id,
+                )
+                proposal["acceptedEntry"] = entry
         proposal["decision"] = "accepted" if payload.decision == "accept" else "rejected"
         updated = _public_background_task(
             update_background_task(dream_id, "completed", result = result) or dream

@@ -51,6 +51,18 @@ _PREFERENCE_PATTERNS = (
     re.compile(r"\b(?:please|do)\s+not\s+(.+?)(?:[.!?]|$)", re.I),
     re.compile(r"\bnever\s+(.+?)(?:[.!?]|$)", re.I),
 )
+_DREAM_FOCUS_RE = re.compile(r"\b(?:focus(?:\s+only)?\s+on|include)\s+([^.;\n]+)", re.I)
+_DREAM_IGNORE_RE = re.compile(r"\b(?:ignore|exclude|skip)\s+([^.;\n]+)", re.I)
+_DREAM_CLEANUP_RE = re.compile(
+    r"\b(?:clean\s+up|cleanup|remove|delete)\s+(?:stale|outdated|old)\s+"
+    r"(?:dream(?:ed)?\s+)?memor(?:y|ies)\b",
+    re.I,
+)
+_DREAM_NO_CLEANUP_RE = re.compile(
+    r"\b(?:do\s+not|don't|never|avoid)\s+(?:clean\s+up|cleanup|remove|delete)"
+    r".{0,80}\bmemor(?:y|ies)\b",
+    re.I,
+)
 
 _MEMORY_LOCKS: dict[str, threading.RLock] = {}
 _MEMORY_LOCKS_GUARD = threading.Lock()
@@ -248,6 +260,30 @@ def _agent_can_write(scope: str, actor: str) -> bool:
     return actor != "agent" or scope in {"project", "agent", "session"}
 
 
+def _agent_can_access_entry(entry: dict[str, Any], actor: str, session_id: Optional[str]) -> bool:
+    """Restrict private memory namespaces to the session that created them.
+
+    Organization and project entries are intentionally shared. Agent and session
+    scratch entries are not: allowing an arbitrary project agent to search or
+    read another agent's scratchpad defeats the permission tier those namespaces
+    are intended to provide.
+    """
+    if actor != "agent" or entry.get("scope") in {"organization", "project"}:
+        return True
+    return bool(session_id) and entry.get("sourceSessionId") == session_id
+
+
+def _require_agent_private_owner(
+    entry: dict[str, Any], actor: str, source_session_id: Optional[str]
+) -> None:
+    if actor != "agent" or entry.get("scope") not in {"agent", "session"}:
+        return
+    if not source_session_id or entry.get("sourceSessionId") != source_session_id:
+        raise AgentWorkspaceError(
+            "Agent and session memory entries are private to the session that created them."
+        )
+
+
 def _normalize_source_ids(values: Optional[Iterable[Any]]) -> list[str]:
     result = []
     for value in values or []:
@@ -265,6 +301,7 @@ def get_memory_entry(
     *,
     include_content: bool = True,
     actor: str = "user",
+    session_id: Optional[str] = None,
 ) -> dict[str, Any]:
     relative = _memory_path(path)
     root = _memory_root(project_id, create = False)
@@ -272,6 +309,10 @@ def get_memory_entry(
         raise AgentWorkspaceError("Memory entry not found.")
     with _memory_lock(root):
         content, entry = _read_entry_unlocked(root, relative)
+    if not _agent_can_access_entry(entry, actor, session_id):
+        raise AgentWorkspaceError(
+            "Agent and session memory entries are private to the session that created them."
+        )
     if include_content:
         entry["content"] = content.decode("utf-8", errors = "replace")
     return entry
@@ -284,6 +325,7 @@ def list_memory_entries(
     include_content: bool = False,
     actor: str = "user",
     scopes: Optional[Iterable[str]] = None,
+    session_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     root = _memory_root(project_id, create = False)
     allowed_scopes = set(scopes or MEMORY_SCOPES)
@@ -312,6 +354,8 @@ def list_memory_entries(
                 if query_terms and not all(term in haystack for term in query_terms):
                     continue
                 entry = _entry_record(root, relative, content, ledger)
+                if not _agent_can_access_entry(entry, actor, session_id):
+                    continue
                 if include_content:
                     entry["content"] = content.decode("utf-8", errors = "replace")
                 results.append(entry)
@@ -327,6 +371,7 @@ def search_memory(
     top_k: int = 8,
     actor: str = "agent",
     scopes: Optional[Iterable[str]] = None,
+    session_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     terms = [part.casefold() for part in _safe_text(query, 512).split() if part]
     if not terms:
@@ -336,6 +381,7 @@ def search_memory(
         include_content = True,
         actor = actor,
         scopes = scopes,
+        session_id = session_id,
     )
     ranked = []
     for entry in entries:
@@ -383,6 +429,7 @@ def write_memory_entry(
         exists = path_obj.exists()
         if exists:
             current, current_entry = _read_entry_unlocked(root, relative, ledger)
+            _require_agent_private_owner(current_entry, actor, source_session_id)
             current_hash = current_entry["hash"]
             if expected_hash is None:
                 raise AgentWorkspaceError("An expected memory hash is required to update an entry.")
@@ -390,6 +437,10 @@ def write_memory_entry(
                 raise AgentWorkspaceError("Memory changed since it was read. Redraft the update.")
         elif expected_hash not in (None, ""):
             raise AgentWorkspaceError("The expected memory hash does not match a new entry.")
+        if actor == "agent" and scope in {"agent", "session"} and not source_session_id:
+            raise AgentWorkspaceError(
+                "Agent and session memory writes require a persisted session identity."
+            )
         previous = entries.get(relative) or {}
         version = int(previous.get("version") or 0) + 1
         if exists:
@@ -433,6 +484,7 @@ def delete_memory_entry(
     *,
     expected_hash: str,
     actor: str = "user",
+    source_session_id: Optional[str] = None,
 ) -> dict[str, Any]:
     relative = _memory_path(path)
     scope = relative.split("/", 1)[0]
@@ -444,6 +496,7 @@ def delete_memory_entry(
     with _memory_lock(root):
         ledger = _read_ledger(root)
         content, entry = _read_entry_unlocked(root, relative, ledger)
+        _require_agent_private_owner(entry, actor, source_session_id)
         if entry["hash"] != expected_hash:
             raise AgentWorkspaceError("Memory changed since it was read. Redraft the deletion.")
         version_root = root / MEMORY_VERSIONS / relative.rsplit("/", 1)[0]
@@ -515,6 +568,32 @@ def _transcript(thread_id: str, project_id: str) -> Optional[dict[str, Any]]:
     }
 
 
+def _tool_call_finding(
+    value: Any, transcript_id: str, message_id: str
+) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    name = _safe_text(
+        value.get("name") or value.get("toolName") or value.get("tool_name") or "tool", 160
+    ).strip()
+    status = _safe_text(value.get("status"), 80).strip()
+    error = _safe_text(value.get("error") or value.get("message"), 360).strip()
+    rendered = _safe_text(json.dumps(value, ensure_ascii = False, sort_keys = True), 1024)
+    lowered = " ".join((status, error, rendered)).casefold()
+    if not error and not any(token in lowered for token in ("error", "failed", "timeout")):
+        return None
+    detail = error or rendered
+    statement = _safe_text(f"Tool {name} failed: {detail}", 360)
+    return {
+        "kind": "tool_failure",
+        "key": re.sub(r"\s+", " ", f"{name.casefold()}:{detail.casefold()}"),
+        "statement": statement,
+        "threadId": transcript_id,
+        "messageId": message_id,
+        "excerpt": rendered,
+    }
+
+
 def _transcript_findings(
     transcript: dict[str, Any], cancel_event: threading.Event
 ) -> list[dict[str, Any]]:
@@ -522,6 +601,10 @@ def _transcript_findings(
     for message in transcript["messages"]:
         if cancel_event.is_set():
             return findings
+        for tool_call in message.get("toolCalls") or []:
+            finding = _tool_call_finding(tool_call, transcript["id"], message["id"])
+            if finding is not None:
+                findings.append(finding)
         if message["role"] != "user":
             continue
         text = message["text"].strip()
@@ -545,6 +628,44 @@ def _transcript_findings(
     return findings
 
 
+def _dream_terms(instructions: str, pattern: re.Pattern[str]) -> tuple[str, ...]:
+    values = []
+    for match in pattern.finditer(instructions):
+        for part in re.split(r"(?:,|\band\b)", match.group(1), flags = re.I):
+            value = re.sub(r"\s+", " ", part).strip(" .,:;\t\"'").casefold()
+            if len(value) >= 2 and value not in values:
+                values.append(value[:160])
+    return tuple(values[:8])
+
+
+def _dream_steering(instructions: str) -> dict[str, Any]:
+    normalized = _safe_text(instructions, 4000).strip()
+    lowered = normalized.casefold()
+    return {
+        "focus": _dream_terms(normalized, _DREAM_FOCUS_RE),
+        "ignore": _dream_terms(normalized, _DREAM_IGNORE_RE),
+        "staleCleanup": bool(_DREAM_CLEANUP_RE.search(lowered))
+        and not bool(_DREAM_NO_CLEANUP_RE.search(lowered)),
+    }
+
+
+def _finding_matches_steering(finding: dict[str, Any], steering: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(finding.get(key) or "") for key in ("kind", "statement", "excerpt")
+    ).casefold()
+    def matches(term: str) -> bool:
+        if term in text:
+            return True
+        tokens = [token for token in re.findall(r"[a-z0-9_]+", term) if len(token) >= 3]
+        return bool(tokens) and any(token in text for token in tokens)
+
+    ignored = steering["ignore"]
+    focused = steering["focus"]
+    if any(matches(term) for term in ignored):
+        return False
+    return not focused or any(matches(term) for term in focused)
+
+
 def _slug(text: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "-", text.casefold()).strip("-")
     return value[:64] or "observation"
@@ -564,14 +685,23 @@ def run_dream_task(
         transcript = _transcript(thread_id, project_id)
         if transcript is not None:
             transcripts.append(transcript)
+    instructions = _safe_text(payload.get("instructions"), 4000).strip()
+    steering = _dream_steering(instructions)
     findings = []
     for transcript in transcripts:
         findings.extend(_transcript_findings(transcript, cancel_event))
+    findings = [item for item in findings if _finding_matches_steering(item, steering)]
+    memory_entries = list_memory_entries(
+        project_id,
+        include_content = True,
+        actor = "user",
+        scopes = ("project",),
+    )
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for finding in findings:
         groups[finding["kind"] + ":" + finding["key"]].append(finding)
-    instructions = _safe_text(payload.get("instructions"), 4000).strip()
     proposals = []
+    observed_paths: set[str] = set()
     for group in groups.values():
         thread_count = len({item["threadId"] for item in group})
         if thread_count < 2 and len(transcripts) > 1:
@@ -579,6 +709,7 @@ def run_dream_task(
         statement = group[0]["statement"]
         source_ids = [item["threadId"] for item in group]
         path = f"project/dreams/{_slug(statement)}.md"
+        observed_paths.add(path)
         existing_hash = None
         try:
             existing_hash = get_memory_entry(project_id, path, include_content = False)["hash"]
@@ -606,21 +737,53 @@ def run_dream_task(
                     "ratio": round(thread_count / max(1, len(transcripts)), 3),
                 },
                 "rationale": (
-                    "A bounded transcript sub-agent found the same explicit preference "
+                    "The deterministic transcript analyzer found the same observation "
                     "across multiple selected sessions."
-                    + (f" Steering instructions: {instructions}" if instructions else "")
                 ),
                 "examples": group[:8],
                 "sourceTranscriptIds": source_ids,
                 "decision": "pending",
             }
         )
+    if steering["staleCleanup"]:
+        for entry in memory_entries:
+            if (
+                not entry.get("dreamId")
+                or not str(entry.get("path") or "").startswith("project/dreams/")
+                or entry["path"] in observed_paths
+            ):
+                continue
+            proposals.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "path": entry["path"],
+                    "scope": "project",
+                    "operation": "delete",
+                    "content": "",
+                    "expectedHash": entry["hash"],
+                    "prevalence": {
+                        "transcripts": 0,
+                        "selected": len(transcripts),
+                        "ratio": 0.0,
+                    },
+                    "rationale": (
+                        "This prior dreamed observation was not revalidated by the selected "
+                        "transcripts. Review before removing it."
+                    ),
+                    "examples": [],
+                    "sourceTranscriptIds": thread_ids,
+                    "decision": "pending",
+                }
+            )
     return {
         "status": "completed",
         "transcriptIds": thread_ids,
         "transcriptCount": len(transcripts),
-        "subAgentCount": len(transcripts),
+        "analyzerCount": len(transcripts),
+        "subAgentCount": 0,
         "instructions": instructions,
+        "steering": steering,
+        "memoryEntriesConsidered": len(memory_entries),
         "proposals": proposals[:50],
         "generatedAt": now_ms(),
     }

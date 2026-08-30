@@ -185,6 +185,28 @@ test("background agent and guarded merge requests match the backend contract", (
   );
 });
 
+test("dream proposals distinguish deletion from a memory update", () => {
+  const api = readFileSync(
+    fileURLToPath(
+      new URL("../src/features/chat/api/agent-workspace-api.ts", import.meta.url),
+    ),
+    "utf8",
+  );
+  const panel = readFileSync(
+    fileURLToPath(
+      new URL(
+        "../src/features/chat/components/agent-workspace-panel.tsx",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  );
+  assert.match(api, /operation: "create" \| "replace" \| "delete"/);
+  assert.match(api, /deletedEntry\?: \{ path: string; deleted: boolean;/);
+  assert.match(panel, /proposal\.operation === "delete"/);
+  assert.match(panel, /Review proposed deletion and evidence/);
+});
+
 test("background runtime selection is credential-free and safe for unattended execution", () => {
   const local = agentBackgroundAgentRequest("project-1", {
     instruction: "Inspect the repository",

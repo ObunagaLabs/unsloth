@@ -189,13 +189,13 @@ def _project_context_block(project: dict) -> str:
     if project_id:
         from .project_automation import (
             render_project_rules_guidance,
-            render_project_skills_guidance,
+            render_project_skills_catalog,
         )
         automation = "\n\n".join(
             value
             for value in (
                 render_project_rules_guidance(project_id),
-                render_project_skills_guidance(project_id),
+                render_project_skills_catalog(project_id),
             )
             if value
         )

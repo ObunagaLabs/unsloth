@@ -529,7 +529,7 @@ export interface AgentDreamProposal {
   id: string;
   path: string;
   scope: string;
-  operation: "create" | "replace" | string;
+  operation: "create" | "replace" | "delete" | string;
   content: string;
   expectedHash: string | null;
   prevalence: { transcripts: number; selected: number; ratio: number };
@@ -542,6 +542,7 @@ export interface AgentDreamProposal {
   sourceTranscriptIds: string[];
   decision: "pending" | "accepted" | "rejected" | string;
   acceptedEntry?: AgentMemoryEntry;
+  deletedEntry?: { path: string; deleted: boolean; previousHash: string };
 }
 
 export class AgentWorkspaceRequestError extends Error {

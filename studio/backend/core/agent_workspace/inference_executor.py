@@ -298,6 +298,7 @@ def _agent_tools(context: Any, full_access: bool) -> list[dict[str, Any]]:
         "memory_read",
         "memory_write",
         "memory_update",
+        "project_skill_read",
     }
     tools = [
         json.loads(json.dumps(tool))
