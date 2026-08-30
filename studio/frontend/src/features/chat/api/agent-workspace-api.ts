@@ -295,6 +295,11 @@ export interface AgentGraphNode {
   type: AgentGraphNodeType;
   label?: string;
   config: Record<string, unknown>;
+  retryPolicy?: {
+    maxAttempts: number;
+    backoffMs: number;
+    retryOn: Array<"error" | "timeout">;
+  };
 }
 
 export interface AgentGraphEdge {
@@ -316,6 +321,8 @@ export interface AgentGraphDocument {
     maxNodes: number;
     maxRunSeconds: number;
     maxOutputBytes: number;
+    maxIterations: number;
+    maxOutputTokens: number;
   };
 }
 
@@ -333,6 +340,15 @@ export interface AgentGraphRevision extends AgentGraphDocument {
   graphId: string;
   projectId: string;
   revision: number;
+  createdAt: number;
+}
+
+export interface AgentGraphRevisionSummary {
+  graphId: string;
+  projectId: string;
+  revision: number;
+  name: string;
+  description: string;
   createdAt: number;
 }
 
@@ -361,6 +377,8 @@ export interface AgentGraphRun {
   attempt: number;
   retryOfRunId: string | null;
   idempotencyKey: string | null;
+  iterationCount: number;
+  reservedOutputTokens: number;
   pauseRequested: boolean;
   cancelRequested: boolean;
   createdAt: number;
@@ -378,6 +396,7 @@ export interface AgentGraphNodeExecution {
   status: string;
   input: unknown;
   output: unknown;
+  checkpoint: Record<string, unknown> | null;
   error: string | null;
   createdAt: number;
   startedAt: number | null;
@@ -871,7 +890,11 @@ export async function listAgentBackgroundTasks(
 export async function getAgentBackgroundTaskTree(
   projectId: string,
   taskId: string,
-): Promise<{ rootTaskId: string; tasks: AgentBackgroundTask[]; truncated: boolean }> {
+): Promise<{
+  rootTaskId: string;
+  tasks: AgentBackgroundTask[];
+  truncated: boolean;
+}> {
   return request(
     agentWorkspaceRequestPath(
       projectId,
@@ -979,9 +1002,13 @@ export async function getAgentGraph(
   revision?: number,
 ): Promise<{ graph: AgentGraphSummary; revision: AgentGraphRevision }> {
   return request(
-    agentWorkspaceRequestPath(projectId, `graphs/${encodeURIComponent(graphId)}`, {
-      revision,
-    }),
+    agentWorkspaceRequestPath(
+      projectId,
+      `graphs/${encodeURIComponent(graphId)}`,
+      {
+        revision,
+      },
+    ),
   );
 }
 
@@ -995,13 +1022,41 @@ export function createAgentGraph(
   );
 }
 
+export function validateAgentGraph(
+  projectId: string,
+  document: AgentGraphDocument,
+): Promise<{ valid: true; document: AgentGraphDocument }> {
+  return request(
+    agentWorkspaceRequestPath(projectId, "graphs/validate"),
+    agentWorkspaceJsonRequest("POST", document),
+  );
+}
+
+export async function listAgentGraphRevisions(
+  projectId: string,
+  graphId: string,
+  limit = 100,
+): Promise<AgentGraphRevisionSummary[]> {
+  const result = await request<{ revisions: AgentGraphRevisionSummary[] }>(
+    agentWorkspaceRequestPath(
+      projectId,
+      `graphs/${encodeURIComponent(graphId)}/revisions`,
+      { limit },
+    ),
+  );
+  return result.revisions;
+}
+
 export function updateAgentGraph(
   projectId: string,
   graph: Pick<AgentGraphSummary, "id" | "currentRevision">,
   document: AgentGraphDocument,
 ): Promise<AgentGraphSummary> {
   return request(
-    agentWorkspaceRequestPath(projectId, `graphs/${encodeURIComponent(graph.id)}`),
+    agentWorkspaceRequestPath(
+      projectId,
+      `graphs/${encodeURIComponent(graph.id)}`,
+    ),
     agentWorkspaceJsonRequest("PUT", {
       ...document,
       expectedRevision: graph.currentRevision,
@@ -1009,9 +1064,15 @@ export function updateAgentGraph(
   );
 }
 
-export async function deleteAgentGraph(projectId: string, graphId: string): Promise<void> {
+export async function deleteAgentGraph(
+  projectId: string,
+  graphId: string,
+): Promise<void> {
   await request(
-    agentWorkspaceRequestPath(projectId, `graphs/${encodeURIComponent(graphId)}`),
+    agentWorkspaceRequestPath(
+      projectId,
+      `graphs/${encodeURIComponent(graphId)}`,
+    ),
     { method: "DELETE" },
   );
 }
@@ -1059,7 +1120,10 @@ export async function getAgentGraphRun(
   approvals: AgentGraphApproval[];
 }> {
   return request(
-    agentWorkspaceRequestPath(projectId, `graph-runs/${encodeURIComponent(runId)}`),
+    agentWorkspaceRequestPath(
+      projectId,
+      `graph-runs/${encodeURIComponent(runId)}`,
+    ),
   );
 }
 
@@ -1081,7 +1145,7 @@ export async function listAgentGraphEvents(
 function graphRunMutation(
   projectId: string,
   runId: string,
-  action: "pause" | "resume" | "cancel" | "retry",
+  action: "start" | "pause" | "resume" | "cancel" | "retry",
 ): Promise<AgentGraphRun> {
   return request(
     agentWorkspaceRequestPath(
@@ -1094,6 +1158,8 @@ function graphRunMutation(
 
 export const pauseAgentGraphRun = (projectId: string, runId: string) =>
   graphRunMutation(projectId, runId, "pause");
+export const startQueuedAgentGraphRun = (projectId: string, runId: string) =>
+  graphRunMutation(projectId, runId, "start");
 export const resumeAgentGraphRun = (projectId: string, runId: string) =>
   graphRunMutation(projectId, runId, "resume");
 export const cancelAgentGraphRun = (projectId: string, runId: string) =>

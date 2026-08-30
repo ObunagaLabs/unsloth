@@ -473,6 +473,7 @@ async def import_mcp_servers(
     for entry in entries:
         try:
             url = _validate_url(entry.url)
+            headers = _normalize_headers(entry.headers)
             # Per entry, so an API-key import of a mixed config still creates its
             # http entries and reports the stdio ones.
             if is_stdio(url):
@@ -515,6 +516,7 @@ async def test_mcp_server(
     if is_stdio(url):
         require_ui_session_for_local_commands(via_api_key)
     headers = _normalize_headers(payload.headers)
+    use_oauth = bool(payload.use_oauth and not is_stdio(url))
     if via_api_key and payload.use_oauth:
         require_ui_session(via_api_key)
     try:

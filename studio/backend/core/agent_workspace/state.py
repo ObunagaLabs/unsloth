@@ -1105,6 +1105,7 @@ def create_agent_background_task(
     project_id: str,
     instruction: str,
     *,
+    task_id: Optional[str] = None,
     runtime_snapshot: Optional[dict] = None,
     plan_id: Optional[str] = None,
     plan_task_id: Optional[str] = None,
@@ -1124,7 +1125,13 @@ def create_agent_background_task(
     if plan_task_id and not plan_id:
         raise AgentWorkspaceError("A plan task must include its plan ID.")
 
-    task_id = str(uuid.uuid4())
+    if task_id is None:
+        task_id = str(uuid.uuid4())
+    else:
+        try:
+            task_id = str(uuid.UUID(str(task_id)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise AgentWorkspaceError("Agent task ID is invalid.") from exc
     current = now_ms()
     conn = connection()
     try:

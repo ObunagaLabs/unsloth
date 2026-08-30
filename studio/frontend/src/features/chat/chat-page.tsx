@@ -137,6 +137,12 @@ import {
 import type { ChatArtifact, ChatArtifactSurface } from "./artifacts/types";
 import { BypassPermissionsConfirmDialog } from "./bypass-permissions-menu-item";
 import { ChatSettingsPanel } from "./chat-settings-sheet";
+import {
+  authorizeAgentGraphDraftRouteNavigation,
+  confirmAgentGraphDraftNavigation,
+  graphRouteRetainsProjectEditor,
+  permitNextAgentGraphDraftRouteNavigation,
+} from "./components/agent-graph-workflow-state";
 import { ChatModelNotice } from "./components/chat-model-notice";
 import {
   chatModelSwitchMeta,
@@ -1428,12 +1434,16 @@ function ProjectLanding({
   }
 
   async function commitProjectDelete(): Promise<void> {
+    if (!confirmAgentGraphDraftNavigation()) {
+      return;
+    }
     setDeletingProject(false);
     try {
       await deleteChatProject(projectId);
       // Refresh chat history so the project's now-deleted chats don't linger
       // in the sidebar, matching the sidebar delete path.
       notifyChatHistoryUpdated();
+      permitNextAgentGraphDraftRouteNavigation();
       useChatRuntimeStore.getState().setActiveProjectId(null);
       navigate({ to: "/chat", search: { new: createThreadNonce() } });
     } catch (err) {
@@ -1513,8 +1523,21 @@ function ProjectLanding({
     }
     event.preventDefault();
     const next = nextProjectLandingTab(projectTab, event.key);
+    if (selectProjectTab(next)) {
+      document.getElementById(`${projectTabsId}-${next}`)?.focus();
+    }
+  }
+
+  function selectProjectTab(next: ProjectLandingTab): boolean {
+    if (
+      next !== projectTab &&
+      projectTab === "agent" &&
+      !confirmAgentGraphDraftNavigation()
+    ) {
+      return false;
+    }
     setProjectTab(next);
-    document.getElementById(`${projectTabsId}-${next}`)?.focus();
+    return true;
   }
 
   // Landing has no active thread selected, so the onView callback here is a
@@ -1866,6 +1889,9 @@ function ProjectLanding({
 
             <ProjectComposer
               disabled={Boolean(pendingNewThreadId) || folderUnavailable}
+              beforeSubmit={() =>
+                projectTab !== "agent" || confirmAgentGraphDraftNavigation()
+              }
               placeholder={
                 folderUnavailable
                   ? "Reconnect the local folder to start a chat"
@@ -1881,7 +1907,7 @@ function ProjectLanding({
               <button
                 id={`${projectTabsId}-chats`}
                 type="button"
-                onClick={() => setProjectTab("chats")}
+                onClick={() => selectProjectTab("chats")}
                 onKeyDown={handleProjectTabKeyDown}
                 data-active={projectTab === "chats"}
                 role="tab"
@@ -1895,7 +1921,7 @@ function ProjectLanding({
               <button
                 id={`${projectTabsId}-sources`}
                 type="button"
-                onClick={() => setProjectTab("sources")}
+                onClick={() => selectProjectTab("sources")}
                 onKeyDown={handleProjectTabKeyDown}
                 data-active={projectTab === "sources"}
                 role="tab"
@@ -1909,7 +1935,7 @@ function ProjectLanding({
               <button
                 id={`${projectTabsId}-agent`}
                 type="button"
-                onClick={() => setProjectTab("agent")}
+                onClick={() => selectProjectTab("agent")}
                 onKeyDown={handleProjectTabKeyDown}
                 data-active={projectTab === "agent"}
                 role="tab"
@@ -2336,7 +2362,6 @@ export function ChatPage({
   const toggleIncognito = useCallback(() => {
     const store = useChatRuntimeStore.getState();
     const wasIncognito = store.incognito;
-    store.setIncognito(!store.incognito);
     // On an empty scratch chat there's nothing to abandon, so flip in
     // place: navigating would remount the thread and bounce the composer
     // (it docks to the bottom before the welcome state re-centers it).
@@ -2347,6 +2372,13 @@ export function ChatPage({
       !search.compare &&
       !search.project &&
       store.activeThreadId == null;
+    if (
+      !onEmptyScratchChat &&
+      !authorizeAgentGraphDraftRouteNavigation()
+    ) {
+      return;
+    }
+    store.setIncognito(!store.incognito);
     if (wasIncognito) {
       requestTemporaryPromptQueueStop();
     }
@@ -2460,36 +2492,61 @@ export function ChatPage({
   const currentProject = currentProjectId
     ? (projects.find((project) => project.id === currentProjectId) ?? null)
     : null;
+  const navigationProjectId = search.project ?? currentProjectId;
   const { items: currentProjectItems, loaded: currentProjectItemsLoaded } =
     useChatSidebarItems({
-    projectId: currentProjectId ?? "__no_project_selected__",
+      projectId: currentProjectId ?? "__no_project_selected__",
     });
   const currentChatTitle = activeThreadId
     ? currentProjectItems.find((item) => item.id === activeThreadId)?.title
     : undefined;
   const openProjectLanding = useCallback(
     (projectId: string) => {
+      if (
+        navigationProjectId &&
+        !graphRouteRetainsProjectEditor(
+          { pathname: "/chat", search: { project: projectId } },
+          navigationProjectId,
+        ) &&
+        !authorizeAgentGraphDraftRouteNavigation()
+      ) {
+        return;
+      }
       useChatRuntimeStore.getState().setActiveThreadId(null);
       useChatRuntimeStore.getState().setActiveProjectId(projectId);
       navigate({ to: "/chat", search: { project: projectId } });
     },
-    [navigate],
+    [navigate, navigationProjectId],
   );
 
   const handleDesktopNewChat = useCallback(() => {
+    const nextSearch = navigationProjectId
+      ? { project: navigationProjectId }
+      : { new: crypto.randomUUID() };
+    if (
+      navigationProjectId &&
+      !graphRouteRetainsProjectEditor(
+        { pathname: "/chat", search: nextSearch },
+        navigationProjectId,
+      ) &&
+      !authorizeAgentGraphDraftRouteNavigation()
+    ) {
+      return;
+    }
     clearNewChatDraft();
     const runtime = useChatRuntimeStore.getState();
     runtime.setActiveThreadId(null);
-    runtime.setActiveProjectId(currentProjectId);
+    runtime.setActiveProjectId(navigationProjectId);
     runtime.setIncognito(false);
     navigate({
       to: "/chat",
-      search: currentProjectId
-        ? { project: currentProjectId }
-        : { new: crypto.randomUUID() },
+      search: nextSearch,
     });
-  }, [currentProjectId, navigate]);
+  }, [navigate, navigationProjectId]);
   const openProjectsList = useCallback(() => {
+    if (!authorizeAgentGraphDraftRouteNavigation()) {
+      return;
+    }
     navigate({ to: "/projects" });
   }, [navigate]);
   const persistedActiveThreadId = isAssistantLocalThreadId(activeThreadId)

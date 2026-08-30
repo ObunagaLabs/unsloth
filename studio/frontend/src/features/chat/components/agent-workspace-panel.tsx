@@ -118,6 +118,7 @@ import {
   safeAgentWorkspaceError,
 } from "./agent-workspace-state";
 import { AgentGraphsPanel } from "./agent-graphs-panel";
+import { confirmAgentGraphDraftNavigation } from "./agent-graph-workflow-state";
 
 const MAP_PATH_LIMIT = 20_000;
 const MAP_BYTE_LIMIT = 2 * 1024 * 1024;
@@ -206,6 +207,7 @@ export function AgentWorkspacePanel({
   const [workspace, setWorkspace] = useState<AgentWorkspaceOverview | null>(
     null,
   );
+  const workspaceRef = useRef<AgentWorkspaceOverview | null>(null);
   const [instructions, setInstructions] = useState<AgentInstructions | null>(
     null,
   );
@@ -310,6 +312,7 @@ export function AgentWorkspacePanel({
       setLoading(true);
       setLoadError(null);
       if (reset) {
+        workspaceRef.current = null;
         setWorkspace(null);
         setInstructions(null);
         setRepositoryMap(null);
@@ -339,6 +342,19 @@ export function AgentWorkspacePanel({
       try {
         const nextWorkspace = await getAgentWorkspace(requestProjectId);
         if (!requestIsCurrent()) return;
+        const currentWorkspace = workspaceRef.current;
+        if (
+          currentWorkspace?.available &&
+          currentWorkspace.capabilities.graphs &&
+          (!nextWorkspace.available || !nextWorkspace.capabilities.graphs) &&
+          !confirmAgentGraphDraftNavigation()
+        ) {
+          setLoadError(
+            "Refresh kept the graph editor open because it has an unsaved draft.",
+          );
+          return;
+        }
+        workspaceRef.current = nextWorkspace;
         setWorkspace(nextWorkspace);
         if (!nextWorkspace.available) {
           setInstructions(null);

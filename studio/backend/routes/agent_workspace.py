@@ -41,11 +41,13 @@ from core.agent_workspace.graphs import (
     get_graph_run,
     list_graph_events,
     list_graph_approvals,
+    list_graph_revisions,
     list_graph_runs,
     list_graphs,
     list_node_executions,
     manager as graph_manager,
     update_graph,
+    validate_graph_spec,
 )
 from core.agent_workspace.instructions import (
     resolve_agents_instructions,
@@ -631,6 +633,25 @@ def save_graph(
         raise _workspace_error(exc) from exc
 
 
+@router.post("/projects/{project_id}/graphs/validate")
+def validate_graph(
+    project_id: str,
+    payload: GraphCreateRequest,
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _project(project_id)
+    try:
+        return {
+            "valid": True,
+            # Graph definitions are authored control data. Redacting their
+            # strings would mutate prompts, mappings, and paths when the
+            # validated document is saved as a revision.
+            "document": validate_graph_spec(payload.model_dump(exclude_none = True)),
+        }
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
 @router.get("/projects/{project_id}/graphs")
 def project_graphs(project_id: str, current_subject: str = Depends(get_current_subject)) -> dict:
     _project(project_id)
@@ -648,7 +669,20 @@ def project_graph(
     document = get_graph_revision(project_id, graph_id, revision)
     if document is None:
         raise HTTPException(status_code = 404, detail = "Graph revision not found.")
-    return _public_graph_value({"graph": graph, "revision": document})
+    # The revision is editable source, not execution output. Returning a
+    # redacted copy would make the next saved revision lossy.
+    return {"graph": graph, "revision": document}
+
+
+@router.get("/projects/{project_id}/graphs/{graph_id}/revisions")
+def graph_revisions(
+    project_id: str,
+    graph_id: str,
+    limit: int = Query(default = 100, ge = 1, le = 500),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    _graph_for_project(project_id, graph_id)
+    return {"revisions": _public_graph_value(list_graph_revisions(project_id, graph_id, limit))}
 
 
 @router.put("/projects/{project_id}/graphs/{graph_id}")
@@ -753,6 +787,25 @@ def graph_run_events(
     return {"events": _public_graph_value(list_graph_events(project_id, run_id, after, limit))}
 
 
+@router.post("/projects/{project_id}/graph-runs/{run_id}/start")
+def start_queued_graph_run(
+    project_id: str,
+    run_id: str,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+) -> dict:
+    run = _run_for_project(project_id, run_id)
+    _require_graph_provider_session(project_id, run["graphId"], run["revision"], via_api_key)
+    try:
+        if _graph_requires_execution(
+            _graph_for_project(project_id, run["graphId"]), run["revision"]
+        ):
+            _require_execution_boundary()
+        return _public_graph_run(graph_manager.start(run_id))
+    except AgentWorkspaceError as exc:
+        raise _workspace_error(exc) from exc
+
+
 @router.post("/projects/{project_id}/graph-runs/{run_id}/pause")
 def pause_graph_run(
     project_id: str,
@@ -809,6 +862,10 @@ def retry_graph_run(
     run = _run_for_project(project_id, run_id)
     _require_graph_provider_session(project_id, run["graphId"], run["revision"], via_api_key)
     try:
+        if _graph_requires_execution(
+            _graph_for_project(project_id, run["graphId"]), run["revision"]
+        ):
+            _require_execution_boundary()
         return _public_graph_run(graph_manager.retry(project_id, run_id, start = start))
     except AgentWorkspaceError as exc:
         raise _workspace_error(exc) from exc
@@ -821,8 +878,10 @@ def decide_graph_run_approval(
     approval_id: str,
     payload: GraphApprovalRequest,
     current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
 ) -> dict:
-    _run_for_project(project_id, run_id)
+    run = _run_for_project(project_id, run_id)
+    _require_graph_provider_session(project_id, run["graphId"], run["revision"], via_api_key)
     try:
         return _public_graph_value(
             decide_graph_approval(project_id, run_id, approval_id, payload.decision)

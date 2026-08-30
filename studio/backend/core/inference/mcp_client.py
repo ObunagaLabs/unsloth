@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import concurrent.futures
 import hashlib
 import json
@@ -247,6 +248,80 @@ def _oauth_store():
             collection_sanitization_strategy = AlwaysHashStrategy(),
         )
     return _oauth_token_store
+
+
+async def _oauth_credential_binding_async(url: str) -> Optional[str]:
+    """Return a credential-free digest for the OAuth account cached for ``url``."""
+    from fastmcp.client.auth import OAuth
+
+    auth = OAuth(mcp_url = url, token_storage = _oauth_store())
+    tokens = await auth.token_storage_adapter.get_tokens()
+    if tokens is None:
+        return None
+    client_info = await auth.token_storage_adapter.get_client_info()
+    access_token = str(tokens.access_token or "")
+    identity_claims: dict[str, Any] = {}
+    try:
+        encoded_payload = access_token.split(".")[1]
+        padding = "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded_payload + padding))
+        if isinstance(payload, dict) and any(
+            payload.get(key) is not None for key in ("sub", "account_id", "tenant_id", "email")
+        ):
+            identity_claims = {
+                key: payload[key]
+                for key in ("iss", "sub", "account_id", "tenant_id", "email", "aud")
+                if payload.get(key) is not None
+            }
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        identity_claims = {}
+
+    material: dict[str, Any] = {
+        "clientIdDigest": (
+            hashlib.sha256(str(client_info.client_id).encode("utf-8")).hexdigest()
+            if client_info is not None and client_info.client_id
+            else None
+        ),
+        "identityClaims": identity_claims or None,
+        "scope": tokens.scope,
+    }
+    if not identity_claims:
+        credential = str(tokens.refresh_token or access_token)
+        if not credential:
+            return None
+        material["credentialDigest"] = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+    encoded = json.dumps(
+        material,
+        ensure_ascii = False,
+        allow_nan = False,
+        sort_keys = True,
+        separators = (",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def oauth_credential_binding(url: str) -> Optional[str]:
+    """Synchronously bind an MCP URL to its cached OAuth account without exposing tokens."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_oauth_credential_binding_async(url))
+
+    result: list[Optional[str]] = []
+    errors: list[BaseException] = []
+
+    def load() -> None:
+        try:
+            result.append(asyncio.run(_oauth_credential_binding_async(url)))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    worker = threading.Thread(target = load, name = "mcp-oauth-binding", daemon = True)
+    worker.start()
+    worker.join()
+    if errors:
+        raise errors[0]
+    return result[0]
 
 
 async def clear_oauth_tokens_async(url: str) -> None:

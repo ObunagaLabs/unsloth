@@ -205,7 +205,9 @@ class BackgroundTaskManager:
         project_id: str,
         instruction: str,
         *,
+        task_id: Optional[str] = None,
         runtime_selection: Optional[dict] = None,
+        runtime_snapshot: Optional[dict] = None,
         plan_id: Optional[str] = None,
         plan_task_id: Optional[str] = None,
         worktree_id: Optional[str] = None,
@@ -219,13 +221,20 @@ class BackgroundTaskManager:
                 raise AgentWorkspaceError(
                     "No background agent executor is registered for this runtime."
                 )
-            runtime_snapshot = None
+            if runtime_selection is not None and runtime_snapshot is not None:
+                raise AgentWorkspaceError(
+                    "Provide either a runtime selection or a durable runtime snapshot, not both."
+                )
             if runtime_selection is not None:
                 from .inference_executor import capture_runtime_snapshot
                 runtime_snapshot = capture_runtime_snapshot(runtime_selection)
+            elif runtime_snapshot is not None:
+                from .inference_executor import validate_runtime_snapshot
+                runtime_snapshot = validate_runtime_snapshot(runtime_snapshot)
             task = create_agent_background_task(
                 project_id,
                 instruction,
+                task_id = task_id,
                 runtime_snapshot = runtime_snapshot,
                 plan_id = plan_id,
                 plan_task_id = plan_task_id,

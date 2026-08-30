@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
   agentBackgroundAgentRequest,
   agentWorkspaceJsonRequest,
@@ -28,6 +30,32 @@ import {
   reconcileAgentBackgroundMutation,
   safeAgentWorkspaceError,
 } from "../src/features/chat/components/agent-workspace-state.ts";
+import {
+  authorizeAgentGraphDraftRouteNavigation,
+  connectGraphEdge,
+  confirmAgentGraphDraftNavigation,
+  consumeAgentGraphDraftRouteAuthorization,
+  graphDraftIsPending,
+  graphConnectionIsValid,
+  graphEditorIsReady,
+  graphEdgeId,
+  graphLoadCanApply,
+  graphMutationIsCurrent,
+  graphResponseIsCurrent,
+  graphRouteRetainsProjectEditor,
+  graphRunActions,
+  graphRunMatchesEditor,
+  graphRunResponseIsCurrent,
+  permitNextAgentGraphDraftRouteNavigation,
+  reconnectGraphEdge,
+  replaceGraphEdge,
+  registerAgentGraphDraftNavigationGuard,
+} from "../src/features/chat/components/agent-graph-workflow-state.ts";
+import {
+  AgentGraphAlert,
+  AgentGraphDraftStatus,
+  AgentGraphLiveStatus,
+} from "../src/features/chat/components/agent-graph-ui.ts";
 
 test("agent workspace requests encode project identity and bounded queries", () => {
   assert.equal(
@@ -253,6 +281,374 @@ test("the verification completion policy is wired through the Agent panel", () =
   assert.match(panel, /checked=\{requireVerificationForGoalCompletion\}/);
   assert.match(panel, /Saved policy revision \{verificationConfigRevision\}/);
   assert.match(goalBar, /Could not complete the project goal/);
+});
+
+test("Sloth Graphs exposes visual editing, validation, history, and test runs", () => {
+  const api = readFileSync(
+    fileURLToPath(
+      new URL(
+        "../src/features/chat/api/agent-workspace-api.ts",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  );
+  const panel = readFileSync(
+    fileURLToPath(
+      new URL(
+        "../src/features/chat/components/agent-graphs-panel.tsx",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  );
+  const editor = readFileSync(
+    fileURLToPath(
+      new URL(
+        "../src/features/chat/components/agent-graph-editor.tsx",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  );
+  const chatPage = readFileSync(
+    fileURLToPath(
+      new URL("../src/features/chat/chat-page.tsx", import.meta.url),
+    ),
+    "utf8",
+  );
+  const thread = readFileSync(
+    fileURLToPath(
+      new URL("../src/components/assistant-ui/thread.tsx", import.meta.url),
+    ),
+    "utf8",
+  );
+  const workspacePanel = readFileSync(
+    fileURLToPath(
+      new URL(
+        "../src/features/chat/components/agent-workspace-panel.tsx",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  );
+
+  assert.match(api, /export function validateAgentGraph/);
+  assert.match(api, /export async function listAgentGraphRevisions/);
+  assert.match(panel, /Visual revision editor/);
+  assert.match(panel, /Test run/);
+  assert.match(panel, /Save this revision before starting a test run/);
+  assert.match(panel, /Discard the unsaved graph changes and editor drafts/);
+  assert.match(panel, /useBlocker\(\{/);
+  assert.match(panel, /shouldBlockFn: shouldBlockRouteNavigation/);
+  assert.match(
+    panel,
+    /This graph was deleted elsewhere\. Your unsaved draft is still open/,
+  );
+  assert.match(panel, /startQueuedAgentGraphRun/);
+  assert.match(panel, /revision: editorRevision/);
+  assert.match(panel, /graphRunResponseIsCurrent/);
+  const validateHandler = panel.slice(
+    panel.indexOf("async function validateDraft"),
+    panel.indexOf("async function applyJsonDocument"),
+  );
+  assert.doesNotMatch(validateHandler, /updateEditorDocument/);
+  assert.match(chatPage, /confirmAgentGraphDraftNavigation\(\)/);
+  assert.match(chatPage, /authorizeAgentGraphDraftRouteNavigation\(\)/);
+  assert.match(chatPage, /permitNextAgentGraphDraftRouteNavigation\(\)/);
+  assert.match(chatPage, /beforeSubmit=\{\(\) =>/);
+  assert.match(thread, /const allowSubmit = useCallback/);
+  const parkedSendEffect = thread.slice(
+    thread.indexOf("// Fire the parked send once indexing clears"),
+    thread.indexOf("// Drop any queued send + toast on unmount"),
+  );
+  assert.match(parkedSendEffect, /if \(!allowSubmit\(\)\) return/);
+  assert.match(
+    workspacePanel,
+    /Refresh kept the graph editor open because it has an unsaved draft/,
+  );
+  assert.match(editor, /<ReactFlow/);
+  assert.match(editor, /Node palette/);
+  assert.match(editor, /Edge mappings/);
+  assert.match(editor, /Node config and mappings/);
+  assert.match(editor, /onReconnect=/);
+  assert.match(editor, /Branch from/);
+  assert.match(editor, /aria-label="New edge source node"/);
+  assert.match(editor, /aria-label="New edge target node"/);
+  assert.match(editor, /> Add edge/);
+});
+
+test("Sloth Graphs fences stale responses, drafts, and pinned run overlays", () => {
+  assert.equal(graphDraftIsPending(false, false, false), false);
+  assert.equal(graphDraftIsPending(false, true, false), true);
+  assert.equal(graphDraftIsPending(false, false, true), true);
+  assert.equal(graphDraftIsPending(false, false, false, true), true);
+
+  assert.equal(graphResponseIsCurrent(4, 4, "graph-b", "graph-b"), true);
+  assert.equal(graphResponseIsCurrent(3, 4, "graph-b", "graph-b"), false);
+  assert.equal(graphResponseIsCurrent(4, 4, "graph-a", "graph-b"), false);
+  assert.equal(
+    graphRunResponseIsCurrent(4, 4, "graph-b", "graph-b", "run-b", "run-b"),
+    true,
+  );
+  assert.equal(
+    graphRunResponseIsCurrent(4, 4, "graph-b", "graph-b", "run-a", "run-b"),
+    false,
+  );
+  assert.equal(graphLoadCanApply(4, 4, "graph-b", "graph-b", false), true);
+  assert.equal(graphLoadCanApply(4, 4, "graph-b", "graph-b", true), false);
+  assert.equal(graphEditorIsReady("graph-b", "graph-b"), true);
+  assert.equal(graphEditorIsReady("graph-b", null), false);
+  assert.equal(graphEditorIsReady(null, null), true);
+
+  assert.equal(
+    graphMutationIsCurrent(
+      { projectId: "project", graphId: "graph-b", runId: "run-b" },
+      { projectId: "project", graphId: "graph-b", runId: "run-b" },
+    ),
+    true,
+  );
+  assert.equal(
+    graphMutationIsCurrent(
+      { projectId: "project", graphId: "graph-a", runId: "run-a" },
+      { projectId: "project", graphId: "graph-b", runId: "run-b" },
+    ),
+    false,
+  );
+
+  assert.equal(
+    graphRunMatchesEditor({ graphId: "graph-b", revision: 2 }, "graph-b", 2),
+    true,
+  );
+  assert.equal(
+    graphRunMatchesEditor({ graphId: "graph-a", revision: 2 }, "graph-b", 2),
+    false,
+  );
+  assert.equal(
+    graphRunMatchesEditor({ graphId: "graph-b", revision: 1 }, "graph-b", 2),
+    false,
+  );
+
+  assert.deepEqual(graphRunActions("queued"), {
+    start: true,
+    resume: false,
+    pause: true,
+    cancel: true,
+    retry: false,
+  });
+  assert.equal(graphRunActions("running").pause, true);
+  assert.equal(graphRunActions("pausing").pause, false);
+  assert.equal(graphRunActions("interrupted").resume, true);
+  assert.equal(graphRunActions("interrupted").retry, true);
+
+  const topologyNodes = [
+    { id: "input", type: "input" as const },
+    { id: "condition", type: "condition" as const },
+    { id: "yes", type: "output" as const },
+    { id: "no", type: "output" as const },
+    { id: "alternate", type: "output" as const },
+  ];
+  const edges = [
+    { from: "condition", to: "yes", when: "true" as const },
+    { from: "condition", to: "no", when: "false" as const },
+  ];
+  assert.deepEqual(
+    reconnectGraphEdge(
+      edges,
+      topologyNodes,
+      "condition:yes:true",
+      "condition",
+      "alternate",
+    ),
+    [
+      { from: "condition", to: "alternate", when: "true" },
+      { from: "condition", to: "no", when: "false" },
+    ],
+  );
+  assert.strictEqual(
+    reconnectGraphEdge(
+      edges,
+      topologyNodes,
+      "condition:yes:true",
+      "input",
+      "alternate",
+    ),
+    edges,
+  );
+
+  const collidingEdges = [
+    { from: "condition", to: "middle", when: "true" as const },
+    { from: "condition", to: "output", when: "false" as const },
+  ];
+  const collisionResult = reconnectGraphEdge(
+    collidingEdges,
+    [
+      { id: "input", type: "input" },
+      { id: "condition", type: "condition" },
+      { id: "middle", type: "output" },
+      { id: "output", type: "output" },
+    ],
+    "condition:middle:true",
+    "condition",
+    "output",
+  );
+  assert.strictEqual(collisionResult, collidingEdges);
+  assert.equal(
+    new Set(collisionResult.map((edge) => graphEdgeId(edge))).size,
+    collisionResult.length,
+  );
+
+  const sequentialNodes = [
+    { id: "input", type: "input" as const },
+    { id: "model", type: "model" as const },
+    { id: "condition", type: "condition" as const },
+    { id: "yes", type: "output" as const },
+    { id: "no", type: "output" as const },
+  ];
+  assert.equal(
+    graphConnectionIsValid([], sequentialNodes, "input", "input"),
+    false,
+  );
+  assert.equal(
+    graphConnectionIsValid([], sequentialNodes, "yes", "model"),
+    false,
+  );
+  assert.equal(
+    graphConnectionIsValid(
+      [{ from: "input", to: "model" }],
+      sequentialNodes,
+      "condition",
+      "model",
+      "default",
+    ),
+    false,
+  );
+  assert.equal(
+    graphConnectionIsValid(
+      [{ from: "input", to: "model" }],
+      sequentialNodes,
+      "input",
+      "yes",
+    ),
+    false,
+  );
+
+  const firstConditionEdge = connectGraphEdge(
+    [],
+    sequentialNodes,
+    "condition",
+    "yes",
+    "default",
+  );
+  assert.deepEqual(firstConditionEdge, [
+    { from: "condition", to: "yes", when: "default" },
+  ]);
+  const conditionBranches = connectGraphEdge(
+    firstConditionEdge,
+    sequentialNodes,
+    "condition",
+    "no",
+    "true",
+  );
+  assert.deepEqual(conditionBranches, [
+    { from: "condition", to: "yes", when: "false" },
+    { from: "condition", to: "no", when: "true" },
+  ]);
+  assert.strictEqual(
+    replaceGraphEdge(conditionBranches, sequentialNodes, 0, {
+      from: "condition",
+      to: "yes",
+      when: "true",
+    }),
+    conditionBranches,
+  );
+
+  assert.equal(
+    graphRouteRetainsProjectEditor(
+      { pathname: "/chat", search: { project: "project-a" } },
+      "project-a",
+    ),
+    true,
+  );
+  assert.equal(
+    graphRouteRetainsProjectEditor(
+      { pathname: "/chat", search: { compare: "pair" } },
+      "project-a",
+    ),
+    true,
+  );
+  assert.equal(
+    graphRouteRetainsProjectEditor(
+      { pathname: "/chat", search: { project: "project-b" } },
+      "project-a",
+    ),
+    false,
+  );
+  assert.equal(
+    graphRouteRetainsProjectEditor(
+      {
+        pathname: "/chat",
+        search: { project: "project-a", thread: "thread-a" },
+      },
+      "project-a",
+    ),
+    false,
+  );
+  assert.equal(
+    graphRouteRetainsProjectEditor(
+      { pathname: "/projects", search: {} },
+      "project-a",
+    ),
+    false,
+  );
+
+  const releaseGuard = registerAgentGraphDraftNavigationGuard(() => false);
+  assert.equal(confirmAgentGraphDraftNavigation(), false);
+  assert.equal(authorizeAgentGraphDraftRouteNavigation(), false);
+  assert.equal(consumeAgentGraphDraftRouteAuthorization(), false);
+  releaseGuard();
+  assert.equal(confirmAgentGraphDraftNavigation(), true);
+
+  let confirmations = 0;
+  const releaseAllowingGuard = registerAgentGraphDraftNavigationGuard(() => {
+    confirmations += 1;
+    return true;
+  });
+  assert.equal(authorizeAgentGraphDraftRouteNavigation(), true);
+  assert.equal(confirmations, 1);
+  assert.equal(consumeAgentGraphDraftRouteAuthorization(), true);
+  assert.equal(consumeAgentGraphDraftRouteAuthorization(), false);
+  permitNextAgentGraphDraftRouteNavigation();
+  assert.equal(consumeAgentGraphDraftRouteAuthorization(), true);
+  releaseAllowingGuard();
+});
+
+test("Sloth Graphs renders live run state and editor errors accessibly", () => {
+  const draft = renderToStaticMarkup(
+    createElement(AgentGraphDraftStatus, {
+      loading: false,
+      ready: true,
+      pending: true,
+      message: "Pinned revision contract",
+    }),
+  );
+  assert.match(draft, /aria-live="polite"/);
+  assert.match(draft, /data-agent-graph-draft-status="pending"/);
+  assert.match(draft, />Unsaved changes<\/p>/);
+
+  const status = renderToStaticMarkup(
+    createElement(AgentGraphLiveStatus, { status: "running" }, "running"),
+  );
+  assert.match(status, /role="status"/);
+  assert.match(status, /aria-live="polite"/);
+  assert.match(status, /aria-atomic="true"/);
+  assert.match(status, /data-agent-graph-run-status="running"/);
+
+  const error = renderToStaticMarkup(
+    createElement(AgentGraphAlert, null, "Invalid node config"),
+  );
+  assert.match(error, /role="alert"/);
+  assert.match(error, />Invalid node config<\/p>/);
 });
 
 test("background controls follow durable task state", () => {

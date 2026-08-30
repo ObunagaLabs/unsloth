@@ -10,7 +10,11 @@ manager, while tool nodes use the existing MCP transport.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
+import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -18,7 +22,11 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from string import Formatter
 from typing import Any, Callable, Optional
 
-from core.inference.mcp_client import call_tool_sync, parse_server_headers
+from core.inference.mcp_client import (
+    call_tool_sync,
+    oauth_credential_binding,
+    parse_server_headers,
+)
 from storage import mcp_servers_db
 
 from .common import AgentWorkspaceError, now_ms
@@ -48,12 +56,132 @@ _MAX_GRAPH_DOCUMENT_BYTES = 512 * 1024
 _MAX_RUN_OUTPUT_BYTES = 1024 * 1024
 _MAX_RUN_SECONDS = 24 * 60 * 60
 _MAX_NODE_SECONDS = 2 * 60 * 60
+_MAX_NODE_ATTEMPTS = 10
+_MAX_RETRY_BACKOFF_MS = 60_000
+_MAX_RUN_ITERATIONS = 10_000
+_MAX_RUN_OUTPUT_TOKENS = 1_048_576
 _UNSET = object()
+
+
+class _GraphNodeTimeout(AgentWorkspaceError):
+    pass
+
+
+class _GraphToolEffectUncertain(AgentWorkspaceError):
+    pass
+
+
+class _GraphLoopEffectUncertain(AgentWorkspaceError):
+    pass
+
+
+class _RunControl:
+    """Thread-safe wakeup with a reason visible to native node adapters."""
+
+    _PRIORITY = {"pause": 0, "cancel": 1, "budget": 2, "shutdown": 3}
+
+    def __init__(self):
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._reason: Optional[str] = None
+
+    def request(self, reason: str) -> None:
+        if reason not in self._PRIORITY:
+            raise ValueError("Unknown graph run control reason.")
+        with self._lock:
+            if self._reason is None or self._PRIORITY[reason] >= self._PRIORITY[self._reason]:
+                self._reason = reason
+            self._event.set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return self._event.wait(timeout)
+
+    def should_cancel_work(self) -> bool:
+        with self._lock:
+            return self._event.is_set() and self._reason != "pause"
+
+
+class _CombinedEvent:
+    def __init__(self, *events: Any):
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        while not self.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def should_cancel_work(self) -> bool:
+        for event in self._events:
+            if not event.is_set():
+                continue
+            check = getattr(event, "should_cancel_work", None)
+            if check is None or check():
+                return True
+        return False
+
+
+def _validate_retry_policy(value: Any, node_type: str, config: dict, node_id: str) -> dict:
+    if value is None:
+        return {"maxAttempts": 1, "backoffMs": 0, "retryOn": ["error", "timeout"]}
+    if not isinstance(value, dict) or set(value) - {"maxAttempts", "backoffMs", "retryOn"}:
+        raise AgentWorkspaceError(f"Graph node '{node_id}' retry policy is invalid.")
+    retry_on = value.get("retryOn", ["error", "timeout"])
+    if (
+        not isinstance(retry_on, list)
+        or not retry_on
+        or any(item not in {"error", "timeout"} for item in retry_on)
+    ):
+        raise AgentWorkspaceError(f"Graph node '{node_id}' retryOn is invalid.")
+    policy = {
+        "maxAttempts": _bounded_int(
+            value.get("maxAttempts", 1),
+            f"Graph node '{node_id}' maxAttempts",
+            1,
+            _MAX_NODE_ATTEMPTS,
+        ),
+        "backoffMs": _bounded_int(
+            value.get("backoffMs", 0),
+            f"Graph node '{node_id}' backoffMs",
+            0,
+            _MAX_RETRY_BACKOFF_MS,
+        ),
+        "retryOn": sorted(set(retry_on)),
+    }
+    if policy["maxAttempts"] > 1:
+        if node_type == "approval":
+            raise AgentWorkspaceError("Approval nodes cannot retry automatically.")
+        if (
+            node_type in {"loop", "model"}
+            and (config.get("runtime") or {}).get("permissionMode") != "off"
+        ):
+            raise AgentWorkspaceError(
+                "Loop and model retries require a runtime with permissionMode 'off'."
+            )
+        if node_type == "tool" and config.get("sideEffecting", True):
+            raise AgentWorkspaceError(
+                "Side-effecting tool nodes fail closed and cannot retry automatically."
+            )
+    return policy
 
 
 def _json(value: Any, *, limit: int, label: str) -> str:
     try:
-        encoded = json.dumps(value, ensure_ascii = False, separators = (",", ":"))
+        encoded = json.dumps(
+            value,
+            ensure_ascii = False,
+            allow_nan = False,
+            sort_keys = True,
+            separators = (",", ":"),
+        )
     except (TypeError, ValueError) as exc:
         raise AgentWorkspaceError(f"{label} must be JSON serializable.") from exc
     if len(encoded.encode("utf-8")) > limit:
@@ -82,6 +210,12 @@ def _string(
     return value.strip()
 
 
+def _authored_text(value: Any, label: str, *, maximum: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > maximum:
+        raise AgentWorkspaceError(f"{label} is invalid.")
+    return value
+
+
 def _bounded_int(value: Any, label: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool):
         raise AgentWorkspaceError(f"{label} is invalid.")
@@ -92,6 +226,19 @@ def _bounded_int(value: Any, label: str, minimum: int, maximum: int) -> int:
     if result < minimum or result > maximum:
         raise AgentWorkspaceError(f"{label} is invalid.")
     return result
+
+
+def _boolean(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise AgentWorkspaceError(f"{label} is invalid.")
+    return value
+
+
+def _node_id(value: Any) -> str:
+    node_id = _string(value, "Graph node ID", maximum = 128)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,127}", node_id) is None:
+        raise AgentWorkspaceError("Graph node ID is invalid.")
+    return node_id
 
 
 def _validate_runtime(value: Any, label: str) -> dict:
@@ -131,9 +278,15 @@ def _validate_runtime(value: Any, label: str) -> dict:
 
 
 def _validate_node(node: Any) -> dict:
-    if not isinstance(node, dict) or set(node) - {"id", "type", "config", "label"}:
+    if not isinstance(node, dict) or set(node) - {
+        "id",
+        "type",
+        "config",
+        "label",
+        "retryPolicy",
+    }:
         raise AgentWorkspaceError("Graph node is invalid.")
-    node_id = _string(node.get("id"), "Graph node ID", maximum = 128)
+    node_id = _node_id(node.get("id"))
     node_type = node.get("type")
     if node_type not in _NODE_TYPES:
         raise AgentWorkspaceError(f"Graph node '{node_id}' has an invalid type.")
@@ -148,9 +301,14 @@ def _validate_node(node: Any) -> dict:
     elif node_type in {"loop", "model"}:
         allowed = {"instruction", "prompt", "runtime", "timeoutSeconds"}
         text_key = "instruction" if node_type == "loop" else "prompt"
-        normalized[text_key] = _string(config.get(text_key), f"{node_type} prompt", maximum = 32768)
-        if config.get("runtime") is not None:
-            normalized["runtime"] = _validate_runtime(config["runtime"], f"{node_type} runtime")
+        normalized[text_key] = _authored_text(
+            config.get(text_key),
+            f"{node_type} prompt",
+            maximum = 32768,
+        )
+        if config.get("runtime") is None:
+            raise AgentWorkspaceError(f"{node_type} runtime is required.")
+        normalized["runtime"] = _validate_runtime(config["runtime"], f"{node_type} runtime")
         normalized["timeoutSeconds"] = _bounded_int(
             config.get("timeoutSeconds", _MAX_NODE_SECONDS),
             f"{node_type}.timeoutSeconds",
@@ -158,7 +316,14 @@ def _validate_node(node: Any) -> dict:
             _MAX_NODE_SECONDS,
         )
     elif node_type == "tool":
-        allowed = {"serverId", "toolName", "arguments", "timeoutSeconds"}
+        allowed = {
+            "serverId",
+            "toolName",
+            "arguments",
+            "timeoutSeconds",
+            "sideEffecting",
+            "idempotencyKey",
+        }
         normalized["serverId"] = _string(config.get("serverId"), "Tool serverId", maximum = 128)
         normalized["toolName"] = _string(config.get("toolName"), "Tool name", maximum = 256)
         arguments = config.get("arguments", {})
@@ -169,6 +334,17 @@ def _validate_node(node: Any) -> dict:
         normalized["timeoutSeconds"] = _bounded_int(
             config.get("timeoutSeconds", 300), "Tool timeoutSeconds", 1, _MAX_NODE_SECONDS
         )
+        normalized["sideEffecting"] = _boolean(
+            config.get("sideEffecting", True), "Tool sideEffecting"
+        )
+        if config.get("idempotencyKey") is not None:
+            normalized["idempotencyKey"] = _string(
+                config["idempotencyKey"], "Tool idempotencyKey", maximum = 512
+            )
+        if normalized["sideEffecting"] and not normalized.get("idempotencyKey"):
+            raise AgentWorkspaceError(
+                "Side-effecting tool nodes require an idempotencyKey template."
+            )
     elif node_type == "condition":
         allowed = {"path", "operator", "value"}
         normalized["path"] = _string(config.get("path"), "Condition path", maximum = 512)
@@ -195,6 +371,9 @@ def _validate_node(node: Any) -> dict:
     if set(config) - allowed:
         raise AgentWorkspaceError(f"Graph node '{node_id}' config contains unsupported fields.")
     result = {"id": node_id, "type": node_type, "config": normalized}
+    result["retryPolicy"] = _validate_retry_policy(
+        node.get("retryPolicy"), node_type, normalized, node_id
+    )
     if node.get("label") is not None:
         result["label"] = _string(node["label"], "Graph node label", maximum = 200)
     return result
@@ -229,6 +408,8 @@ def validate_graph_spec(spec: dict) -> dict:
         raise AgentWorkspaceError("Graph schemas must be objects.")
     _validate_schema_definition(input_schema, "Graph input")
     _validate_schema_definition(output_schema, "Graph output")
+    if input_schema.get("type") != "object":
+        raise AgentWorkspaceError("Graph input schema must describe an object.")
     _json(input_schema, limit = 64 * 1024, label = "Graph input schema")
     _json(output_schema, limit = 64 * 1024, label = "Graph output schema")
     raw_nodes = spec.get("nodes")
@@ -283,11 +464,13 @@ def validate_graph_spec(spec: dict) -> dict:
                 )
             if len(node_edges) == 2 and set(conditions) != {"true", "false"}:
                 raise AgentWorkspaceError("Two condition edges must be true and false.")
+        elif node["type"] == "output" and node_edges:
+            raise AgentWorkspaceError("Output nodes must be terminal.")
         elif len(node_edges) > 1:
             raise AgentWorkspaceError(f"Node '{node['id']}' has too many outgoing edges.")
     terminals = [node for node in nodes if not outgoing[node["id"]]]
-    if not terminals or not any(node["type"] == "output" for node in terminals):
-        raise AgentWorkspaceError("Graph must terminate at an output node.")
+    if not terminals or any(node["type"] != "output" for node in terminals):
+        raise AgentWorkspaceError("Every graph path must terminate at an output node.")
     visited: set[str] = set()
     stack = [inputs[0]["id"]]
     while stack:
@@ -323,6 +506,8 @@ def validate_graph_spec(spec: dict) -> dict:
         "maxNodes",
         "maxRunSeconds",
         "maxOutputBytes",
+        "maxIterations",
+        "maxOutputTokens",
     }:
         raise AgentWorkspaceError("Graph limits are invalid.")
     normalized_limits = {
@@ -338,9 +523,23 @@ def validate_graph_spec(spec: dict) -> dict:
             1024,
             _MAX_RUN_OUTPUT_BYTES,
         ),
+        "maxIterations": _bounded_int(
+            limits.get("maxIterations", max(len(nodes), 100)),
+            "Graph maxIterations",
+            1,
+            _MAX_RUN_ITERATIONS,
+        ),
+        "maxOutputTokens": _bounded_int(
+            limits.get("maxOutputTokens", 262_144),
+            "Graph maxOutputTokens",
+            1,
+            _MAX_RUN_OUTPUT_TOKENS,
+        ),
     }
     if normalized_limits["maxNodes"] < len(nodes):
         raise AgentWorkspaceError("Graph maxNodes cannot be lower than the node count.")
+    if normalized_limits["maxIterations"] < len(nodes):
+        raise AgentWorkspaceError("Graph maxIterations cannot be lower than the node count.")
     result = {
         "name": name,
         "description": description,
@@ -354,6 +553,137 @@ def validate_graph_spec(spec: dict) -> dict:
     }
     _json(result, limit = _MAX_GRAPH_DOCUMENT_BYTES, label = "Graph definition")
     return result
+
+
+def _table_exists(conn, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _create_tool_effects_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_graph_tool_effects (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES chat_projects(id) ON DELETE CASCADE,
+            graph_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            server_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            arguments_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output_json TEXT,
+            error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            UNIQUE(project_id, server_id, tool_name, idempotency_key)
+        )
+        """
+    )
+
+
+def _migrate_tool_effects_schema(conn) -> None:
+    legacy_table = "agent_graph_tool_effects_legacy"
+    legacy_exists = _table_exists(conn, legacy_table)
+    foreign_tables = {
+        row[2]
+        for row in conn.execute("PRAGMA foreign_key_list(agent_graph_tool_effects)").fetchall()
+    }
+    needs_rebuild = bool(foreign_tables & {"agent_graphs", "agent_graph_runs"})
+    if not needs_rebuild and not legacy_exists:
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DROP INDEX IF EXISTS idx_agent_graph_tool_effects_run")
+        if needs_rebuild:
+            if legacy_exists:
+                raise AgentWorkspaceError(
+                    "Graph tool-effect migration found conflicting legacy tables."
+                )
+            conn.execute(
+                "ALTER TABLE agent_graph_tool_effects RENAME TO agent_graph_tool_effects_legacy"
+            )
+            legacy_exists = True
+            _create_tool_effects_table(conn)
+        if legacy_exists:
+            conflict = conn.execute(
+                """
+                SELECT 1
+                FROM agent_graph_tool_effects_legacy AS legacy
+                JOIN agent_graph_tool_effects AS current
+                  ON current.id = legacy.id
+                  OR (
+                    current.project_id = legacy.project_id
+                    AND current.server_id = legacy.server_id
+                    AND current.tool_name = legacy.tool_name
+                    AND current.idempotency_key = legacy.idempotency_key
+                  )
+                WHERE NOT (
+                    current.id IS legacy.id
+                    AND current.project_id IS legacy.project_id
+                    AND current.graph_id IS legacy.graph_id
+                    AND current.run_id IS legacy.run_id
+                    AND current.node_id IS legacy.node_id
+                    AND current.server_id IS legacy.server_id
+                    AND current.tool_name IS legacy.tool_name
+                    AND current.idempotency_key IS legacy.idempotency_key
+                    AND current.arguments_hash IS legacy.arguments_hash
+                    AND current.status IS legacy.status
+                    AND current.output_json IS legacy.output_json
+                    AND current.error IS legacy.error
+                    AND current.created_at IS legacy.created_at
+                    AND current.updated_at IS legacy.updated_at
+                    AND current.completed_at IS legacy.completed_at
+                )
+                LIMIT 1
+                """
+            ).fetchone()
+            if conflict is not None:
+                raise AgentWorkspaceError(
+                    "Graph tool-effect migration found conflicting idempotency receipts."
+                )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO agent_graph_tool_effects(
+                    id, project_id, graph_id, run_id, node_id, server_id, tool_name,
+                    idempotency_key, arguments_hash, status, output_json, error,
+                    created_at, updated_at, completed_at
+                )
+                SELECT
+                    id, project_id, graph_id, run_id, node_id, server_id, tool_name,
+                    idempotency_key, arguments_hash, status, output_json, error,
+                    created_at, updated_at, completed_at
+                FROM agent_graph_tool_effects_legacy
+                """
+            )
+            missing = conn.execute(
+                """
+                SELECT 1
+                FROM agent_graph_tool_effects_legacy AS legacy
+                LEFT JOIN agent_graph_tool_effects AS current ON current.id = legacy.id
+                WHERE current.id IS NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            if missing is not None:
+                raise AgentWorkspaceError("Graph tool-effect receipt migration was incomplete.")
+            conn.execute("DROP TABLE agent_graph_tool_effects_legacy")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_graph_tool_effects_run "
+            "ON agent_graph_tool_effects(run_id, node_id, created_at)"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _ensure_schema(conn) -> None:
@@ -385,6 +715,7 @@ def _ensure_schema(conn) -> None:
             graph_id TEXT NOT NULL REFERENCES agent_graphs(id) ON DELETE CASCADE,
             revision INTEGER NOT NULL,
             input_json TEXT NOT NULL,
+            resource_bindings_json TEXT NOT NULL DEFAULT '{}',
             output_json TEXT,
             error TEXT,
             current_node_id TEXT,
@@ -392,6 +723,8 @@ def _ensure_schema(conn) -> None:
             attempt INTEGER NOT NULL DEFAULT 1,
             retry_of_run_id TEXT REFERENCES agent_graph_runs(id) ON DELETE SET NULL,
             idempotency_key TEXT,
+            iteration_count INTEGER NOT NULL DEFAULT 0,
+            reserved_output_tokens INTEGER NOT NULL DEFAULT 0,
             pause_requested INTEGER NOT NULL DEFAULT 0,
             cancel_requested INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
@@ -410,6 +743,7 @@ def _ensure_schema(conn) -> None:
             status TEXT NOT NULL,
             input_json TEXT,
             output_json TEXT,
+            checkpoint_json TEXT,
             error TEXT,
             created_at INTEGER NOT NULL,
             started_at INTEGER,
@@ -443,8 +777,47 @@ def _ensure_schema(conn) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_agent_graph_approvals_project
             ON agent_graph_approvals(project_id, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS agent_graph_tool_effects (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES chat_projects(id) ON DELETE CASCADE,
+            graph_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            server_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            arguments_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output_json TEXT,
+            error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            UNIQUE(project_id, server_id, tool_name, idempotency_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_graph_tool_effects_run
+            ON agent_graph_tool_effects(run_id, node_id, created_at);
         """
     )
+    _migrate_tool_effects_schema(conn)
+    run_columns = {row[1] for row in conn.execute("PRAGMA table_info(agent_graph_runs)").fetchall()}
+    if "iteration_count" not in run_columns:
+        conn.execute(
+            "ALTER TABLE agent_graph_runs ADD COLUMN iteration_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "reserved_output_tokens" not in run_columns:
+        conn.execute(
+            "ALTER TABLE agent_graph_runs ADD COLUMN reserved_output_tokens INTEGER NOT NULL DEFAULT 0"
+        )
+    if "resource_bindings_json" not in run_columns:
+        conn.execute(
+            "ALTER TABLE agent_graph_runs ADD COLUMN resource_bindings_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    execution_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(agent_graph_node_executions)").fetchall()
+    }
+    if "checkpoint_json" not in execution_columns:
+        conn.execute("ALTER TABLE agent_graph_node_executions ADD COLUMN checkpoint_json TEXT")
     index_columns = [
         row[2]
         for row in conn.execute("PRAGMA index_info(idx_agent_graph_runs_idempotency)").fetchall()
@@ -467,6 +840,26 @@ def _conn():
 
 def _revision_document(row) -> dict:
     document = _load(row["document_json"], {})
+    nodes = []
+    for raw_node in document.get("nodes", []):
+        node = dict(raw_node)
+        node.setdefault(
+            "retryPolicy",
+            {"maxAttempts": 1, "backoffMs": 0, "retryOn": ["error", "timeout"]},
+        )
+        config = dict(node.get("config") or {})
+        if node.get("type") == "tool":
+            config.setdefault("sideEffecting", True)
+        node["config"] = config
+        nodes.append(node)
+    document["nodes"] = nodes
+    limits = dict(document.get("limits") or {})
+    limits.setdefault("maxNodes", max(1, len(nodes)))
+    limits.setdefault("maxRunSeconds", 3600)
+    limits.setdefault("maxOutputBytes", _MAX_RUN_OUTPUT_BYTES)
+    limits.setdefault("maxIterations", max(len(nodes), 100))
+    limits.setdefault("maxOutputTokens", 262_144)
+    document["limits"] = limits
     return {
         **document,
         "graphId": row["graph_id"],
@@ -513,6 +906,9 @@ def create_graph(project_id: str, spec: dict) -> dict:
         conn.commit()
         row = conn.execute("SELECT * FROM agent_graphs WHERE id = ?", (graph_id,)).fetchone()
         return _graph(conn, row)
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise AgentWorkspaceError("A graph with this name already exists in the project.") from exc
     except Exception:
         conn.rollback()
         raise
@@ -552,6 +948,9 @@ def update_graph(project_id: str, graph_id: str, spec: dict, *, expected_revisio
         conn.commit()
         updated = conn.execute("SELECT * FROM agent_graphs WHERE id = ?", (graph_id,)).fetchone()
         return _graph(conn, updated)
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise AgentWorkspaceError("A graph with this name already exists in the project.") from exc
     except Exception:
         conn.rollback()
         raise
@@ -635,6 +1034,34 @@ def get_graph_revision(
         conn.close()
 
 
+def list_graph_revisions(
+    project_id: str,
+    graph_id: str,
+    limit: int = 100,
+) -> list[dict]:
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT graph_id, project_id, revision, document_json, created_at "
+            "FROM agent_graph_revisions WHERE project_id = ? AND graph_id = ? "
+            "ORDER BY revision DESC LIMIT ?",
+            (project_id, graph_id, max(1, min(limit, 500))),
+        ).fetchall()
+        return [
+            {
+                "graphId": row["graph_id"],
+                "projectId": row["project_id"],
+                "revision": row["revision"],
+                "name": _load(row["document_json"], {}).get("name", ""),
+                "description": _load(row["document_json"], {}).get("description", ""),
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
 def _run(row) -> dict:
     return {
         "id": row["id"],
@@ -649,6 +1076,8 @@ def _run(row) -> dict:
         "attempt": row["attempt"],
         "retryOfRunId": row["retry_of_run_id"],
         "idempotencyKey": row["idempotency_key"],
+        "iterationCount": row["iteration_count"],
+        "reservedOutputTokens": row["reserved_output_tokens"],
         "pauseRequested": bool(row["pause_requested"]),
         "cancelRequested": bool(row["cancel_requested"]),
         "createdAt": row["created_at"],
@@ -656,6 +1085,158 @@ def _run(row) -> dict:
         "startedAt": row["started_at"],
         "completedAt": row["completed_at"],
     }
+
+
+def _insert_graph_event(
+    conn: sqlite3.Connection,
+    run_id: str,
+    event_type: str,
+    *,
+    node_id: Optional[str] = None,
+    payload: Optional[dict] = None,
+    created_at: Optional[int] = None,
+) -> dict:
+    event_type = _string(event_type, "Graph event type", maximum = 128)
+    payload = payload or {}
+    sequence_row = conn.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM agent_graph_events WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    sequence = int(sequence_row["next"])
+    event_id = str(uuid.uuid4())
+    current = now_ms() if created_at is None else created_at
+    conn.execute(
+        "INSERT INTO agent_graph_events(id, run_id, sequence, event_type, node_id, payload_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_id,
+            run_id,
+            sequence,
+            event_type,
+            node_id,
+            _json(payload, limit = 64 * 1024, label = "Graph event"),
+            current,
+        ),
+    )
+    return {
+        "id": event_id,
+        "runId": run_id,
+        "sequence": sequence,
+        "type": event_type,
+        "nodeId": node_id,
+        "payload": payload,
+        "createdAt": current,
+    }
+
+
+def _resource_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii = False,
+        allow_nan = False,
+        sort_keys = True,
+        separators = (",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _mcp_resource_binding(server_id: str, server: Any = _UNSET) -> dict:
+    server = mcp_servers_db.get_server(server_id) if server is _UNSET else server
+    if server is None or not server.get("is_enabled"):
+        raise AgentWorkspaceError(
+            f"MCP server '{server_id}' is unavailable. Connect it before starting this graph."
+        )
+    url = str(server.get("url") or "")
+    if not url:
+        raise AgentWorkspaceError(f"MCP server '{server_id}' has no endpoint.")
+    headers = parse_server_headers(server)
+    if headers is None and isinstance(server.get("headers"), dict):
+        headers = server["headers"]
+    if server.get("headers_json") and headers is None:
+        raise AgentWorkspaceError(f"MCP server '{server_id}' has invalid saved headers.")
+    use_oauth = bool(server.get("use_oauth"))
+    oauth_binding = None
+    if use_oauth:
+        try:
+            oauth_binding = oauth_credential_binding(url)
+        except Exception as exc:
+            raise AgentWorkspaceError(
+                f"MCP server '{server_id}' OAuth account could not be bound. Reconnect it first."
+            ) from exc
+        if oauth_binding is None:
+            raise AgentWorkspaceError(
+                f"MCP server '{server_id}' OAuth account is not connected. Connect it before starting this graph."
+            )
+    return {
+        "type": "mcp",
+        "serverId": server_id,
+        "configurationDigest": _resource_digest(
+            {
+                "url": url,
+                "headers": headers or {},
+                "useOauth": use_oauth,
+            }
+        ),
+        "oauthCredentialDigest": oauth_binding,
+    }
+
+
+def _capture_graph_resource_bindings(document: dict) -> dict:
+    from .inference_executor import capture_runtime_snapshot
+
+    bindings: dict[str, dict] = {}
+    for node in document.get("nodes", []):
+        node_type = node.get("type")
+        config = node.get("config") or {}
+        if node_type in {"loop", "model"}:
+            runtime = config.get("runtime")
+            if runtime is None:
+                raise AgentWorkspaceError(
+                    "This graph revision predates durable runtime selection. Save a new revision before running it."
+                )
+            bindings[node["id"]] = {
+                "type": "runtime",
+                "snapshot": capture_runtime_snapshot(runtime),
+            }
+        elif node_type == "tool":
+            bindings[node["id"]] = _mcp_resource_binding(config["serverId"])
+    return {"version": 1, "nodes": bindings}
+
+
+def _graph_node_resource_binding(run_id: str, node_id: str, expected_type: str) -> dict:
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT resource_bindings_json FROM agent_graph_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise AgentWorkspaceError("Graph run not found.")
+        bindings = _load(row["resource_bindings_json"], {})
+    finally:
+        conn.close()
+    binding = (bindings.get("nodes") or {}).get(node_id) if isinstance(bindings, dict) else None
+    if (
+        not isinstance(bindings, dict)
+        or bindings.get("version") != 1
+        or not isinstance(binding, dict)
+        or binding.get("type") != expected_type
+    ):
+        raise AgentWorkspaceError(
+            "This graph run predates durable resource binding. Start a new run from a current revision."
+        )
+    return binding
+
+
+def _bound_mcp_server(run_id: str, node_id: str, server_id: str) -> dict:
+    expected = _graph_node_resource_binding(run_id, node_id, "mcp")
+    current_server = mcp_servers_db.get_server(server_id)
+    current = _mcp_resource_binding(server_id, current_server)
+    if current != expected:
+        raise AgentWorkspaceError(
+            "The MCP server endpoint or credential changed after this run was created. Start a new run."
+        )
+    return current_server
 
 
 def create_graph_run(
@@ -666,13 +1247,14 @@ def create_graph_run(
     revision: Optional[int] = None,
     idempotency_key: Optional[str] = None,
     retry_of_run_id: Optional[str] = None,
+    attempt: int = 1,
 ) -> dict:
     if not isinstance(input_data, dict):
         raise AgentWorkspaceError("Graph run input must be an object.")
-    _json(input_data, limit = _MAX_JSON_BYTES, label = "Graph run input")
+    encoded_input = _json(input_data, limit = _MAX_JSON_BYTES, label = "Graph run input")
+    attempt = _bounded_int(attempt, "Graph run attempt", 1, 1000)
     conn = _conn()
     try:
-        conn.execute("BEGIN IMMEDIATE")
         graph = conn.execute(
             "SELECT current_revision FROM agent_graphs WHERE id = ? AND project_id = ?",
             (graph_id, project_id),
@@ -695,24 +1277,77 @@ def create_graph_run(
                 (project_id, graph_id, idempotency_key),
             ).fetchone()
             if existing is not None:
+                existing_input = _json(
+                    _load(existing["input_json"], {}),
+                    limit = _MAX_JSON_BYTES,
+                    label = "Existing graph run input",
+                )
+                if (
+                    int(existing["revision"]) != selected_revision
+                    or existing_input != encoded_input
+                ):
+                    raise AgentWorkspaceError(
+                        "Graph idempotency key was already used with different input or revision."
+                    )
+                return _run(existing)
+        resource_bindings = _capture_graph_resource_bindings(document)
+        conn.execute("BEGIN IMMEDIATE")
+        revision_still_exists = conn.execute(
+            "SELECT 1 FROM agent_graph_revisions WHERE graph_id = ? AND project_id = ? AND revision = ?",
+            (graph_id, project_id, selected_revision),
+        ).fetchone()
+        if revision_still_exists is None:
+            raise AgentWorkspaceError("Graph revision not found.")
+        if idempotency_key is not None:
+            existing = conn.execute(
+                "SELECT * FROM agent_graph_runs WHERE project_id = ? AND graph_id = ? AND idempotency_key = ?",
+                (project_id, graph_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                existing_input = _json(
+                    _load(existing["input_json"], {}),
+                    limit = _MAX_JSON_BYTES,
+                    label = "Existing graph run input",
+                )
+                if (
+                    int(existing["revision"]) != selected_revision
+                    or existing_input != encoded_input
+                ):
+                    raise AgentWorkspaceError(
+                        "Graph idempotency key was already used with different input or revision."
+                    )
                 conn.commit()
                 return _run(existing)
         run_id = str(uuid.uuid4())
         current = now_ms()
         conn.execute(
-            "INSERT INTO agent_graph_runs(id, project_id, graph_id, revision, input_json, status, retry_of_run_id, "
-            "idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+            "INSERT INTO agent_graph_runs(id, project_id, graph_id, revision, input_json, resource_bindings_json, "
+            "status, attempt, retry_of_run_id, idempotency_key, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
             (
                 run_id,
                 project_id,
                 graph_id,
                 selected_revision,
-                _json(input_data, limit = _MAX_JSON_BYTES, label = "Graph run input"),
+                encoded_input,
+                _json(
+                    resource_bindings,
+                    limit = _MAX_GRAPH_DOCUMENT_BYTES,
+                    label = "Graph resource bindings",
+                ),
+                attempt,
                 retry_of_run_id,
                 idempotency_key,
                 current,
                 current,
             ),
+        )
+        _insert_graph_event(
+            conn,
+            run_id,
+            "run.created",
+            payload = {"revision": selected_revision, "attempt": attempt},
+            created_at = current,
         )
         conn.commit()
         row = conn.execute("SELECT * FROM agent_graph_runs WHERE id = ?", (run_id,)).fetchone()
@@ -757,20 +1392,39 @@ def list_graph_runs(
         conn.close()
 
 
+def _list_active_graph_runs(project_id: str) -> list[dict]:
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM agent_graph_runs WHERE project_id = ? AND status IN "
+            "('queued', 'running', 'pausing', 'paused', 'cancelling') ORDER BY created_at, id",
+            (project_id,),
+        ).fetchall()
+        return [_run(row) for row in rows]
+    finally:
+        conn.close()
+
+
 def claim_graph_run(run_id: str) -> Optional[dict]:
     conn = _conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         current = now_ms()
         cursor = conn.execute(
             "UPDATE agent_graph_runs SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ? "
             "WHERE id = ? AND status = 'queued'",
             (current, current, run_id),
         )
-        conn.commit()
         if not cursor.rowcount:
+            conn.commit()
             return None
+        _insert_graph_event(conn, run_id, "run.started", created_at = current)
+        conn.commit()
         row = conn.execute("SELECT * FROM agent_graph_runs WHERE id = ?", (run_id,)).fetchone()
         return _run(row) if row else None
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -815,6 +1469,187 @@ def update_graph_run(
         conn.close()
 
 
+def finish_graph_run(
+    run_id: str,
+    status: str,
+    event_type: str,
+    *,
+    output: Any = _UNSET,
+    error: Optional[str] = None,
+    current_node_id: Any = _UNSET,
+    node_id: Optional[str] = None,
+    payload: Optional[dict] = None,
+    respect_control_requests: bool = False,
+) -> dict:
+    """Commit a run state transition and its durable event together."""
+    if status not in _GRAPH_STATUSES:
+        raise AgentWorkspaceError("Invalid graph run status.")
+    encoded_output = (
+        _json(output, limit = _MAX_RUN_OUTPUT_BYTES, label = "Graph run output")
+        if output is not _UNSET
+        else None
+    )
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM agent_graph_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise AgentWorkspaceError("Graph run not found.")
+        if row["status"] in {"cancelled", "completed", "failed", "interrupted"}:
+            conn.commit()
+            return _run(row)
+        resolved_status = status
+        resolved_event_type = event_type
+        resolved_error = error
+        if row["cancel_requested"] or row["status"] == "cancelling":
+            resolved_status = "cancelled"
+            resolved_event_type = "run.cancelled"
+            resolved_error = "Graph run cancelled."
+            payload = {"error": resolved_error}
+            encoded_output = None
+        elif respect_control_requests and (row["pause_requested"] or row["status"] == "pausing"):
+            resolved_status = "paused"
+            resolved_event_type = "run.paused"
+            encoded_output = None
+        current = now_ms()
+        assignments = ["status = ?", "updated_at = ?"]
+        values: list[Any] = [resolved_status, current]
+        if resolved_status in {"cancelled", "completed", "failed", "interrupted"}:
+            assignments.append("completed_at = ?")
+            values.append(current)
+        if encoded_output is not None:
+            assignments.append("output_json = ?")
+            values.append(encoded_output)
+        if resolved_error is not None:
+            assignments.append("error = ?")
+            values.append(str(resolved_error)[:8000])
+        if current_node_id is not _UNSET:
+            assignments.append("current_node_id = ?")
+            values.append(current_node_id)
+        if resolved_status == "cancelled":
+            assignments.extend(["cancel_requested = 1", "pause_requested = 0"])
+        values.append(run_id)
+        conn.execute(
+            f"UPDATE agent_graph_runs SET {', '.join(assignments)} WHERE id = ?",
+            values,
+        )
+        _insert_graph_event(
+            conn,
+            run_id,
+            resolved_event_type,
+            node_id = node_id,
+            payload = payload,
+            created_at = current,
+        )
+        conn.commit()
+        return _run(
+            conn.execute("SELECT * FROM agent_graph_runs WHERE id = ?", (run_id,)).fetchone()
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def consume_graph_budget(
+    run_id: str,
+    *,
+    max_iterations: int,
+    max_output_tokens: int,
+    iterations: int = 0,
+    output_tokens: int = 0,
+) -> dict:
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT iteration_count, reserved_output_tokens FROM agent_graph_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise AgentWorkspaceError("Graph run not found.")
+        next_iterations = int(row["iteration_count"]) + max(0, int(iterations))
+        next_tokens = int(row["reserved_output_tokens"]) + max(0, int(output_tokens))
+        if next_iterations > max_iterations:
+            raise AgentWorkspaceError("Graph iteration budget exhausted.")
+        if next_tokens > max_output_tokens:
+            raise AgentWorkspaceError("Graph output token budget exhausted.")
+        conn.execute(
+            "UPDATE agent_graph_runs SET iteration_count = ?, reserved_output_tokens = ?, updated_at = ? "
+            "WHERE id = ?",
+            (next_iterations, next_tokens, now_ms(), run_id),
+        )
+        conn.commit()
+        return {
+            "iterationCount": next_iterations,
+            "reservedOutputTokens": next_tokens,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reserve_graph_task_output_tokens(
+    run_id: str,
+    execution_id: str,
+    reservation_id: str,
+    *,
+    max_output_tokens: int,
+    output_tokens: int,
+) -> dict:
+    """Reserve one task's maximum output and checkpoint it in the same commit."""
+    reservation_id = _string(reservation_id, "Graph task reservation ID", maximum = 256)
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        execution = conn.execute(
+            "SELECT checkpoint_json FROM agent_graph_node_executions WHERE id = ? AND run_id = ?",
+            (execution_id, run_id),
+        ).fetchone()
+        if execution is None:
+            raise AgentWorkspaceError("Graph node execution not found.")
+        checkpoint = _load(execution["checkpoint_json"], {})
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+        if checkpoint.get("outputTokenReservationId") == reservation_id:
+            conn.commit()
+            return checkpoint
+        run = conn.execute(
+            "SELECT reserved_output_tokens FROM agent_graph_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            raise AgentWorkspaceError("Graph run not found.")
+        next_tokens = int(run["reserved_output_tokens"]) + max(0, int(output_tokens))
+        if next_tokens > max_output_tokens:
+            raise AgentWorkspaceError("Graph output token budget exhausted.")
+        checkpoint = {**checkpoint, "outputTokenReservationId": reservation_id}
+        encoded_checkpoint = _json(
+            checkpoint,
+            limit = 64 * 1024,
+            label = "Graph node checkpoint",
+        )
+        current = now_ms()
+        conn.execute(
+            "UPDATE agent_graph_runs SET reserved_output_tokens = ?, updated_at = ? WHERE id = ?",
+            (next_tokens, current, run_id),
+        )
+        conn.execute(
+            "UPDATE agent_graph_node_executions SET checkpoint_json = ? WHERE id = ?",
+            (encoded_checkpoint, execution_id),
+        )
+        conn.commit()
+        return checkpoint
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def request_graph_pause(run_id: str) -> dict:
     conn = _conn()
     try:
@@ -828,10 +1663,19 @@ def request_graph_pause(run_id: str) -> dict:
             status = "pausing"
         else:
             raise AgentWorkspaceError("Only queued or running graph runs can be paused.")
+        current = now_ms()
         conn.execute(
             "UPDATE agent_graph_runs SET status = ?, pause_requested = 1, updated_at = ? WHERE id = ?",
-            (status, now_ms(), run_id),
+            (status, current, run_id),
         )
+        if status == "paused":
+            _insert_graph_event(
+                conn,
+                run_id,
+                "run.paused",
+                node_id = row["current_node_id"],
+                created_at = current,
+            )
         conn.commit()
         return _run(
             conn.execute("SELECT * FROM agent_graph_runs WHERE id = ?", (run_id,)).fetchone()
@@ -847,11 +1691,13 @@ def resume_graph_run(run_id: str) -> dict:
         row = conn.execute("SELECT * FROM agent_graph_runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
             raise AgentWorkspaceError("Graph run not found.")
+        if row["cancel_requested"]:
+            raise AgentWorkspaceError("A cancelled graph run cannot be resumed.")
         if row["status"] not in {"paused", "interrupted"}:
             raise AgentWorkspaceError("Only paused or interrupted graph runs can be resumed.")
         conn.execute(
-            "UPDATE agent_graph_runs SET status = 'queued', pause_requested = 0, cancel_requested = 0, "
-            "error = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE agent_graph_runs SET status = 'queued', pause_requested = 0, "
+            "error = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
             (now_ms(), run_id),
         )
         conn.commit()
@@ -880,13 +1726,28 @@ def request_graph_cancel(run_id: str) -> dict:
         completed_at = now_ms() if status == "cancelled" else None
         if completed_at is None:
             conn.execute(
-                "UPDATE agent_graph_runs SET status = ?, cancel_requested = 1, updated_at = ? WHERE id = ?",
+                "UPDATE agent_graph_runs SET status = ?, cancel_requested = 1, pause_requested = 0, updated_at = ? WHERE id = ?",
                 (status, now_ms(), run_id),
             )
         else:
             conn.execute(
-                "UPDATE agent_graph_runs SET status = ?, cancel_requested = 1, updated_at = ?, completed_at = ? WHERE id = ?",
+                "UPDATE agent_graph_runs SET status = ?, cancel_requested = 1, pause_requested = 0, "
+                "error = COALESCE(error, 'Graph run cancelled.'), updated_at = ?, completed_at = ? "
+                "WHERE id = ?",
                 (status, completed_at, completed_at, run_id),
+            )
+            conn.execute(
+                "UPDATE agent_graph_node_executions SET status = 'cancelled', "
+                "error = COALESCE(error, 'Graph run cancelled.'), completed_at = ? "
+                "WHERE run_id = ? AND status IN ('running', 'paused')",
+                (completed_at, run_id),
+            )
+            _insert_graph_event(
+                conn,
+                run_id,
+                "run.cancelled",
+                node_id = row["current_node_id"],
+                created_at = completed_at,
             )
         conn.commit()
         return _run(
@@ -896,21 +1757,117 @@ def request_graph_cancel(run_id: str) -> dict:
         conn.close()
 
 
-def create_node_execution(run_id: str, node: dict, input_value: Any, attempt: int) -> dict:
+def admit_node_execution(
+    run_id: str,
+    node: dict,
+    input_value: Any,
+    attempt: int,
+    *,
+    max_iterations: int,
+    checkpoint: Optional[dict] = None,
+) -> dict:
+    """Atomically spend one iteration, create its execution, and record admission."""
+    attempt = _bounded_int(attempt, "Graph node attempt", 1, _MAX_NODE_ATTEMPTS)
+    encoded_input = _json(
+        input_value,
+        limit = _MAX_RUN_OUTPUT_BYTES,
+        label = "Graph node input",
+    )
+    encoded_checkpoint = (
+        _json(checkpoint, limit = 64 * 1024, label = "Graph node checkpoint")
+        if checkpoint is not None
+        else None
+    )
     execution_id = str(uuid.uuid4())
     current = now_ms()
     conn = _conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        run = conn.execute(
+            "SELECT status, iteration_count, pause_requested, cancel_requested "
+            "FROM agent_graph_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            raise AgentWorkspaceError("Graph run not found.")
+        if run["status"] != "running" or run["pause_requested"] or run["cancel_requested"]:
+            raise AgentWorkspaceError("Graph run control changed before node admission.")
+        next_iterations = int(run["iteration_count"]) + 1
+        if next_iterations > max_iterations:
+            raise AgentWorkspaceError("Graph iteration budget exhausted.")
         conn.execute(
-            "INSERT INTO agent_graph_node_executions(id, run_id, node_id, node_type, attempt, status, input_json, created_at, started_at) "
-            "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)",
+            "UPDATE agent_graph_runs SET iteration_count = ?, current_node_id = ?, updated_at = ? "
+            "WHERE id = ?",
+            (next_iterations, node["id"], current, run_id),
+        )
+        conn.execute(
+            "INSERT INTO agent_graph_node_executions(id, run_id, node_id, node_type, attempt, "
+            "status, input_json, checkpoint_json, created_at, started_at) "
+            "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
             (
                 execution_id,
                 run_id,
                 node["id"],
                 node["type"],
                 attempt,
-                _json(input_value, limit = _MAX_JSON_BYTES, label = "Graph node input"),
+                encoded_input,
+                encoded_checkpoint,
+                current,
+                current,
+            ),
+        )
+        _insert_graph_event(
+            conn,
+            run_id,
+            "node.started",
+            node_id = node["id"],
+            payload = {"type": node["type"], "attempt": attempt},
+            created_at = current,
+        )
+        conn.commit()
+        return {
+            "id": execution_id,
+            "runId": run_id,
+            "nodeId": node["id"],
+            "nodeType": node["type"],
+            "attempt": attempt,
+            "status": "running",
+            "checkpoint": checkpoint,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def create_node_execution(
+    run_id: str,
+    node: dict,
+    input_value: Any,
+    attempt: int,
+    *,
+    checkpoint: Optional[dict] = None,
+) -> dict:
+    execution_id = str(uuid.uuid4())
+    current = now_ms()
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO agent_graph_node_executions(id, run_id, node_id, node_type, attempt, status, input_json, checkpoint_json, created_at, started_at) "
+            "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
+            (
+                execution_id,
+                run_id,
+                node["id"],
+                node["type"],
+                attempt,
+                _json(input_value, limit = _MAX_RUN_OUTPUT_BYTES, label = "Graph node input"),
+                (
+                    _json(checkpoint, limit = 64 * 1024, label = "Graph node checkpoint")
+                    if checkpoint is not None
+                    else None
+                ),
                 current,
                 current,
             ),
@@ -923,6 +1880,7 @@ def create_node_execution(run_id: str, node: dict, input_value: Any, attempt: in
             "nodeType": node["type"],
             "attempt": attempt,
             "status": "running",
+            "checkpoint": checkpoint,
         }
     finally:
         conn.close()
@@ -942,7 +1900,8 @@ def finish_node_execution(
     conn = _conn()
     try:
         conn.execute(
-            "UPDATE agent_graph_node_executions SET status = ?, output_json = ?, error = ?, completed_at = ? WHERE id = ?",
+            "UPDATE agent_graph_node_executions SET status = ?, output_json = ?, error = ?, "
+            "completed_at = ? WHERE id = ? AND status != 'completed'",
             (
                 status,
                 _json(output, limit = _MAX_RUN_OUTPUT_BYTES, label = "Graph node output")
@@ -952,6 +1911,60 @@ def finish_node_execution(
                 now_ms(),
                 execution_id,
             ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def complete_node_execution(
+    run_id: str,
+    execution_id: str,
+    node_id: str,
+    attempt: int,
+    output: Any,
+    next_node_id: Optional[str],
+) -> None:
+    """Commit node output, completion event, and run cursor atomically."""
+    encoded_output = _json(output, limit = _MAX_RUN_OUTPUT_BYTES, label = "Graph node output")
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = now_ms()
+        cursor = conn.execute(
+            "UPDATE agent_graph_node_executions SET status = 'completed', output_json = ?, "
+            "error = NULL, completed_at = ? WHERE id = ? AND run_id = ? AND status = 'running'",
+            (encoded_output, current, execution_id, run_id),
+        )
+        if cursor.rowcount != 1:
+            raise AgentWorkspaceError("Graph node completion state changed concurrently.")
+        _insert_graph_event(
+            conn,
+            run_id,
+            "node.completed",
+            node_id = node_id,
+            payload = {"attempt": attempt},
+            created_at = current,
+        )
+        conn.execute(
+            "UPDATE agent_graph_runs SET current_node_id = ?, updated_at = ? WHERE id = ?",
+            (next_node_id, current, run_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_node_checkpoint(execution_id: str, checkpoint: dict) -> None:
+    encoded = _json(checkpoint, limit = 64 * 1024, label = "Graph node checkpoint")
+    conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE agent_graph_node_executions SET checkpoint_json = ? WHERE id = ?",
+            (encoded, execution_id),
         )
         conn.commit()
     finally:
@@ -976,6 +1989,7 @@ def list_node_executions(project_id: str, run_id: str) -> list[dict]:
                 "status": row["status"],
                 "input": _load(row["input_json"], None),
                 "output": _load(row["output_json"], None),
+                "checkpoint": _load(row["checkpoint_json"], None),
                 "error": row["error"],
                 "createdAt": row["created_at"],
                 "startedAt": row["started_at"],
@@ -997,35 +2011,15 @@ def append_graph_event(
     conn = _conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        sequence_row = conn.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM agent_graph_events WHERE run_id = ?",
-            (run_id,),
-        ).fetchone()
-        sequence = int(sequence_row["next"])
-        event_id = str(uuid.uuid4())
-        current = now_ms()
-        conn.execute(
-            "INSERT INTO agent_graph_events(id, run_id, sequence, event_type, node_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                event_id,
-                run_id,
-                sequence,
-                _string(event_type, "Graph event type", maximum = 128),
-                node_id,
-                _json(payload or {}, limit = 64 * 1024, label = "Graph event"),
-                current,
-            ),
+        event = _insert_graph_event(
+            conn,
+            run_id,
+            event_type,
+            node_id = node_id,
+            payload = payload,
         )
         conn.commit()
-        return {
-            "id": event_id,
-            "runId": run_id,
-            "sequence": sequence,
-            "type": event_type,
-            "nodeId": node_id,
-            "payload": payload or {},
-            "createdAt": current,
-        }
+        return event
     except Exception:
         conn.rollback()
         raise
@@ -1065,6 +2059,7 @@ def list_graph_events(
 def get_or_create_approval(project_id: str, run_id: str, node: dict) -> dict:
     conn = _conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM agent_graph_approvals WHERE run_id = ? AND node_id = ?",
             (run_id, node["id"]),
@@ -1086,11 +2081,22 @@ def get_or_create_approval(project_id: str, run_id: str, node: dict) -> dict:
                     current,
                 ),
             )
-            conn.commit()
+            _insert_graph_event(
+                conn,
+                run_id,
+                "approval.required",
+                node_id = node["id"],
+                payload = {"approvalId": approval_id},
+                created_at = current,
+            )
             row = conn.execute(
                 "SELECT * FROM agent_graph_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
+        conn.commit()
         return _approval(row)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1149,44 +2155,181 @@ def decide_graph_approval(project_id: str, run_id: str, approval_id: str, decisi
             raise AgentWorkspaceError("Graph approval not found.")
         if row["status"] != "pending":
             raise AgentWorkspaceError("Graph approval has already been decided.")
+        run = conn.execute(
+            "SELECT status, current_node_id, cancel_requested FROM agent_graph_runs "
+            "WHERE id = ? AND project_id = ?",
+            (run_id, project_id),
+        ).fetchone()
+        if run is None:
+            raise AgentWorkspaceError("Graph run not found.")
+        if (
+            run["status"] in {"cancelling", "cancelled", "completed", "failed"}
+            or run["cancel_requested"]
+        ):
+            raise AgentWorkspaceError("This graph run is no longer awaiting approval.")
+        if run["current_node_id"] not in {None, row["node_id"]}:
+            raise AgentWorkspaceError("This graph run is no longer at the approval node.")
         current = now_ms()
         conn.execute(
             "UPDATE agent_graph_approvals SET status = ?, decision = ?, updated_at = ? WHERE id = ?",
             (decision, decision, current, approval_id),
         )
-        conn.commit()
+        _insert_graph_event(
+            conn,
+            run_id,
+            "approval.decided",
+            node_id = row["node_id"],
+            payload = {"approvalId": approval_id, "decision": decision},
+            created_at = current,
+        )
         result = _approval(
             conn.execute(
                 "SELECT * FROM agent_graph_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
         )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-    append_graph_event(
-        run_id,
-        "approval.decided",
-        node_id = result["nodeId"],
-        payload = {"approvalId": approval_id, "decision": decision},
-    )
     return result
+
+
+def _begin_tool_effect(
+    run: dict, node: dict, arguments: dict, idempotency_key: str
+) -> tuple[str, Optional[str], Any]:
+    encoded_arguments = _json(arguments, limit = 64 * 1024, label = "Tool arguments")
+    arguments_hash = hashlib.sha256(encoded_arguments.encode("utf-8")).hexdigest()
+    config = node["config"]
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM agent_graph_tool_effects WHERE project_id = ? AND server_id = ? "
+            "AND tool_name = ? AND idempotency_key = ?",
+            (
+                run["projectId"],
+                config["serverId"],
+                config["toolName"],
+                idempotency_key,
+            ),
+        ).fetchone()
+        if existing is not None:
+            if existing["arguments_hash"] != arguments_hash:
+                raise AgentWorkspaceError(
+                    "Tool idempotency key was already used with different arguments."
+                )
+            if existing["status"] == "completed":
+                conn.commit()
+                return "cached", existing["id"], _load(existing["output_json"], None)
+            raise _GraphToolEffectUncertain(
+                "Tool effect state is uncertain. Verify the external system before using a new idempotency key."
+            )
+        effect_id = str(uuid.uuid4())
+        current = now_ms()
+        conn.execute(
+            "INSERT INTO agent_graph_tool_effects(id, project_id, graph_id, run_id, node_id, "
+            "server_id, tool_name, idempotency_key, arguments_hash, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+            (
+                effect_id,
+                run["projectId"],
+                run["graphId"],
+                run["id"],
+                node["id"],
+                config["serverId"],
+                config["toolName"],
+                idempotency_key,
+                arguments_hash,
+                current,
+                current,
+            ),
+        )
+        conn.commit()
+        return "dispatch", effect_id, None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _complete_tool_effect(effect_id: str, output: Any) -> None:
+    encoded = _json(output, limit = _MAX_RUN_OUTPUT_BYTES, label = "Tool output")
+    conn = _conn()
+    try:
+        current = now_ms()
+        conn.execute(
+            "UPDATE agent_graph_tool_effects SET status = 'completed', output_json = ?, "
+            "updated_at = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+            (encoded, current, current, effect_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _mark_tool_effect_uncertain(effect_id: str, error: str) -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE agent_graph_tool_effects SET status = 'uncertain', error = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (str(error)[:8000], now_ms(), effect_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def recover_graph_runs() -> int:
     """Fence in-flight graph records after a process restart."""
     conn = _conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         current = now_ms()
-        cursor = conn.execute(
-            "UPDATE agent_graph_runs SET status = 'interrupted', error = COALESCE(error, 'Studio restarted while the graph was active.'), "
-            "updated_at = ?, completed_at = ? WHERE status IN ('running', 'pausing', 'cancelling')",
-            (current, current),
-        )
+        active_runs = conn.execute(
+            "SELECT id, current_node_id, status, cancel_requested FROM agent_graph_runs "
+            "WHERE status IN ('queued', 'running', 'pausing', 'cancelling')"
+        ).fetchall()
         conn.execute(
-            "UPDATE agent_graph_node_executions SET status = 'interrupted', error = COALESCE(error, 'Studio restarted while the graph was active.'), completed_at = ? WHERE status = 'running'",
+            "UPDATE agent_graph_tool_effects SET status = 'uncertain', "
+            "error = COALESCE(error, 'Studio restarted while the tool effect was active.'), updated_at = ? "
+            "WHERE status = 'running'",
             (current,),
         )
+        for run in active_runs:
+            cancelled = bool(run["cancel_requested"]) or run["status"] == "cancelling"
+            status = "cancelled" if cancelled else "interrupted"
+            error = (
+                "Graph run cancellation completed after Studio restarted."
+                if cancelled
+                else "Studio restarted while the graph was active."
+            )
+            conn.execute(
+                "UPDATE agent_graph_runs SET status = ?, error = COALESCE(error, ?), "
+                "pause_requested = 0, updated_at = ?, completed_at = ? WHERE id = ?",
+                (status, error, current, current, run["id"]),
+            )
+            conn.execute(
+                "UPDATE agent_graph_node_executions SET status = ?, error = COALESCE(error, ?), "
+                "completed_at = ? WHERE run_id = ? AND status = 'running'",
+                (status, error, current, run["id"]),
+            )
+            _insert_graph_event(
+                conn,
+                run["id"],
+                "run." + status,
+                node_id = run["current_node_id"],
+                payload = {"error": error},
+                created_at = current,
+            )
         conn.commit()
-        return int(cursor.rowcount)
+        return len(active_runs)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1203,23 +2346,36 @@ def _graph_path(value: Any, path: str) -> Any:
     return current
 
 
-def _render(value: Any, context: dict) -> Any:
+def _render(
+    value: Any,
+    context: dict,
+    *,
+    exact_values: bool = False,
+) -> Any:
     if isinstance(value, str):
         try:
-            fields = {field for _, field, _, _ in Formatter().parse(value) if field}
-            if not fields:
-                return value
-            replacements = {
-                field: json.dumps(_graph_path(context, field), ensure_ascii = False)
-                for field in fields
-            }
-            return value.format(**replacements)
-        except (KeyError, ValueError, IndexError) as exc:
+            parsed = list(Formatter().parse(value))
+            if exact_values and len(parsed) == 1:
+                literal, field, format_spec, conversion = parsed[0]
+                if literal == "" and field and not format_spec and not conversion:
+                    return _graph_path(context, field)
+            rendered = []
+            for literal, field, format_spec, conversion in parsed:
+                rendered.append(literal)
+                if field is None:
+                    continue
+                if not field or format_spec or conversion:
+                    raise ValueError("unsupported graph template field")
+                rendered.append(json.dumps(_graph_path(context, field), ensure_ascii = False))
+            return "".join(rendered)
+        except (ValueError, IndexError) as exc:
             raise AgentWorkspaceError("Graph template references an invalid context path.") from exc
     if isinstance(value, dict):
-        return {key: _render(item, context) for key, item in value.items()}
+        return {
+            key: _render(item, context, exact_values = exact_values) for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_render(item, context) for item in value]
+        return [_render(item, context, exact_values = exact_values) for item in value]
     return value
 
 
@@ -1294,11 +2450,22 @@ def _validate_schema_definition(schema: dict, label: str) -> None:
         "null",
     }:
         raise AgentWorkspaceError(f"{label} schema type is invalid.")
+    allowed = {"type"}
+    if expected == "object":
+        allowed.update({"properties", "required", "additionalProperties"})
+    elif expected == "array":
+        allowed.add("items")
+    if set(schema) - allowed:
+        raise AgentWorkspaceError(f"{label} schema contains unsupported fields.")
     if expected == "object":
         properties = schema.get("properties", {})
         required = schema.get("required", [])
         if not isinstance(properties, dict) or not isinstance(required, list):
             raise AgentWorkspaceError(f"{label} schema is invalid.")
+        if "additionalProperties" in schema and not isinstance(
+            schema["additionalProperties"], bool
+        ):
+            raise AgentWorkspaceError(f"{label} schema additionalProperties is invalid.")
         if any(not isinstance(item, str) or item not in properties for item in required):
             raise AgentWorkspaceError(f"{label} schema required fields are invalid.")
         for key, child in properties.items():
@@ -1317,25 +2484,105 @@ class GraphLoopAdapter:
         project_id: str,
         instruction: str,
         runtime: Optional[dict],
-        cancel_event: threading.Event,
+        cancel_event: Any,
+        *,
+        runtime_snapshot: Optional[dict] = None,
+        checkpoint: Optional[dict] = None,
+        checkpoint_callback: Optional[Callable[[dict], None]] = None,
+        before_start: Optional[Callable[[str], None]] = None,
     ) -> dict:
         from .background import manager as background_manager
-        task = background_manager.enqueue_agent(
-            project_id,
-            instruction,
-            runtime_selection = runtime,
-            start = True,
-        )
+
+        task = None
+        needs_start = False
+        checkpoint_task_id = str((checkpoint or {}).get("backgroundTaskId") or "")
+        if checkpoint_task_id:
+            task = background_manager_task(checkpoint_task_id)
+            if task and task["projectId"] != project_id:
+                raise AgentWorkspaceError("Graph loop checkpoint belongs to another project.")
+            if (
+                task
+                and runtime_snapshot is not None
+                and (task.get("payload") or {}).get("runtime") != runtime_snapshot
+            ):
+                raise AgentWorkspaceError(
+                    "Graph loop checkpoint runtime does not match the pinned run resource."
+                )
+            if task and task["status"] == "completed":
+                result = task.get("result") or {}
+                if checkpoint_callback:
+                    checkpoint_callback(
+                        {
+                            "backgroundTaskId": task["id"],
+                            "status": "completed",
+                            "toolIterations": int(result.get("toolEvents") or 0) // 2,
+                        }
+                    )
+                return result
+            if task and task["status"] in {"failed", "cancelled", "interrupted"}:
+                if (runtime or {}).get("permissionMode") != "off":
+                    raise _GraphLoopEffectUncertain(
+                        "The prior Loop task stopped after it may have changed the workspace. Inspect the project before starting a new run."
+                    )
+                task = None
+                checkpoint_task_id = ""
+            elif task and task["status"] == "queued":
+                needs_start = True
+        if task is None:
+            allocated_task_id = checkpoint_task_id or str(uuid.uuid4())
+            if checkpoint_callback:
+                checkpoint_callback(
+                    {
+                        "backgroundTaskId": allocated_task_id,
+                        "status": "allocated",
+                        "toolIterations": 0,
+                    }
+                )
+            if before_start:
+                before_start(allocated_task_id)
+            task = background_manager.enqueue_agent(
+                project_id,
+                instruction,
+                task_id = allocated_task_id,
+                runtime_selection = runtime if runtime_snapshot is None else None,
+                runtime_snapshot = runtime_snapshot,
+                start = False,
+            )
+            needs_start = True
+            if checkpoint_callback:
+                checkpoint_callback(
+                    {
+                        "backgroundTaskId": task["id"],
+                        "status": "queued",
+                        "toolIterations": 0,
+                    }
+                )
+        if needs_start:
+            task = background_manager.start(task["id"])
+        last_status = None
+        cancel_sent = False
         while True:
-            if cancel_event.is_set():
-                background_manager.cancel(task["id"])
             current = background_manager_task(task["id"])
             if current is None:
                 raise AgentWorkspaceError("Graph loop task disappeared before completion.")
+            if current["status"] != last_status and checkpoint_callback:
+                result = current.get("result") or {}
+                checkpoint_callback(
+                    {
+                        "backgroundTaskId": task["id"],
+                        "status": current["status"],
+                        "toolIterations": int(result.get("toolEvents") or 0) // 2,
+                    }
+                )
+                last_status = current["status"]
             if current["status"] in {"completed", "failed", "cancelled", "interrupted"}:
                 if current["status"] != "completed":
                     raise AgentWorkspaceError(current.get("error") or "Graph loop failed.")
                 return current.get("result") or {}
+            should_cancel = getattr(cancel_event, "should_cancel_work", cancel_event.is_set)
+            if should_cancel() and not cancel_sent:
+                background_manager.cancel(task["id"])
+                cancel_sent = True
             time.sleep(0.025)
 
 
@@ -1357,8 +2604,9 @@ class GraphRunManager:
         )
         self._lock = threading.Lock()
         self._futures: dict[str, Future] = {}
-        self._cancellations: dict[str, threading.Event] = {}
+        self._cancellations: dict[str, _RunControl] = {}
         self._deleting_projects: set[str] = set()
+        self._stopping = threading.Event()
         self.loop_adapter = loop_adapter or GraphLoopAdapter()
 
     def begin_project_deletion(self, project_id: str) -> None:
@@ -1393,31 +2641,38 @@ class GraphRunManager:
 
     def start(self, run_id: str) -> dict:
         with self._lock:
+            if self._stopping.is_set():
+                raise AgentWorkspaceError("The graph coordinator is shutting down.")
+            existing = self._get_any(run_id)
+            if existing is None:
+                raise AgentWorkspaceError("Graph run not found.")
+            if existing["projectId"] in self._deleting_projects:
+                raise AgentWorkspaceError("Project deletion is in progress.")
             claimed = claim_graph_run(run_id)
             if claimed is None:
-                run = self._get_any(run_id)
-                if run is None:
-                    raise AgentWorkspaceError("Graph run not found.")
+                run = self._get_any(run_id) or existing
                 if run["status"] != "running":
                     raise AgentWorkspaceError("Only queued graph runs can be started.")
                 return run
-            cancel_event = threading.Event()
+            cancel_event = _RunControl()
             self._cancellations[run_id] = cancel_event
             try:
                 future = self._executor.submit(self._run, run_id, cancel_event)
             except Exception as exc:
                 self._cancellations.pop(run_id, None)
-                update_graph_run(
+                finish_graph_run(
                     run_id,
-                    status = "failed",
+                    "failed",
+                    "run.failed",
                     error = "The graph coordinator could not start this run.",
+                    payload = {"error": "The graph coordinator could not start this run."},
                 )
                 raise AgentWorkspaceError(
                     "The graph coordinator could not start this run."
                 ) from exc
             self._futures[run_id] = future
-            future.add_done_callback(lambda _future: self._forget(run_id))
-            return claimed
+        future.add_done_callback(lambda _future: self._forget(run_id))
+        return claimed
 
     def _get_any(self, run_id: str) -> Optional[dict]:
         conn = _conn()
@@ -1431,10 +2686,16 @@ class GraphRunManager:
         run = request_graph_pause(run_id)
         event = self._cancellations.get(run_id)
         if event:
-            event.set()
+            event.request("pause")
         return run
 
     def resume(self, run_id: str) -> dict:
+        existing = self._get_any(run_id)
+        if existing is None:
+            raise AgentWorkspaceError("Graph run not found.")
+        with self._lock:
+            if existing["projectId"] in self._deleting_projects:
+                raise AgentWorkspaceError("Project deletion is in progress.")
         run = resume_graph_run(run_id)
         return self.start(run_id)
 
@@ -1442,7 +2703,7 @@ class GraphRunManager:
         run = request_graph_cancel(run_id)
         event = self._cancellations.get(run_id)
         if event:
-            event.set()
+            event.request("cancel")
         return run
 
     def retry(
@@ -1457,6 +2718,21 @@ class GraphRunManager:
             raise AgentWorkspaceError("Graph run not found.")
         if previous["status"] not in {"failed", "cancelled", "interrupted"}:
             raise AgentWorkspaceError("Only stopped graph runs can be retried.")
+        graph = get_graph_revision(project_id, previous["graphId"], previous["revision"])
+        if graph is None:
+            raise AgentWorkspaceError("Pinned graph revision is unavailable.")
+        executed_nodes = {item["nodeId"] for item in list_node_executions(project_id, run_id)}
+        unsafe_replays = [
+            node["id"]
+            for node in graph["nodes"]
+            if node["id"] in executed_nodes
+            and node["type"] in {"loop", "model"}
+            and (node["config"].get("runtime") or {}).get("permissionMode") != "off"
+        ]
+        if unsafe_replays:
+            raise AgentWorkspaceError(
+                "This run used a Loop or model node that may have changed the workspace. Inspect the project and start a new run instead of replaying it."
+            )
         with self._lock:
             if project_id in self._deleting_projects:
                 raise AgentWorkspaceError("Project deletion is in progress.")
@@ -1465,9 +2741,13 @@ class GraphRunManager:
                 previous["graphId"],
                 previous["input"],
                 revision = previous["revision"],
+                idempotency_key = f"graph-retry:{run_id}",
                 retry_of_run_id = run_id,
+                attempt = int(previous["attempt"]) + 1,
             )
-        return self.start(run["id"]) if start else run
+            if run["retryOfRunId"] != run_id:
+                raise AgentWorkspaceError("Graph retry idempotency key collision.")
+        return self.start(run["id"]) if start and run["status"] == "queued" else run
 
     def _forget(self, run_id: str) -> None:
         with self._lock:
@@ -1475,11 +2755,12 @@ class GraphRunManager:
             self._cancellations.pop(run_id, None)
 
     def prepare_for_app_exit(self, timeout_seconds: float = 10) -> None:
+        self._stopping.set()
         with self._lock:
             events = list(self._cancellations.values())
             futures = list(self._futures.values())
         for event in events:
-            event.set()
+            event.request("shutdown")
         deadline = time.monotonic() + max(0.1, timeout_seconds)
         for future in futures:
             remaining = deadline - time.monotonic()
@@ -1496,11 +2777,7 @@ class GraphRunManager:
         project_id: str,
         timeout_seconds: float = 30,
     ) -> list[dict]:
-        active = [
-            run
-            for run in list_graph_runs(project_id, limit = 500)
-            if run["status"] in {"queued", "running", "pausing", "cancelling"}
-        ]
+        active = _list_active_graph_runs(project_id)
         for run in active:
             try:
                 self.cancel(run["id"])
@@ -1517,11 +2794,7 @@ class GraphRunManager:
                 future.result(timeout = remaining)
             except Exception as exc:
                 raise AgentWorkspaceError("Failed while stopping a project graph run.") from exc
-        remaining_runs = [
-            run
-            for run in list_graph_runs(project_id, limit = 500)
-            if run["status"] in {"queued", "running", "pausing", "cancelling"}
-        ]
+        remaining_runs = _list_active_graph_runs(project_id)
         if remaining_runs:
             raise AgentWorkspaceError("Project still has active graph runs.")
         return [
@@ -1530,25 +2803,35 @@ class GraphRunManager:
             if get_graph_run(project_id, run["id"])
         ]
 
-    def _run(self, run_id: str, cancel_event: threading.Event) -> None:
+    def _run(self, run_id: str, cancel_event: _RunControl) -> None:
         run = self._get_any(run_id)
         if run is None:
             return
         graph = get_graph_revision(run["projectId"], run["graphId"], run["revision"])
         budget_expired = threading.Event()
-        timer = threading.Timer(
-            int((graph or {}).get("limits", {}).get("maxRunSeconds", 3600)),
-            lambda: (budget_expired.set(), cancel_event.set()),
-        )
-        timer.daemon = True
-        timer.start()
+        max_run_seconds = int((graph or {}).get("limits", {}).get("maxRunSeconds", 3600))
+        started_at = int(run.get("startedAt") or now_ms())
+        remaining = max_run_seconds - max(0.0, (now_ms() - started_at) / 1000)
+
+        def exhaust_budget() -> None:
+            budget_expired.set()
+            cancel_event.request("budget")
+
+        timer = None
+        if remaining <= 0:
+            exhaust_budget()
+        else:
+            timer = threading.Timer(remaining, exhaust_budget)
+            timer.daemon = True
+            timer.start()
         try:
             self._run_impl(run_id, cancel_event, budget_expired)
         finally:
-            timer.cancel()
+            if timer is not None:
+                timer.cancel()
 
     def _run_impl(
-        self, run_id: str, cancel_event: threading.Event, budget_expired: threading.Event
+        self, run_id: str, cancel_event: _RunControl, budget_expired: threading.Event
     ) -> None:
         run = self._get_any(run_id)
         if run is None:
@@ -1561,125 +2844,371 @@ class GraphRunManager:
             edges = graph["edges"]
             executions = list_node_executions(run["projectId"], run_id)
             context = {"input": run["input"], "nodes": {}, "previous": None}
+            completed_by_node: dict[str, dict] = {}
             for execution in executions:
-                if execution["status"] == "completed":
-                    context["nodes"][execution["nodeId"]] = execution["output"]
-                    context["previous"] = execution["output"]
-            current_node_id = run.get("currentNodeId")
-            if current_node_id is None:
-                completed = [item for item in executions if item["status"] == "completed"]
-                if completed:
-                    current_node_id = self._next_node(
-                        completed[-1]["nodeId"], completed[-1]["output"], nodes, edges
-                    )
-                else:
-                    current_node_id = next(
-                        node["id"] for node in graph["nodes"] if node["type"] == "input"
-                    )
-            node_count = len([item for item in executions if item["status"] == "completed"])
+                if execution["status"] != "completed":
+                    continue
+                existing = completed_by_node.get(execution["nodeId"])
+                if existing is None or int(execution["attempt"]) > int(existing["attempt"]):
+                    completed_by_node[execution["nodeId"]] = execution
+            current_node_id = next(node["id"] for node in graph["nodes"] if node["type"] == "input")
+            completed_path: list[str] = []
+            while current_node_id in completed_by_node:
+                if current_node_id in completed_path:
+                    raise AgentWorkspaceError("Graph execution history contains a cycle.")
+                completed_execution = completed_by_node[current_node_id]
+                completed_path.append(current_node_id)
+                context["nodes"][current_node_id] = completed_execution["output"]
+                context["previous"] = completed_execution["output"]
+                current_node_id = self._next_node(
+                    current_node_id,
+                    completed_execution["output"],
+                    nodes,
+                    edges,
+                )
+            if set(completed_path) != set(completed_by_node):
+                raise AgentWorkspaceError(
+                    "Graph completed execution history does not match the pinned revision."
+                )
+            if run.get("currentNodeId") != current_node_id:
+                update_graph_run(run_id, current_node_id = current_node_id)
+            node_count = len(completed_path)
             while current_node_id is not None:
                 run = self._get_any(run_id) or run
                 if budget_expired.is_set():
                     raise AgentWorkspaceError("Graph run budget exhausted.")
+                if self._stopping.is_set() and cancel_event.is_set():
+                    finish_graph_run(
+                        run_id,
+                        "interrupted",
+                        "run.interrupted",
+                        error = "Studio stopped while the graph was active.",
+                        current_node_id = current_node_id,
+                        node_id = current_node_id,
+                    )
+                    return
                 if run["cancelRequested"] or (cancel_event.is_set() and not run["pauseRequested"]):
-                    update_graph_run(run_id, status = "cancelled", error = "Graph run cancelled.")
-                    append_graph_event(run_id, "run.cancelled")
+                    finish_graph_run(
+                        run_id,
+                        "cancelled",
+                        "run.cancelled",
+                        error = "Graph run cancelled.",
+                    )
                     return
                 if (
                     run["pauseRequested"]
                     or run["status"] == "pausing"
                     or (cancel_event.is_set() and run["status"] == "paused")
                 ):
-                    update_graph_run(run_id, status = "paused", current_node_id = current_node_id)
-                    append_graph_event(run_id, "run.paused", node_id = current_node_id)
+                    finish_graph_run(
+                        run_id,
+                        "paused",
+                        "run.paused",
+                        current_node_id = current_node_id,
+                        node_id = current_node_id,
+                    )
                     return
                 if node_count >= graph["limits"]["maxNodes"]:
                     raise AgentWorkspaceError("Graph node budget exhausted.")
                 node = nodes[current_node_id]
                 update_graph_run(run_id, current_node_id = current_node_id)
-                append_graph_event(
-                    run_id, "node.started", node_id = current_node_id, payload = {"type": node["type"]}
+                prior_attempts = sorted(
+                    [item for item in executions if item["nodeId"] == current_node_id],
+                    key = lambda item: int(item["attempt"]),
                 )
-                prior_attempts = [item for item in executions if item["nodeId"] == current_node_id]
-                execution = create_node_execution(
-                    run_id, node, context["previous"], len(prior_attempts) + 1
+                seed_checkpoint = next(
+                    (
+                        item.get("checkpoint")
+                        for item in reversed(prior_attempts)
+                        if item.get("checkpoint")
+                    ),
+                    None,
                 )
-                node_timed_out = threading.Event()
-                node_timer = threading.Timer(
-                    int(node["config"].get("timeoutSeconds", _MAX_NODE_SECONDS)),
-                    lambda: (node_timed_out.set(), cancel_event.set()),
-                )
-                node_timer.daemon = True
-                node_timer.start()
-                try:
-                    output = self._execute_node(run, graph, node, context, cancel_event)
-                    _json(
-                        output,
-                        limit = graph["limits"]["maxOutputBytes"],
-                        label = "Graph node output",
+                retry_policy = node["retryPolicy"]
+                failed_attempts = [item for item in prior_attempts if item["status"] == "failed"]
+                failed_attempt_count = len(failed_attempts)
+                if failed_attempt_count >= retry_policy["maxAttempts"]:
+                    failure_error = (
+                        failed_attempts[-1].get("error")
+                        or "Graph node retry attempts were exhausted."
                     )
-                    if node_timed_out.is_set():
-                        raise AgentWorkspaceError("Graph node timeout exceeded.")
-                    if cancel_event.is_set() and ((self._get_any(run_id) or run)["pauseRequested"]):
-                        finish_node_execution(execution["id"], "paused", output = output)
-                        update_graph_run(run_id, status = "paused", current_node_id = current_node_id)
-                        append_graph_event(run_id, "node.paused", node_id = current_node_id)
-                        return
-                    finish_node_execution(execution["id"], "completed", output = output)
-                    executions.append(
-                        {"nodeId": current_node_id, "status": "completed", "output": output}
-                    )
-                    context["nodes"][current_node_id] = output
-                    context["previous"] = output
-                    node_count += 1
-                    append_graph_event(run_id, "node.completed", node_id = current_node_id)
-                    current_node_id = self._next_node(current_node_id, output, nodes, edges)
-                    update_graph_run(run_id, current_node_id = current_node_id)
-                except Exception as exc:
-                    current = self._get_any(run_id) or run
-                    if budget_expired.is_set():
-                        finish_node_execution(
-                            execution["id"], "failed", error = "Graph run budget exhausted."
-                        )
-                        raise AgentWorkspaceError("Graph run budget exhausted.") from exc
-                    if current["pauseRequested"]:
-                        finish_node_execution(execution["id"], "paused", error = str(exc))
-                        update_graph_run(run_id, status = "paused", current_node_id = current_node_id)
-                        append_graph_event(run_id, "node.paused", node_id = current_node_id)
-                        return
-                    finish_node_execution(
-                        execution["id"],
-                        "cancelled" if current["cancelRequested"] else "failed",
-                        error = str(exc),
-                    )
-                    status = "cancelled" if current["cancelRequested"] else "failed"
-                    update_graph_run(run_id, status = status, error = str(exc))
-                    append_graph_event(
+                    finish_graph_run(
                         run_id,
-                        "run." + status,
+                        "failed",
+                        "run.failed",
+                        error = failure_error,
+                        current_node_id = current_node_id,
                         node_id = current_node_id,
-                        payload = {"error": str(exc)[:1000]},
+                        payload = {"error": str(failure_error)[:1000]},
                     )
                     return
-                finally:
-                    node_timer.cancel()
-            final_output = context["previous"] or {}
+                attempt = max((int(item["attempt"]) for item in prior_attempts), default = 0) + 1
+                while True:
+                    execution = admit_node_execution(
+                        run_id,
+                        node,
+                        context["previous"],
+                        attempt,
+                        max_iterations = graph["limits"]["maxIterations"],
+                        checkpoint = seed_checkpoint,
+                    )
+                    checkpoint_holder = {"value": seed_checkpoint}
+                    node_timed_out = threading.Event()
+                    node_timer = threading.Timer(
+                        int(node["config"].get("timeoutSeconds", _MAX_NODE_SECONDS)),
+                        node_timed_out.set,
+                    )
+                    node_timer.daemon = True
+                    node_timer.start()
+                    try:
+                        output = self._execute_node(
+                            run,
+                            graph,
+                            node,
+                            context,
+                            _CombinedEvent(cancel_event, node_timed_out),
+                            execution["id"],
+                            checkpoint_holder,
+                        )
+                        _json(
+                            output,
+                            limit = graph["limits"]["maxOutputBytes"],
+                            label = "Graph node output",
+                        )
+                        current_after_node = self._get_any(run_id) or run
+                        if self._stopping.is_set():
+                            raise AgentWorkspaceError(
+                                "Studio stopped while the graph node was finishing."
+                            )
+                        if budget_expired.is_set():
+                            raise AgentWorkspaceError("Graph run budget exhausted.")
+                        if current_after_node["cancelRequested"]:
+                            raise AgentWorkspaceError("Graph run cancelled.")
+                        if node_timed_out.is_set():
+                            raise _GraphNodeTimeout("Graph node timeout exceeded.")
+                        if cancel_event.is_set() and current_after_node["pauseRequested"]:
+                            finish_node_execution(execution["id"], "paused", output = output)
+                            finish_graph_run(
+                                run_id,
+                                "paused",
+                                "node.paused",
+                                current_node_id = current_node_id,
+                                node_id = current_node_id,
+                            )
+                            return
+                        next_node_id = self._next_node(current_node_id, output, nodes, edges)
+                        complete_node_execution(
+                            run_id,
+                            execution["id"],
+                            current_node_id,
+                            attempt,
+                            output,
+                            next_node_id,
+                        )
+                        executions.append(
+                            {
+                                "nodeId": current_node_id,
+                                "status": "completed",
+                                "output": output,
+                                "checkpoint": checkpoint_holder["value"],
+                            }
+                        )
+                        context["nodes"][current_node_id] = output
+                        context["previous"] = output
+                        node_count += 1
+                        current_node_id = next_node_id
+                        break
+                    except Exception as exc:
+                        effective_exc: Exception = exc
+                        if node_timed_out.is_set() and not isinstance(exc, _GraphNodeTimeout):
+                            effective_exc = _GraphNodeTimeout("Graph node timeout exceeded.")
+                        persisted_execution = next(
+                            (
+                                item
+                                for item in list_node_executions(run["projectId"], run_id)
+                                if item["id"] == execution["id"]
+                            ),
+                            None,
+                        )
+                        if persisted_execution and persisted_execution["status"] == "completed":
+                            persisted_output = persisted_execution["output"]
+                            executions.append(persisted_execution)
+                            context["nodes"][current_node_id] = persisted_output
+                            context["previous"] = persisted_output
+                            node_count += 1
+                            current_node_id = self._next_node(
+                                current_node_id,
+                                persisted_output,
+                                nodes,
+                                edges,
+                            )
+                            break
+                        current = self._get_any(run_id) or run
+                        if self._stopping.is_set():
+                            finish_node_execution(
+                                execution["id"], "interrupted", error = str(effective_exc)
+                            )
+                            finish_graph_run(
+                                run_id,
+                                "interrupted",
+                                "run.interrupted",
+                                error = "Studio stopped while the graph was active.",
+                                current_node_id = current_node_id,
+                                node_id = current_node_id,
+                            )
+                            return
+                        if budget_expired.is_set():
+                            finish_node_execution(
+                                execution["id"], "failed", error = "Graph run budget exhausted."
+                            )
+                            raise AgentWorkspaceError("Graph run budget exhausted.") from exc
+                        if current["cancelRequested"]:
+                            finish_node_execution(
+                                execution["id"], "cancelled", error = str(effective_exc)
+                            )
+                            finish_graph_run(
+                                run_id,
+                                "cancelled",
+                                "run.cancelled",
+                                error = str(effective_exc),
+                                current_node_id = current_node_id,
+                                node_id = current_node_id,
+                                payload = {"error": str(effective_exc)[:1000]},
+                            )
+                            return
+                        if current["pauseRequested"]:
+                            finish_node_execution(
+                                execution["id"], "paused", error = str(effective_exc)
+                            )
+                            finish_graph_run(
+                                run_id,
+                                "paused",
+                                "node.paused",
+                                current_node_id = current_node_id,
+                                node_id = current_node_id,
+                            )
+                            return
+                        finish_node_execution(execution["id"], "failed", error = str(effective_exc))
+                        executions.append(
+                            {
+                                "nodeId": current_node_id,
+                                "status": "failed",
+                                "output": None,
+                                "checkpoint": checkpoint_holder["value"],
+                            }
+                        )
+                        failed_attempt_count += 1
+                        retry_kind = (
+                            "timeout" if isinstance(effective_exc, _GraphNodeTimeout) else "error"
+                        )
+                        retryable = (
+                            failed_attempt_count < retry_policy["maxAttempts"]
+                            and retry_kind in retry_policy["retryOn"]
+                            and not isinstance(effective_exc, _GraphToolEffectUncertain)
+                            and "budget exhausted" not in str(effective_exc).lower()
+                        )
+                        if not retryable:
+                            finish_graph_run(
+                                run_id,
+                                "failed",
+                                "run.failed",
+                                error = str(effective_exc),
+                                current_node_id = current_node_id,
+                                node_id = current_node_id,
+                                payload = {"error": str(effective_exc)[:1000]},
+                            )
+                            return
+                        append_graph_event(
+                            run_id,
+                            "node.retrying",
+                            node_id = current_node_id,
+                            payload = {
+                                "attempt": attempt,
+                                "nextAttempt": attempt + 1,
+                                "reason": retry_kind,
+                                "backoffMs": retry_policy["backoffMs"],
+                            },
+                        )
+                        if cancel_event.wait(retry_policy["backoffMs"] / 1000):
+                            current = self._get_any(run_id) or run
+                            if self._stopping.is_set():
+                                status = "interrupted"
+                                finish_error = "Studio stopped during graph retry backoff."
+                            elif budget_expired.is_set():
+                                status = "failed"
+                                finish_error = "Graph run budget exhausted."
+                            elif current["cancelRequested"]:
+                                status = "cancelled"
+                                finish_error = "Graph retry cancelled."
+                            elif current["pauseRequested"]:
+                                status = "paused"
+                                finish_error = "Graph retry paused."
+                            else:
+                                status = "cancelled"
+                                finish_error = "Graph retry cancelled."
+                            finish_graph_run(
+                                run_id,
+                                status,
+                                "run." + status,
+                                error = finish_error,
+                                current_node_id = current_node_id,
+                                node_id = current_node_id,
+                            )
+                            return
+                        attempt += 1
+                        seed_checkpoint = checkpoint_holder["value"]
+                    finally:
+                        node_timer.cancel()
+            final_output = context["previous"]
             _json(
                 final_output,
                 limit = graph["limits"]["maxOutputBytes"],
                 label = "Graph output",
             )
             _validate_schema_value(final_output, graph.get("outputSchema", {}), "Graph output")
-            update_graph_run(run_id, status = "completed", output = final_output)
-            append_graph_event(run_id, "run.completed")
+            if self._stopping.is_set():
+                finish_graph_run(
+                    run_id,
+                    "interrupted",
+                    "run.interrupted",
+                    error = "Studio stopped while the graph was finishing.",
+                )
+                return
+            if budget_expired.is_set():
+                raise AgentWorkspaceError("Graph run budget exhausted.")
+            finish_graph_run(
+                run_id,
+                "completed",
+                "run.completed",
+                output = final_output,
+                current_node_id = None,
+                respect_control_requests = True,
+            )
         except Exception as exc:
             current = self._get_any(run_id)
-            if current and current["status"] not in {"cancelled", "completed"}:
-                update_graph_run(run_id, status = "failed", error = str(exc))
-                append_graph_event(run_id, "run.failed", payload = {"error": str(exc)[:1000]})
+            if current and current["status"] not in {
+                "cancelled",
+                "completed",
+                "failed",
+                "interrupted",
+            }:
+                finish_graph_run(
+                    run_id,
+                    "failed",
+                    "run.failed",
+                    error = str(exc),
+                    payload = {"error": str(exc)[:1000]},
+                )
 
     def _execute_node(
-        self, run: dict, graph: dict, node: dict, context: dict, cancel_event: threading.Event
+        self,
+        run: dict,
+        graph: dict,
+        node: dict,
+        context: dict,
+        cancel_event: Any,
+        execution_id: str,
+        checkpoint_holder: dict,
     ) -> Any:
         node_type = node["type"]
         config = node["config"]
@@ -1688,36 +3217,133 @@ class GraphRunManager:
         if node_type in {"loop", "model"}:
             template = config["instruction"] if node_type == "loop" else config["prompt"]
             instruction = _render(template, context)
+            resource_binding = _graph_node_resource_binding(run["id"], node["id"], "runtime")
+            runtime_snapshot = resource_binding.get("snapshot")
+            if not isinstance(runtime_snapshot, dict):
+                raise AgentWorkspaceError("The graph runtime binding is invalid.")
+
+            def save_checkpoint(checkpoint: dict) -> None:
+                merged_checkpoint = dict(checkpoint)
+                previous_checkpoint = checkpoint_holder.get("value")
+                if (
+                    isinstance(previous_checkpoint, dict)
+                    and previous_checkpoint.get("outputTokenReservationId")
+                    and not merged_checkpoint.get("outputTokenReservationId")
+                ):
+                    merged_checkpoint["outputTokenReservationId"] = previous_checkpoint[
+                        "outputTokenReservationId"
+                    ]
+                checkpoint_holder["value"] = merged_checkpoint
+                update_node_checkpoint(execution_id, merged_checkpoint)
+
+            def reserve_tokens(reservation_id: str) -> None:
+                runtime = config.get("runtime") or {}
+                checkpoint_holder["value"] = reserve_graph_task_output_tokens(
+                    run["id"],
+                    execution_id,
+                    reservation_id,
+                    max_output_tokens = graph["limits"]["maxOutputTokens"],
+                    output_tokens = int(runtime.get("maxOutputTokens") or 8192),
+                )
+
+            run_parameters = inspect.signature(self.loop_adapter.run).parameters
+            if "checkpoint" not in run_parameters:
+                if runtime_snapshot.get("kind") == "provider":
+                    raise AgentWorkspaceError(
+                        "This Loop adapter cannot enforce the pinned provider resource."
+                    )
+                reserve_tokens(f"legacy:{execution_id}")
+                return self.loop_adapter.run(
+                    run["projectId"], instruction, config.get("runtime"), cancel_event
+                )
+            run_kwargs = {
+                "checkpoint": checkpoint_holder["value"],
+                "checkpoint_callback": save_checkpoint,
+                "before_start": reserve_tokens,
+            }
+            if "runtime_snapshot" in run_parameters:
+                run_kwargs["runtime_snapshot"] = runtime_snapshot
             return self.loop_adapter.run(
-                run["projectId"], instruction, config.get("runtime"), cancel_event
+                run["projectId"],
+                instruction,
+                config.get("runtime"),
+                cancel_event,
+                **run_kwargs,
             )
         if node_type == "tool":
             allowed = graph["permissions"].get("allowedToolServerIds", [])
             if config["serverId"] not in allowed:
                 raise AgentWorkspaceError("Graph tool is not permitted by this graph revision.")
-            server = mcp_servers_db.get_server(config["serverId"])
-            if server is None or not server.get("is_enabled"):
-                raise AgentWorkspaceError("Graph tool server is unavailable.")
-            return call_tool_sync(
-                server["url"],
-                parse_server_headers(server),
-                config["toolName"],
-                _render(config["arguments"], context),
-                timeout = config["timeoutSeconds"],
-                use_oauth = bool(server.get("use_oauth")),
-                cancel_event = cancel_event,
-                scope = f"graph:{run['id']}",
+            server = _bound_mcp_server(run["id"], node["id"], config["serverId"])
+            arguments = _render(config["arguments"], context, exact_values = True)
+            server_url = server["url"]
+            server_headers = parse_server_headers(server)
+            server_oauth = bool(server.get("use_oauth"))
+
+            def config_current() -> bool:
+                try:
+                    current = _bound_mcp_server(run["id"], node["id"], config["serverId"])
+                except AgentWorkspaceError:
+                    return False
+                return (
+                    current.get("url") == server_url
+                    and parse_server_headers(current) == server_headers
+                    and bool(current.get("use_oauth")) == server_oauth
+                )
+
+            def dispatch() -> Any:
+                result = call_tool_sync(
+                    server_url,
+                    server_headers,
+                    config["toolName"],
+                    arguments,
+                    timeout = config["timeoutSeconds"],
+                    use_oauth = server_oauth,
+                    cancel_event = cancel_event,
+                    scope = f"graph:{run['id']}",
+                    config_check = config_current,
+                )
+                if isinstance(result, str) and result.startswith("Error:"):
+                    if " timed out" in result:
+                        raise _GraphNodeTimeout(result)
+                    raise AgentWorkspaceError(result)
+                return result
+
+            if not config["sideEffecting"]:
+                return dispatch()
+            if not config.get("idempotencyKey"):
+                raise AgentWorkspaceError(
+                    "This pinned tool node predates effect idempotency. Save a new graph revision with an idempotencyKey before running it."
+                )
+            idempotency_key = _string(
+                _render(config["idempotencyKey"], context),
+                "Tool idempotency key",
+                maximum = 512,
             )
+            effect_status, effect_id, cached_output = _begin_tool_effect(
+                run, node, arguments, idempotency_key
+            )
+            if effect_status == "cached":
+                append_graph_event(
+                    run["id"],
+                    "tool.effect.reused",
+                    node_id = node["id"],
+                    payload = {"idempotencyKey": idempotency_key},
+                )
+                return cached_output
+            try:
+                output = dispatch()
+                _complete_tool_effect(str(effect_id), output)
+                return output
+            except Exception as exc:
+                _mark_tool_effect_uncertain(str(effect_id), str(exc))
+                raise _GraphToolEffectUncertain(
+                    "Tool effect may have occurred. Automatic replay was blocked."
+                ) from exc
         if node_type == "condition":
             return _condition(_graph_path(context, config["path"]), config)
         if node_type == "approval":
             approval = get_or_create_approval(run["projectId"], run["id"], node)
-            append_graph_event(
-                run["id"],
-                "approval.required",
-                node_id = node["id"],
-                payload = {"approvalId": approval["id"]},
-            )
             while approval["status"] == "pending":
                 current = self._get_any(run["id"]) or run
                 if current["cancelRequested"]:
@@ -1774,6 +3400,7 @@ __all__ = [
     "get_graph_revision",
     "get_graph_run",
     "list_graph_events",
+    "list_graph_revisions",
     "list_graph_approvals",
     "list_graph_runs",
     "list_graphs",
@@ -1781,5 +3408,6 @@ __all__ = [
     "manager",
     "recover_graph_runs",
     "update_graph",
+    "update_node_checkpoint",
     "validate_graph_spec",
 ]

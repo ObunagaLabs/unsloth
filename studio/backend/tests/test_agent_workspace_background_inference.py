@@ -194,6 +194,10 @@ def test_runtime_snapshot_rejects_secrets_and_persists_only_saved_provider_ident
                 "apiKey": "must-not-persist",
             }
         )
+    with pytest.raises(AgentWorkspaceError, match = "selection is invalid"):
+        background_inference._validate_snapshot(
+            {**snapshot, "apiKey": "must-not-copy-from-durable-state"}
+        )
 
 
 def test_provider_routing_and_codex_account_bindings_reject_drift(monkeypatch):

@@ -30,6 +30,9 @@ _SELECTION_KEYS = frozenset(
         "maxOutputTokens",
     }
 )
+_SNAPSHOT_KEYS = _SELECTION_KEYS | frozenset(
+    {"providerType", "routingDigest", "credentialBindingDigest"}
+)
 _KEY_OPTIONAL_PROVIDERS = frozenset({"custom", "llama_cpp", "ollama", "vllm"})
 _MAX_GENERATION_TOKENS = 32_768
 _DEFAULT_GENERATION_TOKENS = 8_192
@@ -157,6 +160,8 @@ def _validate_snapshot(snapshot: Any) -> dict[str, Any]:
         raise AgentWorkspaceError(
             "This background task has no runtime selection. Queue it again with a model."
         )
+    if set(snapshot) - _SNAPSHOT_KEYS:
+        raise AgentWorkspaceError("The saved background runtime selection is invalid.")
     kind = snapshot.get("kind")
     model = snapshot.get("model")
     permission_mode = snapshot.get("permissionMode")
@@ -183,6 +188,11 @@ def _validate_snapshot(snapshot: Any) -> dict[str, Any]:
             "Queue this task with permission mode 'off' or 'full'."
         )
     return snapshot
+
+
+def validate_runtime_snapshot(snapshot: Any) -> dict[str, Any]:
+    """Validate an internal durable snapshot before copying it to another task."""
+    return dict(_validate_snapshot(snapshot))
 
 
 def _bounded_text(value: Any, limit: int) -> str:
@@ -643,8 +653,7 @@ async def _run_external(
     )
     if credential_binding != snapshot.get("credentialBindingDigest"):
         raise AgentWorkspaceError(
-            "The selected provider credential changed after this task was queued. "
-            "Queue a new task."
+            "The selected provider credential changed after this task was queued. Queue a new task."
         )
     api_key = api_key_value or ""
     if not api_key and snapshot["providerType"] not in _KEY_OPTIONAL_PROVIDERS:
