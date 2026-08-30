@@ -12,6 +12,7 @@
  */
 
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
+import { issuedRunFrom } from "./auto-continue-issued-run";
 import {
   AUTO_CONTINUE_LEASE_RENEW_MS,
   createAutoContinueLeaseKeeper,
@@ -115,4 +116,30 @@ export function holdAutoContinueRun(
     window.addEventListener(PROMPT_QUEUE_RUN_FAILED_EVENT, onRunFailed);
   }
   timer ??= setInterval(tick, AUTO_CONTINUE_LEASE_RENEW_MS);
+}
+
+/**
+ * Tie the hold just taken for `messageId` to the run the bar has just issued for it.
+ *
+ * `started` is whatever `startRun` handed back, passed through untyped: the runtime declares
+ * `void` and returns the roundtrip's promise, and `issuedRunFrom` is what decides which of
+ * those it actually got.
+ *
+ * This is the only thing that ends a hold whose preflight the user STOPPED. That run raises no
+ * failure -- the abort is what was asked for, so the adapter wrapper skips its notice on
+ * purpose -- and it never reached the stream flag either, so without this the hold renewed its
+ * lease until the tab closed and every other tab refused the message for just as long.
+ *
+ * Nothing here reads a clock. A preflight that is merely long leaves the promise pending, and
+ * a pending promise settles nothing, which is what the absence of an arming deadline is for.
+ */
+export function watchAutoContinueRun(
+  messageId: string,
+  threadId: string | undefined,
+  started: unknown,
+): void {
+  if (!threadId) {
+    return;
+  }
+  keeper.settleOn(messageId, threadId, issuedRunFrom(started));
 }
