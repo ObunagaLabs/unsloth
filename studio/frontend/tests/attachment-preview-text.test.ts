@@ -196,6 +196,43 @@ test("readAttachmentText reads a bounded slice of a large text file", async () =
   assert.equal(truncateAttachmentPreviewText(text).truncated, true);
 });
 
+test("readAttachmentText previews UTF-16 registry exports as decoded text", async () => {
+  const text =
+    "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Test]";
+  const utf16le = new Uint8Array(2 + text.length * 2);
+  utf16le.set([0xff, 0xfe]);
+  for (let index = 0; index < text.length; index += 1) {
+    const codeUnit = text.charCodeAt(index);
+    utf16le[2 + index * 2] = codeUnit & 0xff;
+    utf16le[3 + index * 2] = codeUnit >>> 8;
+  }
+  const file = new File([utf16le], "export.reg");
+
+  assert.deepEqual(await readAttachmentText(file, file.name, file.type), {
+    label: null,
+    text,
+    truncated: false,
+  });
+});
+
+test("readAttachmentText previews gettext catalogs in their declared charset", async () => {
+  const before =
+    'msgid ""\nmsgstr ""\n"Content-Type: text/plain; charset=ISO-8859-1\\n"\n\nmsgid "coffee"\nmsgstr "caf';
+  const after = '"\n';
+  const encoded = Uint8Array.from([
+    ...new TextEncoder().encode(before),
+    0xe9,
+    ...new TextEncoder().encode(after),
+  ]);
+  const file = new File([encoded], "messages.po");
+
+  assert.deepEqual(await readAttachmentText(file, file.name, file.type), {
+    label: null,
+    text: `${before}é${after}`,
+    truncated: false,
+  });
+});
+
 test("readAttachmentText reads a bounded slice of a large html file", async () => {
   const oversized = new File(
     [`<p>${"b".repeat(2_000_000)}</p>`],
