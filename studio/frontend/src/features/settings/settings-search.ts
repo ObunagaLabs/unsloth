@@ -261,6 +261,10 @@ export function createSettingsSearchIndex({
       "settings.general.startup.launchAtLogin",
       ...(closeToTray ? (["settings.general.startup.closeToTray"] as const) : []),
     ],
+    appearance: [
+      ...SETTINGS_SEARCH_INDEX.appearance,
+      "settings.appearance.custom.interfaceScale.label",
+    ],
     about: SETTINGS_SEARCH_INDEX.about.filter(
       (key) => key !== "settings.about.updates",
     ),
