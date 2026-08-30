@@ -30,6 +30,7 @@ import { useSelectedModelView } from "./use-selected-model-view";
 
 export interface ModelsSelection {
   selectedId: string | null;
+  selectionInputId: string | null;
   setSelected: (id: string | null) => void;
   selectedModel: SelectedModelView | null;
   metadataUnavailable: boolean;
@@ -69,6 +70,7 @@ export function useModelsSelection({
   filteredDiscoverRows,
   filteredCachedRows,
   filteredLocalRows,
+  downloadedReady,
   results,
   accessToken,
   online,
@@ -81,6 +83,7 @@ export function useModelsSelection({
   filteredDiscoverRows: DiscoverRow[];
   filteredCachedRows: CachedInventoryRow[];
   filteredLocalRows: LocalInventoryRow[];
+  downloadedReady: boolean;
   results: HfModelResult[];
   accessToken: string | undefined;
   online: boolean;
@@ -154,6 +157,7 @@ export function useModelsSelection({
     () =>
       resolveDownloadedSelection({
         selectedId: downloadedSelectedId,
+        inventoryReady: downloadedReady,
         cachedRows,
         localRows,
         filteredCachedRows,
@@ -161,6 +165,7 @@ export function useModelsSelection({
       }),
     [
       cachedRows,
+      downloadedReady,
       downloadedSelectedId,
       filteredCachedRows,
       filteredLocalRows,
@@ -170,10 +175,14 @@ export function useModelsSelection({
   const selectedId = isDiscoverTab
     ? discoverResolution.selectedId
     : downloadedResolution.selectedId;
+  const selectionInputId = isDiscoverTab
+    ? discoverSelectedId
+    : downloadedSelectedId;
   const selectionHiddenByFilters = isDiscoverTab
     ? discoverResolution.hiddenByFilters
     : downloadedResolution.hiddenByFilters;
-  const detailSelectedId = useDeferredValue(selectedId);
+  const deferredSelectedId = useDeferredValue(selectedId);
+  const detailSelectedId = isDiscoverTab ? deferredSelectedId : selectedId;
   const setSelected = useCallback(
     (id: string | null) => {
       if (isDiscoverTab) {
@@ -315,6 +324,7 @@ export function useModelsSelection({
 
   return {
     selectedId,
+    selectionInputId,
     setSelected,
     selectedModel,
     metadataUnavailable,

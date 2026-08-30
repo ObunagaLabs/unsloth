@@ -15,9 +15,10 @@ import {
   apiGetStatus,
   isRequestTimeout,
 } from "./download-api-adapter";
-import type {
-  DownloadRequest,
-  ManagedDownload,
+import {
+  downloadRequestInventoryKind,
+  type DownloadRequest,
+  type ManagedDownload,
 } from "./download-manager-types";
 import {
   getState,
@@ -85,16 +86,21 @@ async function adoptActiveModelDownloads(): Promise<void> {
   for (const download of downloads) {
     const repoId = download.repo_id?.trim();
     if (!repoId || !ACTIVE_STATES.has(download.state)) continue;
-    removeLocalActivePeers(
-      DOWNLOAD_KIND.MODEL,
-      repoId,
-      download.variant ?? null,
-    );
+    const variant = download.variant ?? null;
+    const files = download.files?.length ? [...download.files] : undefined;
+    const inventoryKind = downloadRequestInventoryKind({
+      kind: DOWNLOAD_KIND.MODEL,
+      variant,
+      files,
+    });
+    removeLocalActivePeers(DOWNLOAD_KIND.MODEL, repoId, variant);
     adoptJob(
       {
         kind: DOWNLOAD_KIND.MODEL,
         repoId,
-        variant: download.variant ?? null,
+        variant,
+        ...(inventoryKind ? { inventoryKind } : {}),
+        ...(files ? { files } : {}),
         expectedBytes: 0,
       },
       safeGeneration(download.generation),
@@ -306,6 +312,9 @@ export function hydrateDownloadManager(): void {
       kind: job.kind,
       repoId: job.repoId,
       variant: job.variant,
+      ...(job.inventoryKind ? { inventoryKind: job.inventoryKind } : {}),
+      ...(job.scopedFiles ? { files: job.scopedFiles } : {}),
+      ...(job.checkpoint !== undefined ? { checkpoint: job.checkpoint } : {}),
       expectedBytes: job.expectedBytes,
     };
     void probeHydratedJob(job.key, req, 0);

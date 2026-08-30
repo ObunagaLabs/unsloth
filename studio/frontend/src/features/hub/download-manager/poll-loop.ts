@@ -56,13 +56,14 @@ import {
   pollAccessErrorMessage,
   withPollRequestTimeout,
 } from "./download-api-adapter";
-import type {
-  DownloadRequest,
-  JobListeners,
-  JobRuntime,
-  ManagedDownload,
-  ProgressLike,
-  Terminal,
+import {
+  downloadRequestInventoryKind,
+  type DownloadRequest,
+  type JobListeners,
+  type JobRuntime,
+  type ManagedDownload,
+  type ProgressLike,
+  type Terminal,
 } from "./download-manager-types";
 import {
   XET_NOTICE_TITLE,
@@ -678,6 +679,7 @@ export async function startJob(
       )
     : { transport: mode, cancelTransport: undefined };
   const activeTransport = adopted.transport;
+  const inventoryKind = downloadRequestInventoryKind(req);
   if (!opts.adopt && hasActiveRepoPeer(req.kind, req.repoId, key, req.variant)) {
     teardownRuntime(key);
     return;
@@ -722,6 +724,11 @@ export async function startJob(
       ? { checkpoint: req.checkpoint }
       : opts.adopt && existing?.checkpoint !== undefined
         ? { checkpoint: existing.checkpoint }
+        : {}),
+    ...(inventoryKind !== undefined
+      ? { inventoryKind }
+      : opts.adopt && existing?.inventoryKind !== undefined
+        ? { inventoryKind: existing.inventoryKind }
         : {}),
   });
 
@@ -1000,13 +1007,16 @@ export function adoptJob(
     // Only for the run it described, though: a cancel and restart in between
     // makes this a different job, possibly on the other transport.
     const known = getState().jobs[key]?.serverGeneration;
-    if (transport && probeDescribesCurrentRun(known, generation)) {
+    if (probeDescribesCurrentRun(known, generation)) {
+      const inventoryKind = downloadRequestInventoryKind(req);
       patchJob(key, {
-        transport,
-        ...(cancelTransport === undefined
-          ? {}
-          : { cancelTransport: cancelTransport ?? undefined }),
+        ...(transport ? { transport } : {}),
+        ...(transport && cancelTransport !== undefined
+          ? { cancelTransport: cancelTransport ?? undefined }
+          : {}),
         ...(Number.isSafeInteger(known) ? {} : { serverGeneration: generation }),
+        ...(req.files?.length ? { scopedFiles: [...req.files] } : {}),
+        ...(inventoryKind ? { inventoryKind } : {}),
       });
     }
     return;
