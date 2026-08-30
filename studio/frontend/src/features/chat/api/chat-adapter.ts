@@ -108,8 +108,14 @@ import {
 
 import { toolCallReplayArguments } from "../tool-call-arguments";
 import {
+  ToolCallArgumentBoundaries,
+  bindStreamedToolCallBackendId,
   findStreamedToolCallPartIndex,
+  findUnclaimedToolCallPartIndex,
+  findUnnamedToolCallPartIndex,
+  mintStreamedToolCallId,
   resolveToolCallPartId,
+  toolCallArgumentSegments,
 } from "../tool-call-id";
 
 import { buildResearchInferenceRequest } from "../research-inference-request";
@@ -467,6 +473,16 @@ function parseLiveToolArgs(
     return null;
   }
   return { args: parsed, argsText: candidate };
+}
+
+/** Streamed arguments as structured args, keeping unparsable text as `_raw`. */
+function parseStreamedToolCallArgs(raw: string): ToolCallMessagePart["args"] {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as ToolCallMessagePart["args"];
+  } catch {
+    return { _raw: raw } as ToolCallMessagePart["args"];
+  }
 }
 
 function parseSystemVariablesMap(raw: string): Record<string, unknown> {
@@ -5282,6 +5298,16 @@ export function createOpenAIStreamAdapter(
       // key is unique; every tool_start/output/args/end resolves the same id via
       // this map, dropped at tool_end.
       const toolPartIdByBackendId = new Map<string, string>();
+      // Provider ids remain reserved after their live reconciliation entries expire.
+      const providerToolCallIds = new Set<string>();
+      // Live JSON-boundary scan per streamed call, so a long argument is read
+      // once across the turn rather than once per fragment.
+      const toolArgumentBoundaries = new Map<
+        string,
+        ToolCallArgumentBoundaries
+      >();
+      // Calls a boundary split off whose own document has not closed yet.
+      const splitTailPartIds = new Set<string>();
       const resolveToolPartId = (backendToolCallId: string): string =>
         resolveToolCallPartId(
           toolPartIdByBackendId,
@@ -6926,21 +6952,77 @@ export function createOpenAIStreamAdapter(
                   // tool_start/tool_end events. Resolve the backend id now so all three
                   // event shapes update one run-unique card instead of leaving the raw
                   // provisional card beside a second execution card.
+                  if (stableId) providerToolCallIds.add(stableId);
                   const stablePartId = stableId
                     ? resolveToolPartId(stableId)
                     : undefined;
                   // match by resolved id when the fragment carries one, else by
                   // index slot; streams that send neither get a minted
                   // tool_call_<n> id.
-                  const existingIndex = findStreamedToolCallPartIndex(
+                  let existingIndex = findStreamedToolCallPartIndex(
                     toolCallParts,
                     stablePartId,
                     idx,
                   );
-                  const existing =
+                  if (
+                    stablePartId &&
+                    call.function?.name &&
+                    existingIndex !== -1 &&
+                    toolCallParts[existingIndex].toolCallId !== stablePartId
+                  ) {
+                    // A late id that also names its call claims the first one a
+                    // split left waiting. A bare id has nothing to match on, so
+                    // it stays with the call this slot has open.
+                    const unclaimed = findUnclaimedToolCallPartIndex(
+                      toolCallParts,
+                      idx,
+                    );
+                    if (unclaimed !== -1) existingIndex = unclaimed;
+                  }
+                  const slotPart =
                     existingIndex === -1
                       ? undefined
                       : toolCallParts[existingIndex];
+                  // Do not append a new round to a closed card.
+                  const matched =
+                    slotPart?.result === undefined ? slotPart : undefined;
+
+                  const argsFragment = call.function?.arguments ?? "";
+                  const nameFragment = call.function?.name ?? "";
+                  // Split id-less calls collapsed onto one index at JSON boundaries
+                  // (#9807). Calls with provider ids are already distinct.
+                  let scan = matched
+                    ? toolArgumentBoundaries.get(matched.toolCallId)
+                    : undefined;
+                  if (!scan) {
+                    scan = new ToolCallArgumentBoundaries();
+                    if (matched) {
+                      toolArgumentBoundaries.set(matched.toolCallId, scan);
+                    }
+                  }
+                  // Scan every stream so a late id does not invalidate the state.
+                  const cuts = argsFragment ? scan.feed(argsFragment) : [];
+                  // Cut the scan's own text: tool_start rewrites argsText to the
+                  // arguments it parsed, which no longer matches these offsets.
+                  const segments =
+                    cuts.length > 0 && !stablePartId
+                      ? toolCallArgumentSegments(scan.text(), cuts)
+                      : [];
+                  // Route an id-less name to the first unnamed call in its slot.
+                  const namedIndex =
+                    nameFragment && !stablePartId
+                      ? findUnnamedToolCallPartIndex(toolCallParts, idx)
+                      : -1;
+                  const namedNextCall =
+                    !stablePartId &&
+                    !argsFragment &&
+                    Boolean(nameFragment) &&
+                    Boolean(matched?.toolName) &&
+                    namedIndex === -1 &&
+                    // A resent growing name stays on the current call.
+                    !nameFragment.startsWith(matched?.toolName ?? "") &&
+                    scan.holdsOneCompleteDocument();
+                  const existing = namedNextCall ? undefined : matched;
 
                   if (
                     stablePartId &&
@@ -6948,12 +7030,72 @@ export function createOpenAIStreamAdapter(
                   ) {
                     codexRoundToolCallIds.push(stablePartId);
                   }
-                  const argsFragment = call.function?.arguments ?? "";
-                  streamedChars +=
-                    argsFragment.length + (call.function?.name?.length ?? 0);
+                  streamedChars += argsFragment.length + nameFragment.length;
+
+                  if (segments.length > 1) {
+                    // Segment 0 finishes the current call; later segments open calls.
+                    const splitName = nameFragment || matched?.toolName || "";
+                    let lastSplitId = "";
+                    for (const [position, argsText] of segments.entries()) {
+                      if (position === 0 && matched) {
+                        toolCallParts[existingIndex] = {
+                          ...(matched as PositionedToolCallPart),
+                          // Do not leave the completed call nameless.
+                          toolName: matched.toolName || splitName,
+                          argsText,
+                          args: parseStreamedToolCallArgs(argsText),
+                        };
+                        toolArgumentBoundaries.set(
+                          matched.toolCallId,
+                          new ToolCallArgumentBoundaries(),
+                        );
+                        continue;
+                      }
+                      const splitId = mintStreamedToolCallId(
+                        toolCallParts,
+                        `tool_call_${idx ?? toolCallParts.length}`,
+                        providerToolCallIds,
+                      );
+                      if (!codexRoundToolCallIds.includes(splitId)) {
+                        codexRoundToolCallIds.push(splitId);
+                      }
+                      // Bind later backend events to this provisional card.
+                      bindStreamedToolCallBackendId(toolPartIdByBackendId, splitId);
+                      toolCallParts.push({
+                        type: "tool-call" as const,
+                        toolCallId: splitId,
+                        toolName: splitName,
+                        argsText,
+                        args: parseStreamedToolCallArgs(argsText),
+                        textCursor: cumulativeText.length,
+                        // Attach per-call metadata only to the last split call.
+                        ...(call.extra_content !== undefined &&
+                        position === segments.length - 1
+                          ? { extra_content: call.extra_content }
+                          : {}),
+                        ...(idx !== undefined ? { _delta_index: idx } : {}),
+                      });
+                      lastSplitId = splitId;
+                      addedToolCall = true;
+                    }
+                    // Only the last segment can remain open.
+                    if (lastSplitId) {
+                      scan.rebase(segments[segments.length - 1]);
+                      toolArgumentBoundaries.set(lastSplitId, scan);
+                      splitTailPartIds.add(lastSplitId);
+                    }
+                    if (call.extra_content !== undefined) {
+                      replayStateChanged = true;
+                    }
+                    continue;
+                  }
+
                   if (existing) {
                     const prevName = existing.toolName ?? "";
-                    const nextName = call.function?.name ?? prevName;
+                    const nextName =
+                      namedIndex === -1 || namedIndex === existingIndex
+                        ? (call.function?.name ?? prevName)
+                        : prevName;
                     const merged = (existing.argsText ?? "") + argsFragment;
                     let parsedArgs: ToolCallMessagePart["args"] =
                       existing.args ?? {};
@@ -6997,31 +7139,45 @@ export function createOpenAIStreamAdapter(
                       ...(idx !== undefined ? { _delta_index: idx } : {}),
                     };
                     toolCallParts[existingIndex] = updated;
+                    if (namedIndex !== -1 && namedIndex !== existingIndex) {
+                      const waiting = toolCallParts[
+                        namedIndex
+                      ] as PositionedToolCallPart;
+                      toolCallParts[namedIndex] = {
+                        ...waiting,
+                        toolName: nameFragment,
+                      };
+                    }
+                    if (stablePartId && stablePartId !== existing.toolCallId) {
+                      // Keep split state keyed to the renamed card.
+                      toolArgumentBoundaries.delete(existing.toolCallId);
+                      toolArgumentBoundaries.set(stablePartId, scan);
+                      if (splitTailPartIds.delete(existing.toolCallId)) {
+                        splitTailPartIds.add(stablePartId);
+                      }
+                    }
                   } else {
                     const callId =
                       stablePartId ||
-                      `tool_call_${idx ?? toolCallParts.length}`;
+                      mintStreamedToolCallId(
+                        toolCallParts,
+                        `tool_call_${idx ?? toolCallParts.length}`,
+                        providerToolCallIds,
+                      );
 
                     if (!codexRoundToolCallIds.includes(callId)) {
                       codexRoundToolCallIds.push(callId);
                     }
-                    const argsText = argsFragment;
-                    let parsedArgs: ToolCallMessagePart["args"] = {};
-                    if (argsText) {
-                      try {
-                        parsedArgs = JSON.parse(
-                          argsText,
-                        ) as ToolCallMessagePart["args"];
-                      } catch {
-                        parsedArgs = {
-                          _raw: argsText,
-                        } as ToolCallMessagePart["args"];
-                      }
+                    if (!stablePartId) {
+                      // Bind later backend events to this provisional card.
+                      bindStreamedToolCallBackendId(toolPartIdByBackendId, callId);
                     }
+                    const argsText = argsFragment;
+                    const parsedArgs = parseStreamedToolCallArgs(argsText);
                     const fresh: PositionedToolCallPart = {
                       type: "tool-call" as const,
                       toolCallId: callId,
-                      toolName: call.function?.name ?? "",
+                      toolName: nameFragment,
                       argsText,
                       args: parsedArgs,
                       textCursor: cumulativeText.length,
@@ -7032,6 +7188,12 @@ export function createOpenAIStreamAdapter(
                       ...(idx !== undefined ? { _delta_index: idx } : {}),
                     };
                     toolCallParts.push(fresh);
+                    // Track a name-only fork as a new split call.
+                    toolArgumentBoundaries.set(
+                      callId,
+                      matched ? new ToolCallArgumentBoundaries() : scan,
+                    );
+                    if (matched) splitTailPartIds.add(callId);
                     addedToolCall = true;
                   }
                 }
@@ -7261,6 +7423,18 @@ export function createOpenAIStreamAdapter(
         // the open <think> tag so the reasoning panel parses cleanly.
         closeReasoningContent();
         settleFirstTokenOk();
+
+        // Drop unfinished split calls if their closing event never arrives.
+        for (let i = toolCallParts.length - 1; i >= 0; i -= 1) {
+          const part = toolCallParts[i];
+          if (
+            splitTailPartIds.has(part.toolCallId) &&
+            part.result === undefined &&
+            toolArgumentBoundaries.get(part.toolCallId)?.isUnfinished()
+          ) {
+            toolCallParts.splice(i, 1);
+          }
+        }
 
         // Extract source parts from completed web_search and web_fetch
         // calls. Both emit the same `Title:` / `URL:` / `Snippet:` block
