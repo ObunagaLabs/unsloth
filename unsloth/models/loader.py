@@ -1075,6 +1075,25 @@ class FastLanguageModel(FastLlamaModel):
 
         if resize_model_vocab is not None:
             model.resize_token_embeddings(resize_model_vocab)
+            # `resize_token_embeddings` builds a NEW embedding (and, when tied, a
+            # new output head) and the `_hf_hook` does not travel to the
+            # replacement. On a model the loader split across cards that is the
+            # last module swap of all, after every repair inside
+            # `from_pretrained`, so without this the ids reach a card the weight
+            # is no longer on and the load ends in `index_select`.
+            try:
+                from unsloth.models.vision import _repair_dispatch_hooks
+                _repaired = _repair_dispatch_hooks(model)
+                if _repaired:
+                    logger.info(
+                        f"Unsloth: re-attached dispatch hooks to {_repaired} module(s) "
+                        "left unhooked by the vocabulary resize."
+                    )
+            except Exception as _exc:
+                logger.warning(
+                    f"Unsloth: could not check the dispatch hooks after resizing "
+                    f"the vocabulary ({type(_exc).__name__}: {_exc})."
+                )
 
         # In case the model supports tagging, add the unsloth tag.
         if hasattr(model, "add_model_tags"):
@@ -1165,6 +1184,13 @@ class FastLanguageModel(FastLlamaModel):
             )
             # Patch it as well!
             model = dispatch_model.patch_peft_model(model, use_gradient_checkpointing)
+            # PEFT keeps a repaired endpoint only as `base_layer`, so its hook no
+            # longer covers the adapter branch. Lift it onto the wrapper.
+            try:
+                from .vision import _lift_endpoint_hooks_onto_adapters
+                _lift_endpoint_hooks_onto_adapters(model)
+            except Exception:
+                pass  # never block loading on a placement nicety
             # Re-evaluate grouped MoE now the adapter is attached: an expert-LoRA block falls back
             # to the original loop, an attention-only adapter keeps the grouped path. Guarded.
             try:
@@ -2127,6 +2153,25 @@ class FastModel(FastBaseModel):
 
         if resize_model_vocab is not None:
             model.resize_token_embeddings(resize_model_vocab)
+            # `resize_token_embeddings` builds a NEW embedding (and, when tied, a
+            # new output head) and the `_hf_hook` does not travel to the
+            # replacement. On a model the loader split across cards that is the
+            # last module swap of all, after every repair inside
+            # `from_pretrained`, so without this the ids reach a card the weight
+            # is no longer on and the load ends in `index_select`.
+            try:
+                from unsloth.models.vision import _repair_dispatch_hooks
+                _repaired = _repair_dispatch_hooks(model)
+                if _repaired:
+                    logger.info(
+                        f"Unsloth: re-attached dispatch hooks to {_repaired} module(s) "
+                        "left unhooked by the vocabulary resize."
+                    )
+            except Exception as _exc:
+                logger.warning(
+                    f"Unsloth: could not check the dispatch hooks after resizing "
+                    f"the vocabulary ({type(_exc).__name__}: {_exc})."
+                )
 
         # In case the model supports tagging, add the unsloth tag.
         if hasattr(model, "add_model_tags"):
@@ -2277,6 +2322,13 @@ class FastModel(FastBaseModel):
             model = FastBaseModel.post_patch_model(
                 model, use_gradient_checkpointing, trust_remote_code = trust_remote_code
             )
+            # PEFT keeps a repaired endpoint only as `base_layer`, so its hook no
+            # longer covers the adapter branch. Lift it onto the wrapper.
+            try:
+                from .vision import _lift_endpoint_hooks_onto_adapters
+                _lift_endpoint_hooks_onto_adapters(model)
+            except Exception:
+                pass  # never block loading on a placement nicety
             # Re-evaluate grouped MoE now the adapter is attached: an expert-LoRA block falls back
             # to the original loop, an attention-only adapter keeps the grouped path. Guarded.
             try:

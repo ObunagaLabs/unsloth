@@ -152,6 +152,237 @@ def _infer_device_map_from_loaded_model(model):
     return device_map
 
 
+def _repair_dispatch_hooks(model):
+    """Give a dispatched module its hook back after the load replaced it.
+
+    `dispatch_model` hooks every name in the device map, including the tied
+    ones. What loses the hook is our own patching pass: `post_patch` calls
+    `unsloth_zoo.patching_utils.patch_model_and_tokenizer`, which builds a
+    BRAND NEW `torch.nn.Embedding` around the existing weight and a brand new
+    `torch.nn.Linear` for the lm_head, and installs them with
+    `set_input_embeddings` / `set_output_embeddings`. The weights are carried
+    over; the `_hf_hook` attribute is not, because it lived on the module
+    object that was just replaced.
+
+    On one card nothing notices, since every tensor is already in the same
+    place. On a split model those two are typically the ones the planner put
+    on the OTHER card, so they become the only modules with nothing to move
+    their input to them.
+
+    Measured on 2x Tesla T4, `unsloth/Qwen3-0.6B` in 4bit, the map placing
+    `embed_tokens` and `lm_head` on cuda:1 and everything else on cuda:0: 395
+    modules carried a hook, `embed_tokens` did not, and the first embedding
+    lookup raised
+
+        RuntimeError: Expected all tensors to be on the same device, but got
+        index is on cuda:0, different from other tensors on cuda:1
+        (when checking argument in method wrapper_CUDA__index_select)
+
+    Nothing here is specific to tied weights. The replacement happens whether
+    or not `tie_word_embeddings` is set, and an untied model split the same way
+    fails the same way; the tied case is simply where it was first measured.
+
+    Repairs only what the model's OWN `hf_device_map` already names, so it
+    cannot move a module the load did not place, and it never touches a module
+    that already has a hook. A single-device map leaves nothing to repair.
+
+    Returns the number of modules repaired, for the caller's log line.
+    """
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map or len(set(device_map.values())) < 2:
+        return 0
+    try:
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+    except ImportError:
+        return 0
+
+    # Match what `dispatch_model` puts on a mapped block, so a repaired module
+    # behaves like one it never had to repair.
+    #
+    # `skip_keys`: dispatch passes the model's `_skip_keys_device_placement`
+    # (`["past_key_values"]` on every decoder checked). Those keys are the ones
+    # accelerate deliberately does NOT move with the inputs, so a hook without
+    # them would relocate a cache the model expects to stay put.
+    #
+    # `io_same_device`: dispatch sets it only on the ROOT, leaving activations
+    # on the block's own card to flow straight into the next block. Setting it
+    # on a submodule copies the whole result back to the incoming card, and the
+    # next hook copies it over again. Measured on the split repro: False gives
+    # byte-identical logits and still returns the output to the caller, because
+    # the root's own hook survives the embedding rebuild and does that. So it is
+    # True only when the root has NO hook and nothing else would.
+    skip_keys = getattr(model, "_skip_keys_device_placement", None)
+    io_same_device = not hasattr(model, "_hf_hook")
+
+    # Every mapped module that lacks a hook, not only the ones on a far card.
+    # This restores what `dispatch_model` did: it hooks each entry in the map,
+    # which is why 395 modules carried one in the measured run and only the
+    # replaced pair did not. A hook whose execution device is where the module
+    # already sits is a no-op move, so matching that behaviour is both simpler
+    # and safer than guessing which device counts as "main" -- a guess that
+    # inverts the moment the far side holds more entries than the near one.
+    targets = {name: device for name, device in device_map.items() if name}
+
+    # A map does not have to NAME the modules the patching pass replaces. Every
+    # map this loader builds itself is leaf-granular and lists both, but a
+    # hand-written coarse one such as `{"model": 0, "lm_head": 1}` covers
+    # `model.embed_tokens` through an ANCESTOR. `dispatch_model` hooks it
+    # regardless, because it walks the subtree an entry covers -- measured: a
+    # `{"": 0, "model.layers.1": "cpu"}` map leaves `lm_head` hooked without
+    # `lm_head` being a key. Iterating keys alone would then repair nothing and
+    # leave exactly the crash this function exists for, arriving through the
+    # shape of the map rather than the shape of the model.
+    #
+    # Only the two modules the pass actually replaces are resolved this way,
+    # under the device of the longest entry covering them. Repairing every
+    # covered descendant instead would hook thousands of modules that never
+    # lost anything, which is a much larger claim than the bug supports.
+    for get in ("get_input_embeddings", "get_output_embeddings"):
+        try:
+            replaced = getattr(model, get, lambda: None)()
+        except Exception:
+            continue  # a model that cannot answer is not one to guess about
+        if replaced is None or hasattr(replaced, "_hf_hook"):
+            continue
+        name = next(
+            (n for n, m in model.named_modules() if m is replaced and n),
+            None,
+        )
+        if name is None or name in targets:
+            continue
+        covering = [
+            key for key in device_map if not key or name == key or name.startswith(key + ".")
+        ]
+        if covering:
+            targets[name] = device_map[max(covering, key = len)]
+
+    repaired = 0
+    for name, device in targets.items():
+        try:
+            module = model.get_submodule(name)
+        except AttributeError:
+            continue  # a name this build does not have; not ours to invent
+        if hasattr(module, "_hf_hook"):
+            continue
+        # CUDA entries come back as bare ints, which torch reads as a device
+        # index only when paired with a type.
+        execution_device = (
+            f"{DEVICE_TYPE_TORCH}:{device}"
+            if isinstance(device, int) and not isinstance(device, bool)
+            else device
+        )
+        # Read through `.type`, because a map may carry `torch.device("cpu")`
+        # rather than the string: `dispatch_model` takes
+        # `Union[str, int, torch.device]` and writes back whatever it was given.
+        # `torch.device("cpu") != "cpu"`, so an identity test reads an offloaded
+        # module as an accelerator one and hooks it, the opposite of this line's
+        # purpose; and `str()` alone still misses `torch.device("cpu", 0)`.
+        device_kind = (
+            execution_device.type
+            if isinstance(execution_device, torch.device)
+            else str(execution_device)
+        )
+        if device_kind in ("cpu", "disk"):
+            continue  # offload is a different mechanism, and has its own hooks
+        try:
+            add_hook_to_module(
+                module,
+                AlignDevicesHook(
+                    execution_device = execution_device,
+                    io_same_device = io_same_device,
+                    skip_keys = skip_keys,
+                ),
+            )
+        except Exception as exc:
+            # Never silently: a repair that reports success while attaching
+            # nothing leaves the original index_select crash in place and hides
+            # the reason. `init_hook` moves the module's tensors to the
+            # execution device, so this is where a device the map names but the
+            # machine does not have shows up.
+            warnings.warn(
+                f"Unsloth: could not re-attach a dispatch hook to {name!r} on "
+                f"{execution_device} ({type(exc).__name__}: {exc}). Training a "
+                "model split across devices may fail at the first tensor that "
+                "crosses one.",
+                RuntimeWarning,
+                stacklevel = 2,
+            )
+            continue
+        repaired += 1
+    return repaired
+
+
+def _lift_endpoint_hooks_onto_adapters(model):
+    """After PEFT wraps a repaired endpoint, lift its hook onto the wrapper.
+
+    An `AlignDevicesHook` wraps the module's OWN forward, so it moves the input
+    inside `base_layer(x)`. `lora.Linear.forward` then reaches for the caller's
+    `x` again for the adapter branch, where it casts dtype and NOT device, and
+    feeds it to `lora_A` -- whose weights PEFT put on the base layer's device via
+    `_move_adapter_to_device_of_base_layer`. On a split model those are different
+    cards, so the adapter branch raises where the base call did not:
+
+        RuntimeError: Expected all tensors to be on the same device, but got
+        mat2 is on cuda:0, different from other tensors on cpu
+
+    Measured on peft 0.20.0, isolated: the base layer alone copes, the wrapper
+    raises, and hooking the wrapper fixes it. It is reachable because unsloth's
+    continued pretraining recipe targets `embed_tokens` and `lm_head` by name,
+    which are exactly the two modules the load rebuilt.
+
+    Only the endpoints are considered. They are the only modules the patching
+    pass replaced, so they are the only ones whose hook this file attached after
+    dispatch; every other adapter wraps a module accelerate hooked itself.
+
+    Returns the number of wrappers lifted, for the caller's log line.
+    """
+    try:
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+    except ImportError:
+        return 0
+
+    lifted = 0
+    for get in ("get_input_embeddings", "get_output_embeddings"):
+        try:
+            wrapper = getattr(model, get, lambda: None)()
+        except Exception:
+            continue  # a model that cannot answer is not one to guess about
+        if wrapper is None:
+            continue
+
+        if hasattr(wrapper, "_hf_hook"):
+            continue
+        base = getattr(wrapper, "base_layer", None)
+        hook = getattr(base, "_hf_hook", None) if base is not None else None
+        if hook is None or getattr(hook, "execution_device", None) is None:
+            continue  # not a wrapped endpoint, or one dispatch never placed
+        try:
+            add_hook_to_module(
+                wrapper,
+                AlignDevicesHook(
+                    execution_device = hook.execution_device,
+                    # The base layer keeps its own hook, so the inner move still
+                    # happens and is a no-op by the time it runs. Mirroring the
+                    # block shape here rather than inventing a new one.
+                    io_same_device = False,
+                    skip_keys = getattr(hook, "skip_keys", None),
+                ),
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Unsloth: could not lift the dispatch hook onto the adapter "
+                f"wrapping {get}() on {hook.execution_device} "
+                f"({type(exc).__name__}: {exc}). Training an adapter that "
+                "targets the embeddings on a split model may fail at the first "
+                "tensor that crosses a device.",
+                RuntimeWarning,
+                stacklevel = 2,
+            )
+            continue
+        lifted += 1
+    return lifted
+
+
 def _attach_bnb_multidevice_hooks(
     model, load_in_4bit, load_in_8bit, offload_embedding, fast_inference
 ):
@@ -162,6 +393,18 @@ def _attach_bnb_multidevice_hooks(
     """
     if fast_inference:
         return
+    # Before the bnb gate, because the embedding rebuild that drops these hooks
+    # happens whatever the quantization. Skipped entirely when the
+    # embedding is being offloaded: that path owns the embedding, and
+    # `_embedding_dispatch_device` READS the hook we would add to decide where
+    # to re-send the ids, so adding one here would answer its question wrongly.
+    if not offload_embedding:
+        repaired = _repair_dispatch_hooks(model)
+        if repaired:
+            logger.info(
+                f"Unsloth: re-attached dispatch hooks to {repaired} module(s) "
+                "the load left unhooked, so a split model runs and trains."
+            )
     is_bnb = (
         load_in_4bit
         or load_in_8bit
@@ -1993,6 +2236,26 @@ class FastBaseModel:
         _mark_loaded_revision(tokenizer, _tokenizer_revision)
         model = _mark_forced_float32(model, do_forced_float32)
         model = _mark_full_finetuning(model, full_finetuning)
+
+        # LAST, for the reason the llama loader repairs last: the attach above
+        # runs during the load, and `patch_model_and_tokenizer` further down
+        # REPLACES the embedding and lm_head with freshly built modules, which
+        # carry the weights over but not the `_hf_hook`. A model this loader
+        # split across cards would otherwise still meet the original
+        # cross-device `index_select`. Idempotent, so the earlier attach stands.
+        if not fast_inference and not offload_embedding:
+            try:
+                _repaired = _repair_dispatch_hooks(model)
+                if _repaired:
+                    logger.info(
+                        f"Unsloth: re-attached dispatch hooks to {_repaired} module(s) "
+                        "the patching pass left unhooked, so the model trains."
+                    )
+            except Exception as _exc:
+                logger.warning(
+                    f"Unsloth: could not check the dispatch hooks "
+                    f"({type(_exc).__name__}: {_exc})."
+                )
         return _mark_requested_float32(model, user_float32), tokenizer
 
     @staticmethod
@@ -2291,6 +2554,18 @@ class FastBaseModel:
             _LoraModel._create_and_replace = _patched_car
 
         model = _get_peft_model(model, lora_config)
+
+        # PEFT may have wrapped an endpoint this load repaired; the hook stays on
+        # `base_layer` and the adapter branch reads the caller's tensor.
+        try:
+            _lifted = _lift_endpoint_hooks_onto_adapters(model)
+            if _lifted:
+                logger.info(
+                    f"Unsloth: lifted dispatch hooks onto {_lifted} adapter-wrapped "
+                    "embedding module(s), so a split model trains them."
+                )
+        except Exception as _exc:
+            logger.warning_once(f"Unsloth: could not lift adapter hooks: {_exc}")
 
         # Restore original PEFT method
         if _clippable_linear_cls is not None:
