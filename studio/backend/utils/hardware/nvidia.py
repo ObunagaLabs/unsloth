@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import os
+import platform
+import shutil
 import subprocess
 from typing import Any, Optional
 
@@ -236,6 +239,146 @@ def get_visible_gpu_utilization(
     }
 
 
+def _nvidia_smi_executable() -> str:
+    """The nvidia-smi to run, resolving the standard Windows locations off PATH.
+
+    A driver install can leave nvidia-smi.exe in the NVSMI directory or the driver
+    store without putting either on PATH, and a bare "nvidia-smi" then raises
+    FileNotFoundError. That would leave the physical inventory empty on exactly the
+    host this inventory exists for: real GPUs, a PyTorch that cannot see them. Same
+    two locations setup.ps1 already falls back to. Returns the bare name when nothing
+    better is found, so the caller's existing OSError handling still applies.
+    """
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    if platform.system() != "Windows":
+        return "nvidia-smi"
+    for base, tail in (
+        (os.environ.get("ProgramFiles"), r"NVIDIA Corporation\NVSMI\nvidia-smi.exe"),
+        (os.environ.get("SystemRoot"), r"System32\nvidia-smi.exe"),
+    ):
+        if not base:
+            continue
+        candidate = os.path.join(base, tail)
+        if os.path.isfile(candidate):
+            return candidate
+    return "nvidia-smi"
+
+
+# "nvidia-smi is not on this machine" is a conclusive answer, not a failed probe: it is
+# the normal state of every CPU-only, AMD and Intel host, and the installers read the
+# same absence as "no usable NVIDIA GPU". Distinct from None, which means a probe that
+# WAS found could not answer -- a hung driver, a permission fault, a non-zero exit.
+NVIDIA_SMI_ABSENT = object()
+
+
+def _query_gpu_inventory(caller: str) -> Any:
+    """``[{index, name, memory_total_gb}]`` for every GPU nvidia-smi enumerates.
+
+    ``None`` when the query could not be answered at all -- no nvidia-smi on PATH, a
+    driver that hung past the timeout, a non-zero exit. Callers report that as
+    "unknown", which is not the same as the empty list a working driver with no
+    cards returns. Never raises.
+
+    Split out of get_backend_visible_gpu_info so the same rows can be read WITHOUT a
+    ``DeviceType.CUDA`` precondition: get_physical_gpu_inventory below is reached on
+    exactly the host where torch reports no CUDA device, and that host still has its
+    GPUs. Rows a caller cannot make sense of are dropped, not raised on -- a name
+    holding commas is rejoined, and a malformed index or memory column skips the row.
+    """
+    try:
+        result = subprocess.run(
+            [
+                _nvidia_smi_executable(),
+                "--query-gpu=index,name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output = True,
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = 10,
+            env = child_env_without_native_path_secret(),
+            **_windows_hidden_subprocess_kwargs(),
+        )
+    except FileNotFoundError as e:
+        # No nvidia-smi at all, which is the NORMAL state of every CPU-only, AMD and
+        # Intel host. The physical inventory calls this unconditionally on a 60 second
+        # refresh reached from the health and system polls, so warning here would put a
+        # line in production logs every minute on machines that are working correctly.
+        logger.debug("nvidia-smi is not installed (%s): %s", caller, e)
+        return NVIDIA_SMI_ABSENT
+    except (OSError, subprocess.TimeoutExpired) as e:
+        # Past this point an nvidia-smi WAS found, so a failure is worth saying loudly:
+        # a hung driver or a permission problem is a real fault on an NVIDIA host.
+        logger.warning("nvidia-smi query failed in %s: %s", caller, e)
+        return None
+    if result.returncode != 0:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for line in result.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            idx = int(parts[0])
+        except (ValueError, TypeError):
+            continue
+        # Rejoin in case the GPU name contains commas
+        name = parts[1] if len(parts) == 3 else ", ".join(parts[1:-1])
+        try:
+            mem_total_mb = int(parts[-1])
+        except (ValueError, TypeError):
+            continue
+        rows.append(
+            {
+                "index": idx,
+                "name": name,
+                "memory_total_gb": round(mem_total_mb / 1024, 2),
+            }
+        )
+    return rows
+
+
+def get_physical_gpu_inventory() -> dict[str, Any]:
+    """Every NVIDIA GPU the driver enumerates, with no visibility mask and no torch.
+
+    Display-only inventory: ``index`` is nvidia-smi's own row number, which is a
+    physical id and NOT something a caller may pin, because the whole point of this
+    probe is that PyTorch cannot open these devices. A failed probe comes back as a
+    structured unavailable result, so this never raises out of an endpoint.
+    """
+    rows = _query_gpu_inventory("get_physical_gpu_inventory")
+    if rows is NVIDIA_SMI_ABSENT:
+        # An answer, and the caller must not read it as "some probe failed": an AMD-only
+        # host has no nvidia-smi by design, and marking its inventory unknown would keep
+        # a settled mismatch alive after the card that established it was unplugged.
+        return {
+            "available": False,
+            "source": "nvidia-smi",
+            "devices": [],
+            "error": "nvidia-smi is not installed",
+            "absent": True,
+        }
+    if rows is None:
+        return {
+            "available": False,
+            "source": "nvidia-smi",
+            "devices": [],
+            "error": "nvidia-smi did not answer",
+            "absent": False,
+        }
+    return {
+        "available": bool(rows),
+        "source": "nvidia-smi",
+        "devices": [{**row, "vendor": "nvidia", "source": "nvidia-smi"} for row in rows],
+        "error": None,
+        "absent": False,
+    }
+
+
 def get_backend_visible_gpu_info(
     parent_visible_ids: Optional[list[int]], backend_cuda_visible_devices: Optional[str]
 ) -> dict[str, Any]:
@@ -250,31 +393,8 @@ def get_backend_visible_gpu_info(
             "index_kind": "unresolved",
         }
     visible_ordinals = _visible_ordinal_map(parent_visible_ids)
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,name,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output = True,
-            text = True,
-            encoding = "utf-8",
-            errors = "replace",
-            timeout = 10,
-            env = child_env_without_native_path_secret(),
-            **_windows_hidden_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        logger.warning("nvidia-smi query failed in get_backend_visible_gpu_info: %s", e)
-        return {
-            "available": False,
-            "backend_cuda_visible_devices": backend_cuda_visible_devices,
-            "parent_visible_gpu_ids": parent_visible_ids or [],
-            "devices": [],
-            "index_kind": "physical",
-        }
-    if result.returncode != 0:
+    rows = _query_gpu_inventory("get_backend_visible_gpu_info")
+    if rows is None or rows is NVIDIA_SMI_ABSENT:
         return {
             "available": False,
             "backend_cuda_visible_devices": backend_cuda_visible_devices,
@@ -284,21 +404,9 @@ def get_backend_visible_gpu_info(
         }
 
     devices = []
-    for line in result.stdout.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 3:
-            continue
-        try:
-            idx = int(parts[0])
-        except (ValueError, TypeError):
-            continue
+    for row in rows:
+        idx = row["index"]
         if visible_ordinals is not None and idx not in visible_ordinals:
-            continue
-        # Rejoin in case the GPU name contains commas
-        name = parts[1] if len(parts) == 3 else ", ".join(parts[1:-1])
-        try:
-            mem_total_mb = int(parts[-1])
-        except (ValueError, TypeError):
             continue
         devices.append(
             {
@@ -307,8 +415,8 @@ def get_backend_visible_gpu_info(
                 "visible_ordinal": (
                     visible_ordinals[idx] if visible_ordinals is not None else len(devices)
                 ),
-                "name": name,
-                "memory_total_gb": round(mem_total_mb / 1024, 2),
+                "name": row["name"],
+                "memory_total_gb": row["memory_total_gb"],
             }
         )
 
